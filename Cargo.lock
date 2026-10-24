@@ -5,6 +5,17 @@ version = 4
 [[package]]
 name = "orvi-cli"
 version = "0.1.0"
+dependencies = [
+ "orvi-runtime",
+ "orvi-syntax",
+]
+
+[[package]]
+name = "orvi-runtime"
+version = "0.1.0"
+dependencies = [
+ "orvi-syntax",
+]
 
 [[package]]
 name = "orvi-syntax"

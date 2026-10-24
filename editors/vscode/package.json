@@ -1,0 +1,34 @@
+{
+  "name": "orviscript",
+  "displayName": "OrviScript",
+  "description": "Language support for OrviScript",
+  "version": "0.1.0",
+  "publisher": "orviscript",
+  "license": "Apache-2.0",
+  "scripts": {
+    "check": "node validate.mjs"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "orviscript",
+        "aliases": ["OrviScript", "orviscript"],
+        "extensions": [".orvi"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "orviscript",
+        "scopeName": "source.orviscript",
+        "path": "./syntaxes/orviscript.tmLanguage.json"
+      }
+    ]
+  }
+}

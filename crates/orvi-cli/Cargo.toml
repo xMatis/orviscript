@@ -11,3 +11,7 @@ publish = false
 name = "orviscript"
 path = "src/main.rs"
 
+[dependencies]
+orvi-runtime = { path = "../orvi-runtime" }
+orvi-syntax = { path = "../orvi-syntax" }
+

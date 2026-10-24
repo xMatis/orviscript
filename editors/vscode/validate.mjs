@@ -1,0 +1,27 @@
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
+
+const root = path.dirname(url.fileURLToPath(import.meta.url));
+const readJson = (relativePath) => JSON.parse(fs.readFileSync(path.join(root, relativePath), "utf8"));
+const assert = (condition, message) => {
+  if (!condition) throw new Error(message);
+};
+
+const manifest = readJson("package.json");
+const language = manifest.contributes.languages.find(({ id }) => id === "orviscript");
+assert(language, "missing OrviScript language contribution");
+assert(language.extensions.includes(".orvi"), "missing .orvi file extension");
+assert(fs.existsSync(path.join(root, language.configuration)), "missing language configuration");
+
+const grammarContribution = manifest.contributes.grammars.find(({ language: id }) => id === "orviscript");
+assert(grammarContribution, "missing OrviScript grammar contribution");
+const grammar = readJson(grammarContribution.path);
+assert(grammar.scopeName === grammarContribution.scopeName, "grammar scope does not match manifest");
+assert(Array.isArray(grammar.patterns) && grammar.patterns.length > 0, "grammar has no patterns");
+
+const configuration = readJson(language.configuration);
+assert(configuration.brackets.length === 3, "expected three bracket pairs");
+assert(configuration.autoClosingPairs.length >= 4, "expected bracket and quote auto-closing pairs");
+
+console.log("OrviScript VS Code extension configuration is valid.");

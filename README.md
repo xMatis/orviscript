@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-The project is at an early stage. The repository currently contains a minimal command-line executable with `--help` and `--version` support, plus a reusable syntax crate with source spans, lexical diagnostics, and tokenization. It does not yet include a language parser, interpreter, runtime, or standard library.
+The project is at an early but runnable stage. It includes a reusable lexer and parser, a tree-walk interpreter, `run` and `check` CLI commands, and a Visual Studio Code extension with `.orvi` file recognition and syntax highlighting. The language remains incomplete and does not yet include modules, static type checking, async I/O, packages, or a standard library beyond `print`.
 
 ## Goals
 
@@ -14,7 +14,7 @@ The planned direction includes:
 - Standalone executable bundling.
 - Experimental native compilation at a later stage.
 
-These capabilities are goals, not implemented features.
+Except for the basic interpreter described above, these capabilities are goals, not implemented features.
 
 ## Roadmap
 
@@ -33,6 +33,15 @@ The executable is named `orviscript`:
 
 ```sh
 cargo run --bin orviscript -- --help
+cargo run --bin orviscript -- run examples/hello.orvi
+```
+
+The current language subset supports mutable `let` bindings, immutable `const` bindings, numbers, strings, booleans, `null`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`.
+
+The VS Code extension lives in `editors/vscode`. Launch a development window with the extension enabled:
+
+```sh
+code --new-window --extensionDevelopmentPath=editors/vscode examples/hello.orvi
 ```
 
 Project website: [orviscript.com](https://orviscript.com)

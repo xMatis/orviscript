@@ -7,6 +7,13 @@ pub struct Span {
 }
 
 impl Span {
+    pub const fn empty(offset: usize) -> Self {
+        Self {
+            start: offset,
+            end: offset,
+        }
+    }
+
     pub const fn new(start: usize, end: usize) -> Option<Self> {
         if start <= end {
             Some(Self { start, end })
@@ -41,6 +48,21 @@ impl Span {
 
     pub fn text(self, source: &str) -> Option<&str> {
         source.get(self.range())
+    }
+
+    pub const fn cover(self, other: Self) -> Self {
+        Self {
+            start: if self.start < other.start {
+                self.start
+            } else {
+                other.start
+            },
+            end: if self.end > other.end {
+                self.end
+            } else {
+                other.end
+            },
+        }
     }
 }
 

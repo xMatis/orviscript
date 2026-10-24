@@ -1,0 +1,12 @@
+[package]
+name = "orvi-runtime"
+version = "0.1.0"
+description = "Interpreter runtime for OrviScript"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+orvi-syntax = { path = "../orvi-syntax" }
+

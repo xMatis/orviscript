@@ -31,3 +31,6 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Validate VS Code extension
+        run: node editors/vscode/validate.mjs
+

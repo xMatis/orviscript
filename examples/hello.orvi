@@ -1,0 +1,12 @@
+fn greet(name) {
+    return "Hello, " + name + "!"
+}
+
+let language = "OrviScript"
+print(greet(language))
+
+let count = 1
+while count <= 3 {
+    print("Count", count)
+    count = count + 1
+}
