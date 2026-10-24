@@ -5,8 +5,12 @@
   "version": "0.1.0",
   "publisher": "orviscript",
   "license": "Apache-2.0",
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:orviscript"
+  ],
   "scripts": {
-    "check": "node validate.mjs"
+    "check": "cargo build --manifest-path ../../Cargo.toml --bin orvi-lsp && node --check extension.js && node --check protocol.mjs && node validate.mjs && node --test test/*.test.mjs"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -15,6 +19,16 @@
     "Programming Languages"
   ],
   "contributes": {
+    "configuration": {
+      "title": "OrviScript",
+      "properties": {
+        "orviscript.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the orvi-lsp executable. Leave empty to use the workspace build or PATH."
+        }
+      }
+    },
     "languages": [
       {
         "id": "orviscript",

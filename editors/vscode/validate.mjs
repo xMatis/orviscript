@@ -9,6 +9,12 @@ const assert = (condition, message) => {
 };
 
 const manifest = readJson("package.json");
+assert(manifest.main === "./extension.js", "missing extension entry point");
+assert(fs.existsSync(path.join(root, manifest.main)), "missing extension entry point file");
+assert(
+  manifest.activationEvents.includes("onLanguage:orviscript"),
+  "missing OrviScript activation event",
+);
 const language = manifest.contributes.languages.find(({ id }) => id === "orviscript");
 assert(language, "missing OrviScript language contribution");
 assert(language.extensions.includes(".orvi"), "missing .orvi file extension");
@@ -23,5 +29,9 @@ assert(Array.isArray(grammar.patterns) && grammar.patterns.length > 0, "grammar 
 const configuration = readJson(language.configuration);
 assert(configuration.brackets.length === 3, "expected three bracket pairs");
 assert(configuration.autoClosingPairs.length >= 4, "expected bracket and quote auto-closing pairs");
+assert(
+  manifest.contributes.configuration.properties["orviscript.server.path"],
+  "missing language server path setting",
+);
 
 console.log("OrviScript VS Code extension configuration is valid.");
