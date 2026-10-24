@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-The project is at an early stage. The repository currently contains only a minimal command-line executable with `--help` and `--version` support. It does not yet include a language parser, interpreter, runtime, or standard library.
+The project is at an early stage. The repository currently contains a minimal command-line executable with `--help` and `--version` support, plus a reusable syntax crate with source spans, lexical diagnostics, and tokenization. It does not yet include a language parser, interpreter, runtime, or standard library.
 
 ## Goals
 

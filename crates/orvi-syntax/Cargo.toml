@@ -1,0 +1,12 @@
+[package]
+name = "orvi-syntax"
+version = "0.1.0"
+description = "Source text and lexical analysis for OrviScript"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+

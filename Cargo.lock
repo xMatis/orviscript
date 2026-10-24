@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "orvi-cli"
 version = "0.1.0"
+
+[[package]]
+name = "orvi-syntax"
+version = "0.1.0"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/orvi-cli"]
+members = ["crates/orvi-cli", "crates/orvi-syntax"]
 resolver = "3"
 
 [workspace.package]
