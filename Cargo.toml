@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/orvi-cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/xMatis/orviscript"
+
