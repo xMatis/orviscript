@@ -36,7 +36,7 @@ cargo run --bin orviscript -- --help
 cargo run --bin orviscript -- run examples/hello.orvi
 ```
 
-The current language subset supports mutable `let` bindings, immutable `const` bindings, numbers, strings, booleans, `null`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, and incorrect argument counts for declared functions.
+The current language subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, numbers, strings, booleans, `null`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, and statically visible type mismatches. The runtime also enforces declared binding, parameter, and return types.
 
 The VS Code extension lives in `editors/vscode`. Build the language server, then launch a development window with the extension enabled:
 

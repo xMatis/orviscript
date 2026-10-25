@@ -64,3 +64,28 @@ fn print_accepts_multiple_values() {
         ["value 4 true null"]
     );
 }
+
+#[test]
+fn enforces_binding_types_on_initialization_and_assignment() {
+    assert_eq!(
+        run("let value: int = \"wrong\"").expect_err("initialization fails"),
+        "expected int, received string"
+    );
+    assert_eq!(
+        run("let value: int = 1; value = false").expect_err("assignment fails"),
+        "expected int, received bool"
+    );
+}
+
+#[test]
+fn enforces_parameter_and_return_types() {
+    assert_eq!(
+        run("fn twice(value: int) -> int { return value * 2 } twice(\"wrong\")")
+            .expect_err("argument fails"),
+        "expected int, received string"
+    );
+    assert_eq!(
+        run("fn wrong() -> int { return \"wrong\" } wrong()").expect_err("return value fails"),
+        "expected int, received string"
+    );
+}

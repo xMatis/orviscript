@@ -4,8 +4,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Literal, Program, Span, Statement, StatementKind,
-    UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, Literal, Parameter, Program, Span, Statement,
+    StatementKind, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone)]
@@ -62,7 +62,8 @@ pub struct Execution {
 #[derive(Clone)]
 pub struct UserFunction {
     name: String,
-    parameters: Vec<String>,
+    parameters: Vec<Parameter>,
+    return_type: Option<TypeAnnotation>,
     body: Vec<Statement>,
     closure: Environment,
 }
@@ -78,6 +79,7 @@ struct EnvironmentData {
 struct Binding {
     value: Value,
     mutable: bool,
+    type_annotation: Option<TypeAnnotation>,
 }
 
 impl Environment {
@@ -93,11 +95,21 @@ impl Environment {
             parent: Some(parent),
         })))
     }
-    fn define(&self, name: String, value: Value, mutable: bool) {
-        self.0
-            .borrow_mut()
-            .values
-            .insert(name, Binding { value, mutable });
+    fn define(
+        &self,
+        name: String,
+        value: Value,
+        mutable: bool,
+        type_annotation: Option<TypeAnnotation>,
+    ) {
+        self.0.borrow_mut().values.insert(
+            name,
+            Binding {
+                value,
+                mutable,
+                type_annotation,
+            },
+        );
     }
     fn get(&self, name: &str) -> Option<Value> {
         let data = self.0.borrow();
@@ -113,6 +125,14 @@ impl Environment {
                 if !binding.mutable {
                     return Err(AssignError::Immutable);
                 }
+                if let Some(type_annotation) = &binding.type_annotation
+                    && !value_matches_type(&value, type_annotation)
+                {
+                    return Err(AssignError::TypeMismatch {
+                        expected: display_type(type_annotation),
+                        actual: value.type_name(),
+                    });
+                }
                 binding.value = value;
                 return Ok(());
             }
@@ -127,6 +147,10 @@ impl Environment {
 enum AssignError {
     Undefined,
     Immutable,
+    TypeMismatch {
+        expected: String,
+        actual: &'static str,
+    },
 }
 enum Control {
     Continue(Value),
@@ -135,7 +159,7 @@ enum Control {
 
 pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
     let globals = Environment::root();
-    globals.define("print".into(), Value::NativePrint, false);
+    globals.define("print".into(), Value::NativePrint, false, None);
     let mut interpreter = Interpreter {
         environment: globals,
         output: Vec::new(),
@@ -179,24 +203,29 @@ impl Interpreter {
             StatementKind::Variable {
                 name,
                 mutable,
+                type_annotation,
                 initializer,
             } => {
                 let value = self.evaluate(initializer)?;
-                self.environment
-                    .define(name.name.clone(), value.clone(), *mutable);
+                self.require_type(&value, type_annotation.as_ref(), initializer.span)?;
+                self.environment.define(
+                    name.name.clone(),
+                    value.clone(),
+                    *mutable,
+                    type_annotation.clone(),
+                );
                 Ok(Control::Continue(value))
             }
             StatementKind::Function {
                 name,
                 parameters,
+                return_type,
                 body,
             } => {
                 let function = UserFunction {
                     name: name.name.clone(),
-                    parameters: parameters
-                        .iter()
-                        .map(|parameter| parameter.name.clone())
-                        .collect(),
+                    parameters: parameters.clone(),
+                    return_type: return_type.clone(),
                     body: body.clone(),
                     closure: self.environment.clone(),
                 };
@@ -204,6 +233,7 @@ impl Interpreter {
                     name.name.clone(),
                     Value::Function(Rc::new(function)),
                     false,
+                    None,
                 );
                 Ok(Control::Continue(Value::Null))
             }
@@ -292,6 +322,10 @@ impl Interpreter {
                         ),
                         AssignError::Immutable => self.error(
                             format!("cannot assign to constant '{}'", name.name),
+                            expression.span,
+                        ),
+                        AssignError::TypeMismatch { expected, actual } => self.error(
+                            format!("expected {expected}, received {actual}"),
                             expression.span,
                         ),
                     })?;
@@ -413,16 +447,28 @@ impl Interpreter {
                     ));
                 }
                 let environment = Environment::child(function.closure.clone());
-                for (name, value) in function.parameters.iter().cloned().zip(arguments) {
-                    environment.define(name, value, true);
+                for (parameter, value) in function.parameters.iter().zip(arguments) {
+                    self.require_type(
+                        &value,
+                        parameter.type_annotation.as_ref(),
+                        parameter.name.span,
+                    )?;
+                    environment.define(
+                        parameter.name.name.clone(),
+                        value,
+                        true,
+                        parameter.type_annotation.clone(),
+                    );
                 }
                 self.function_depth += 1;
                 let result = self.execute_block(&function.body, environment);
                 self.function_depth -= 1;
-                match result? {
-                    Control::Continue(_) => Ok(Value::Null),
-                    Control::Return(value) => Ok(value),
-                }
+                let value = match result? {
+                    Control::Continue(_) => Value::Null,
+                    Control::Return(value) => value,
+                };
+                self.require_type(&value, function.return_type.as_ref(), span)?;
+                Ok(value)
             }
             _ => Err(self.error("value is not callable", span)),
         }
@@ -499,12 +545,77 @@ impl Interpreter {
             Err(self.error("condition must be bool", span))
         }
     }
+    fn require_type(
+        &self,
+        value: &Value,
+        type_annotation: Option<&TypeAnnotation>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let Some(type_annotation) = type_annotation else {
+            return Ok(());
+        };
+        if value_matches_type(value, type_annotation) {
+            Ok(())
+        } else {
+            Err(self.error(
+                format!(
+                    "expected {}, received {}",
+                    display_type(type_annotation),
+                    value.type_name()
+                ),
+                span,
+            ))
+        }
+    }
     fn error(&self, message: impl Into<String>, span: Span) -> RuntimeError {
         RuntimeError {
             message: message.into(),
             span,
         }
     }
+}
+
+impl Value {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::Integer(_) => "int",
+            Self::Float(_) => "float",
+            Self::String(_) => "string",
+            Self::Function(_) | Self::NativePrint => "fn",
+        }
+    }
+}
+
+fn value_matches_type(value: &Value, type_annotation: &TypeAnnotation) -> bool {
+    match type_annotation.name.as_str() {
+        "any" => true,
+        "null" => matches!(value, Value::Null),
+        "bool" => matches!(value, Value::Bool(_)),
+        "int" => matches!(value, Value::Integer(_)),
+        "float" => matches!(value, Value::Float(_)),
+        "number" => matches!(value, Value::Integer(_) | Value::Float(_)),
+        "string" => matches!(value, Value::String(_)),
+        "fn" => matches!(value, Value::Function(_) | Value::NativePrint),
+        _ => false,
+    }
+}
+
+fn display_type(type_annotation: &TypeAnnotation) -> String {
+    if type_annotation.arguments.is_empty() {
+        return type_annotation.name.name.clone();
+    }
+    format!(
+        "{}<{}>",
+        type_annotation.name.name,
+        type_annotation
+            .arguments
+            .iter()
+            .map(display_type)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn numbers(left: Value, right: Value) -> Option<(f64, f64)> {

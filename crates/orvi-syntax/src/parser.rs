@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, Program, Span,
-    Statement, StatementKind, Token, TokenKind, UnaryOperator, lex,
+    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, Parameter, Program,
+    Span, Statement, StatementKind, Token, TokenKind, TypeAnnotation, UnaryOperator, lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +89,11 @@ impl Parser<'_> {
     fn variable(&mut self, mutable: bool) -> Result<Statement, ParseError> {
         let start = self.previous().span;
         let name = self.expect_identifier("expected variable name")?;
+        let type_annotation = if self.consume(TokenKind::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         self.expect(TokenKind::Equal, "expected '=' after variable name")?;
         let initializer = self.expression()?;
         self.consume(TokenKind::Semicolon);
@@ -97,6 +102,7 @@ impl Parser<'_> {
             kind: StatementKind::Variable {
                 name,
                 mutable,
+                type_annotation,
                 initializer,
             },
         })
@@ -112,13 +118,27 @@ impl Parser<'_> {
         let mut parameters = Vec::new();
         if !self.at(TokenKind::RightParenthesis) {
             loop {
-                parameters.push(self.expect_identifier("expected parameter name")?);
+                let name = self.expect_identifier("expected parameter name")?;
+                let type_annotation = if self.consume(TokenKind::Colon) {
+                    Some(self.type_annotation()?)
+                } else {
+                    None
+                };
+                parameters.push(Parameter {
+                    name,
+                    type_annotation,
+                });
                 if !self.consume(TokenKind::Comma) {
                     break;
                 }
             }
         }
         self.expect(TokenKind::RightParenthesis, "expected ')' after parameters")?;
+        let return_type = if self.consume(TokenKind::Arrow) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
         let body = self.block_statements()?;
         let end = self.previous().span;
         Ok(Statement {
@@ -126,6 +146,7 @@ impl Parser<'_> {
             kind: StatementKind::Function {
                 name,
                 parameters,
+                return_type,
                 body,
             },
         })
@@ -413,6 +434,28 @@ impl Parser<'_> {
         Ok(Identifier {
             name: token.text(self.source).unwrap_or_default().to_owned(),
             span: token.span,
+        })
+    }
+
+    fn type_annotation(&mut self) -> Result<TypeAnnotation, ParseError> {
+        let name = self.expect_identifier("expected type name")?;
+        let mut arguments = Vec::new();
+        let mut end = name.span;
+        if self.consume(TokenKind::Less) {
+            loop {
+                arguments.push(self.type_annotation()?);
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            end = self
+                .expect(TokenKind::Greater, "expected '>' after type arguments")?
+                .span;
+        }
+        Ok(TypeAnnotation {
+            span: name.span.cover(end),
+            name,
+            arguments,
         })
     }
 

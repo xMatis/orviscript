@@ -17,6 +17,19 @@ pub struct Identifier {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypeAnnotation {
+    pub name: Identifier,
+    pub arguments: Vec<TypeAnnotation>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Parameter {
+    pub name: Identifier,
+    pub type_annotation: Option<TypeAnnotation>,
+}
+
 impl Identifier {
     pub fn as_str(&self) -> &str {
         &self.name
@@ -28,11 +41,13 @@ pub enum StatementKind {
     Variable {
         name: Identifier,
         mutable: bool,
+        type_annotation: Option<TypeAnnotation>,
         initializer: Expression,
     },
     Function {
         name: Identifier,
-        parameters: Vec<Identifier>,
+        parameters: Vec<Parameter>,
+        return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
     },
     Block(Vec<Statement>),

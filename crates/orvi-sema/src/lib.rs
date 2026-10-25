@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use orvi_syntax::{
-    Expression, ExpressionKind, Identifier, Program, Span, Statement, StatementKind,
+    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, Parameter, Program, Span,
+    Statement, StatementKind, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +13,8 @@ pub enum SemanticErrorKind {
     ImmutableAssignment,
     ReturnOutsideFunction,
     ArgumentCount,
+    UnknownType,
+    TypeMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +39,7 @@ pub struct SymbolOccurrence {
     pub definition: Span,
     pub kind: SymbolKind,
     pub is_definition: bool,
+    pub type_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -50,12 +54,28 @@ impl fmt::Display for SemanticError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Symbol {
     kind: SymbolKind,
     mutable: bool,
     arity: Option<usize>,
     definition: Option<Span>,
+    value_type: StaticType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StaticType {
+    Dynamic,
+    Null,
+    Bool,
+    Int,
+    Float,
+    Number,
+    String,
+    Function {
+        parameters: Vec<StaticType>,
+        result: Box<StaticType>,
+    },
 }
 
 pub fn analyze(program: &Program) -> Vec<SemanticError> {
@@ -71,11 +91,16 @@ pub fn analyze_program(program: &Program) -> Analysis {
                 mutable: false,
                 arity: None,
                 definition: None,
+                value_type: StaticType::Function {
+                    parameters: Vec::new(),
+                    result: Box::new(StaticType::Null),
+                },
             },
         )])],
         errors: Vec::new(),
         symbols: Vec::new(),
         function_depth: 0,
+        current_return_type: None,
     };
     analyzer.statements(&program.statements, false);
     Analysis {
@@ -89,6 +114,7 @@ struct Analyzer {
     errors: Vec<SemanticError>,
     symbols: Vec<SymbolOccurrence>,
     function_depth: usize,
+    current_return_type: Option<StaticType>,
 }
 
 impl Analyzer {
@@ -99,9 +125,22 @@ impl Analyzer {
 
         for statement in statements {
             if let StatementKind::Function {
-                name, parameters, ..
+                name,
+                parameters,
+                return_type,
+                ..
             } = &statement.kind
             {
+                let parameter_types = parameters
+                    .iter()
+                    .map(|parameter| {
+                        self.annotation_type(parameter.type_annotation.as_ref())
+                            .unwrap_or(StaticType::Dynamic)
+                    })
+                    .collect();
+                let result = self
+                    .annotation_type(return_type.as_ref())
+                    .unwrap_or(StaticType::Dynamic);
                 self.declare(
                     name,
                     Symbol {
@@ -109,6 +148,10 @@ impl Analyzer {
                         mutable: false,
                         arity: Some(parameters.len()),
                         definition: Some(name.span),
+                        value_type: StaticType::Function {
+                            parameters: parameter_types,
+                            result: Box::new(result),
+                        },
                     },
                 );
             }
@@ -122,10 +165,13 @@ impl Analyzer {
 
         for statement in statements {
             if let StatementKind::Function {
-                parameters, body, ..
+                parameters,
+                return_type,
+                body,
+                ..
             } = &statement.kind
             {
-                self.function(parameters, body, statement.span);
+                self.function(parameters, return_type.as_ref(), body);
             }
         }
 
@@ -139,9 +185,14 @@ impl Analyzer {
             StatementKind::Variable {
                 name,
                 mutable,
+                type_annotation,
                 initializer,
             } => {
-                self.expression(initializer);
+                let actual = self.expression(initializer);
+                let declared = self.annotation_type(type_annotation.as_ref());
+                if let Some(expected) = &declared {
+                    self.require_assignable(expected, &actual, initializer.span);
+                }
                 self.declare(
                     name,
                     Symbol {
@@ -153,6 +204,7 @@ impl Analyzer {
                         mutable: *mutable,
                         arity: None,
                         definition: Some(name.span),
+                        value_type: declared.unwrap_or(actual),
                     },
                 );
             }
@@ -163,14 +215,16 @@ impl Analyzer {
                 then_branch,
                 else_branch,
             } => {
-                self.expression(condition);
+                let condition_type = self.expression(condition);
+                self.require_assignable(&StaticType::Bool, &condition_type, condition.span);
                 self.statement(then_branch);
                 if let Some(else_branch) = else_branch {
                     self.statement(else_branch);
                 }
             }
             StatementKind::While { condition, body } => {
-                self.expression(condition);
+                let condition_type = self.expression(condition);
+                self.require_assignable(&StaticType::Bool, &condition_type, condition.span);
                 self.statement(body);
             }
             StatementKind::Return(value) => {
@@ -181,65 +235,119 @@ impl Analyzer {
                         span: statement.span,
                     });
                 }
-                if let Some(value) = value {
-                    self.expression(value);
+                let actual = value
+                    .as_ref()
+                    .map_or(StaticType::Null, |value| self.expression(value));
+                if let Some(expected) = self.current_return_type.clone() {
+                    self.require_assignable(&expected, &actual, statement.span);
                 }
             }
-            StatementKind::Expression(expression) => self.expression(expression),
+            StatementKind::Expression(expression) => {
+                self.expression(expression);
+            }
         }
     }
 
-    fn function(&mut self, parameters: &[Identifier], body: &[Statement], _: Span) {
+    fn function(
+        &mut self,
+        parameters: &[Parameter],
+        return_type: Option<&TypeAnnotation>,
+        body: &[Statement],
+    ) {
         self.scopes.push(HashMap::new());
         for parameter in parameters {
+            let value_type = parameter
+                .type_annotation
+                .as_ref()
+                .and_then(static_type_from_annotation)
+                .unwrap_or(StaticType::Dynamic);
             self.declare(
-                parameter,
+                &parameter.name,
                 Symbol {
                     kind: SymbolKind::Parameter,
                     mutable: true,
                     arity: None,
-                    definition: Some(parameter.span),
+                    definition: Some(parameter.name.span),
+                    value_type,
                 },
             );
         }
+        let previous_return_type = self.current_return_type.clone();
+        self.current_return_type = return_type.and_then(static_type_from_annotation);
         self.function_depth += 1;
         self.statements(body, false);
         self.function_depth -= 1;
+        self.current_return_type = previous_return_type;
         self.scopes.pop();
     }
 
-    fn expression(&mut self, expression: &Expression) {
+    fn expression(&mut self, expression: &Expression) -> StaticType {
         match &expression.kind {
-            ExpressionKind::Literal(_) => {}
-            ExpressionKind::Variable(name) => {
-                if self.resolve_reference(name).is_none() {
+            ExpressionKind::Literal(literal) => match literal {
+                Literal::Null => StaticType::Null,
+                Literal::Bool(_) => StaticType::Bool,
+                Literal::Integer(_) => StaticType::Int,
+                Literal::Float(_) => StaticType::Float,
+                Literal::String(_) => StaticType::String,
+            },
+            ExpressionKind::Variable(name) => match self.resolve_reference(name) {
+                Some(symbol) => symbol.value_type,
+                None => {
                     self.undefined(name);
+                    StaticType::Dynamic
                 }
-            }
+            },
             ExpressionKind::Assign { name, value } => {
-                self.expression(value);
+                let actual = self.expression(value);
                 match self.resolve_reference(name) {
-                    None => self.undefined(name),
+                    None => {
+                        self.undefined(name);
+                        StaticType::Dynamic
+                    }
                     Some(symbol) if !symbol.mutable => {
                         self.errors.push(SemanticError {
                             kind: SemanticErrorKind::ImmutableAssignment,
                             message: format!("cannot assign to immutable name '{}'", name.name),
                             span: name.span,
                         });
+                        symbol.value_type
                     }
-                    Some(_) => {}
+                    Some(symbol) => {
+                        self.require_assignable(&symbol.value_type, &actual, value.span);
+                        symbol.value_type
+                    }
                 }
             }
-            ExpressionKind::Unary { operand, .. } => self.expression(operand),
-            ExpressionKind::Binary { left, right, .. } => {
-                self.expression(left);
-                self.expression(right);
+            ExpressionKind::Unary { operator, operand } => {
+                let operand_type = self.expression(operand);
+                match operator {
+                    UnaryOperator::Not => {
+                        self.require_assignable(&StaticType::Bool, &operand_type, operand.span);
+                        StaticType::Bool
+                    }
+                    UnaryOperator::Negate => {
+                        if !operand_type.is_numeric() && operand_type != StaticType::Dynamic {
+                            self.type_error("unary '-' requires a number", expression.span);
+                        }
+                        operand_type
+                    }
+                }
+            }
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left_type = self.expression(left);
+                let right_type = self.expression(right);
+                self.binary_type(*operator, &left_type, &right_type, expression.span)
             }
             ExpressionKind::Call { callee, arguments } => {
-                self.expression(callee);
-                for argument in arguments {
-                    self.expression(argument);
-                }
+                let callee_type = self.expression(callee);
+                let argument_types = arguments
+                    .iter()
+                    .map(|argument| self.expression(argument))
+                    .collect::<Vec<_>>();
                 if let ExpressionKind::Variable(name) = &callee.kind
                     && let Some(Symbol {
                         arity: Some(arity), ..
@@ -256,11 +364,76 @@ impl Analyzer {
                         span: expression.span,
                     });
                 }
+                if let StaticType::Function { parameters, result } = callee_type {
+                    for ((expected, actual), argument) in
+                        parameters.iter().zip(&argument_types).zip(arguments)
+                    {
+                        self.require_assignable(expected, actual, argument.span);
+                    }
+                    *result
+                } else {
+                    if callee_type != StaticType::Dynamic {
+                        self.type_error("value is not callable", callee.span);
+                    }
+                    StaticType::Dynamic
+                }
+            }
+        }
+    }
+
+    fn binary_type(
+        &mut self,
+        operator: BinaryOperator,
+        left: &StaticType,
+        right: &StaticType,
+        span: Span,
+    ) -> StaticType {
+        match operator {
+            BinaryOperator::Equal | BinaryOperator::NotEqual => StaticType::Bool,
+            BinaryOperator::And | BinaryOperator::Or => {
+                self.require_assignable(&StaticType::Bool, left, span);
+                self.require_assignable(&StaticType::Bool, right, span);
+                StaticType::Bool
+            }
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual => {
+                if (!left.is_numeric() && *left != StaticType::Dynamic)
+                    || (!right.is_numeric() && *right != StaticType::Dynamic)
+                {
+                    self.type_error("comparison requires numbers", span);
+                }
+                StaticType::Bool
+            }
+            BinaryOperator::Add if *left == StaticType::String && *right == StaticType::String => {
+                StaticType::String
+            }
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Remainder => {
+                if (!left.is_numeric() && *left != StaticType::Dynamic)
+                    || (!right.is_numeric() && *right != StaticType::Dynamic)
+                {
+                    self.type_error("operator requires numbers", span);
+                    return StaticType::Dynamic;
+                }
+                if *left == StaticType::Int && *right == StaticType::Int {
+                    StaticType::Int
+                } else if *left == StaticType::Dynamic || *right == StaticType::Dynamic {
+                    StaticType::Dynamic
+                } else {
+                    StaticType::Number
+                }
             }
         }
     }
 
     fn declare(&mut self, name: &Identifier, symbol: Symbol) {
+        let occurrence_kind = symbol.kind;
+        let occurrence_type = symbol.value_type.display_name();
         let scope = self.scopes.last_mut().expect("analyzer always has a scope");
         if scope.insert(name.name.clone(), symbol).is_some() {
             self.errors.push(SemanticError {
@@ -273,8 +446,9 @@ impl Analyzer {
             name: name.name.clone(),
             span: name.span,
             definition: name.span,
-            kind: symbol.kind,
+            kind: occurrence_kind,
             is_definition: true,
+            type_name: Some(occurrence_type),
         });
     }
 
@@ -282,7 +456,7 @@ impl Analyzer {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
+            .find_map(|scope| scope.get(name).cloned())
     }
 
     fn resolve_reference(&mut self, name: &Identifier) -> Option<Symbol> {
@@ -294,6 +468,7 @@ impl Analyzer {
                 definition,
                 kind: symbol.kind,
                 is_definition: false,
+                type_name: Some(symbol.value_type.display_name()),
             });
         }
         Some(symbol)
@@ -305,6 +480,102 @@ impl Analyzer {
             message: format!("undefined name '{}'", name.name),
             span: name.span,
         });
+    }
+
+    fn annotation_type(&mut self, annotation: Option<&TypeAnnotation>) -> Option<StaticType> {
+        let annotation = annotation?;
+        let Some(value_type) = static_type_from_annotation(annotation) else {
+            self.errors.push(SemanticError {
+                kind: SemanticErrorKind::UnknownType,
+                message: format!("unknown type '{}'", annotation.name.name),
+                span: annotation.span,
+            });
+            return Some(StaticType::Dynamic);
+        };
+        if !annotation.arguments.is_empty() {
+            self.errors.push(SemanticError {
+                kind: SemanticErrorKind::UnknownType,
+                message: format!(
+                    "type '{}' does not accept type arguments",
+                    annotation.name.name
+                ),
+                span: annotation.span,
+            });
+        }
+        Some(value_type)
+    }
+
+    fn require_assignable(&mut self, expected: &StaticType, actual: &StaticType, span: Span) {
+        if !expected.accepts(actual) {
+            self.errors.push(SemanticError {
+                kind: SemanticErrorKind::TypeMismatch,
+                message: format!(
+                    "expected {}, received {}",
+                    expected.display_name(),
+                    actual.display_name()
+                ),
+                span,
+            });
+        }
+    }
+
+    fn type_error(&mut self, message: impl Into<String>, span: Span) {
+        self.errors.push(SemanticError {
+            kind: SemanticErrorKind::TypeMismatch,
+            message: message.into(),
+            span,
+        });
+    }
+}
+
+impl StaticType {
+    fn is_numeric(&self) -> bool {
+        matches!(self, Self::Int | Self::Float | Self::Number)
+    }
+
+    fn accepts(&self, actual: &Self) -> bool {
+        self == &Self::Dynamic
+            || actual == &Self::Dynamic
+            || self == actual
+            || (*self == Self::Number && actual.is_numeric())
+    }
+
+    fn display_name(&self) -> String {
+        match self {
+            Self::Dynamic => "any".into(),
+            Self::Null => "null".into(),
+            Self::Bool => "bool".into(),
+            Self::Int => "int".into(),
+            Self::Float => "float".into(),
+            Self::Number => "number".into(),
+            Self::String => "string".into(),
+            Self::Function { parameters, result } => format!(
+                "fn({}) -> {}",
+                parameters
+                    .iter()
+                    .map(Self::display_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result.display_name()
+            ),
+        }
+    }
+}
+
+fn static_type_from_annotation(annotation: &TypeAnnotation) -> Option<StaticType> {
+    match annotation.name.as_str() {
+        "any" => Some(StaticType::Dynamic),
+        "null" => Some(StaticType::Null),
+        "bool" => Some(StaticType::Bool),
+        "int" => Some(StaticType::Int),
+        "float" => Some(StaticType::Float),
+        "number" => Some(StaticType::Number),
+        "string" => Some(StaticType::String),
+        "fn" => Some(StaticType::Function {
+            parameters: Vec::new(),
+            result: Box::new(StaticType::Dynamic),
+        }),
+        _ => None,
     }
 }
 
@@ -376,5 +647,25 @@ mod tests {
         assert_eq!(references.len(), 2);
         assert_eq!(references[0].definition, definitions[1].definition);
         assert_eq!(references[1].definition, definitions[0].definition);
+    }
+
+    #[test]
+    fn checks_declared_binding_and_function_types() {
+        let errors = errors(
+            "let count: int = \"wrong\"; fn twice(value: int) -> int { return value * 2; } twice(\"wrong\");",
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn reports_unknown_types() {
+        let errors = errors("let value: missing = 1;");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, SemanticErrorKind::UnknownType);
     }
 }

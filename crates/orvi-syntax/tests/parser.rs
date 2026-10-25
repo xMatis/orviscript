@@ -55,3 +55,32 @@ fn reports_invalid_assignment_target() {
             .any(|error| error.message == "invalid assignment target")
     );
 }
+
+#[test]
+fn parses_binding_parameter_and_return_types() {
+    let parsed = parse("let port: int = 22; fn label(value: int) -> string { return \"ok\" }");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+
+    let StatementKind::Variable {
+        type_annotation: Some(annotation),
+        ..
+    } = &parsed.program.statements[0].kind
+    else {
+        panic!("expected typed variable")
+    };
+    assert_eq!(annotation.name.name, "int");
+
+    let StatementKind::Function {
+        parameters,
+        return_type: Some(return_type),
+        ..
+    } = &parsed.program.statements[1].kind
+    else {
+        panic!("expected typed function")
+    };
+    assert_eq!(
+        parameters[0].type_annotation.as_ref().unwrap().name.name,
+        "int"
+    );
+    assert_eq!(return_type.name.name, "string");
+}

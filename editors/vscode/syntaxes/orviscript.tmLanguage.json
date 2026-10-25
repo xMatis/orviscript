@@ -8,6 +8,7 @@
     { "include": "#numbers" },
     { "include": "#keywords" },
     { "include": "#constants" },
+    { "include": "#types" },
     { "include": "#functionDeclarations" },
     { "include": "#functionCalls" },
     { "include": "#operators" },
@@ -49,6 +50,11 @@
         { "name": "constant.language.orviscript", "match": "\\b(?:true|false|null)\\b" }
       ]
     },
+    "types": {
+      "patterns": [
+        { "name": "support.type.builtin.orviscript", "match": "\\b(?:any|bool|float|fn|int|null|number|string)\\b" }
+      ]
+    },
     "functionDeclarations": {
       "patterns": [
         { "name": "entity.name.function.orviscript", "match": "(?<=\\bfn\\s)[\\p{L}_][\\p{L}\\p{N}_]*" }
@@ -61,12 +67,12 @@
     },
     "operators": {
       "patterns": [
-        { "name": "keyword.operator.orviscript", "match": "(?:==|!=|<=|>=|&&|\\|\\||\\+|-|\\*|/|%|=|!|<|>)" }
+        { "name": "keyword.operator.orviscript", "match": "(?:->|==|!=|<=|>=|&&|\\|\\||\\+|-|\\*|/|%|=|!|<|>)" }
       ]
     },
     "punctuation": {
       "patterns": [
-        { "name": "punctuation.separator.orviscript", "match": "[,;]" },
+        { "name": "punctuation.separator.orviscript", "match": "[,;:]" },
         { "name": "punctuation.section.group.orviscript", "match": "[(){}\\[\\]]" }
       ]
     }

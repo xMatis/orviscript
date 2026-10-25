@@ -122,8 +122,12 @@ impl LanguageServer for Backend {
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
-    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
-        Ok(Some(CompletionResponse::Array(completion_items())))
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let document = params.text_document_position.text_document;
+        let source = self.document(&document.uri);
+        Ok(Some(CompletionResponse::Array(completion_items(
+            source.as_deref(),
+        ))))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -306,6 +310,7 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
             SemanticTokenType::NUMBER,
             SemanticTokenType::COMMENT,
             SemanticTokenType::OPERATOR,
+            SemanticTokenType::TYPE,
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
@@ -386,6 +391,9 @@ fn classify_token(
     const DEFAULT_LIBRARY: u32 = 4;
 
     let classification = match kind {
+        TokenKind::Identifier if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) => {
+            (8, 0)
+        }
         TokenKind::Identifier if previous == Some(TokenKind::Fn) => (1, DECLARATION),
         TokenKind::Identifier if in_parameters => (2, DECLARATION),
         TokenKind::Identifier if previous == Some(TokenKind::Let) => (0, DECLARATION),
@@ -436,8 +444,8 @@ fn classify_token(
     Some(classification)
 }
 
-fn completion_items() -> Vec<CompletionItem> {
-    [
+fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
+    let mut items = [
         (
             "let",
             CompletionItemKind::KEYWORD,
@@ -465,6 +473,16 @@ fn completion_items() -> Vec<CompletionItem> {
             CompletionItemKind::FUNCTION,
             "built-in output function",
         ),
+        ("int", CompletionItemKind::TYPE_PARAMETER, "integer type"),
+        (
+            "float",
+            CompletionItemKind::TYPE_PARAMETER,
+            "floating-point type",
+        ),
+        ("number", CompletionItemKind::TYPE_PARAMETER, "numeric type"),
+        ("string", CompletionItemKind::TYPE_PARAMETER, "string type"),
+        ("bool", CompletionItemKind::TYPE_PARAMETER, "boolean type"),
+        ("any", CompletionItemKind::TYPE_PARAMETER, "dynamic type"),
     ]
     .into_iter()
     .map(|(label, kind, detail)| CompletionItem {
@@ -473,7 +491,35 @@ fn completion_items() -> Vec<CompletionItem> {
         detail: Some(detail.into()),
         ..CompletionItem::default()
     })
-    .collect()
+    .collect::<Vec<_>>();
+    if let Some(source) = source {
+        let parsed = parse(source);
+        if !parsed.has_errors() {
+            let analysis = analyze_program(&parsed.program);
+            for symbol in analysis
+                .symbols
+                .into_iter()
+                .filter(|symbol| symbol.is_definition)
+            {
+                if items.iter().any(|item| item.label == symbol.name) {
+                    continue;
+                }
+                let kind = match symbol.kind {
+                    orvi_sema::SymbolKind::Function => CompletionItemKind::FUNCTION,
+                    orvi_sema::SymbolKind::Variable
+                    | orvi_sema::SymbolKind::Constant
+                    | orvi_sema::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+                };
+                items.push(CompletionItem {
+                    label: symbol.name,
+                    kind: Some(kind),
+                    detail: symbol.type_name,
+                    ..CompletionItem::default()
+                });
+            }
+        }
+    }
+    items
 }
 
 fn hover_at(source: &str, position: Position) -> Option<Hover> {
@@ -494,7 +540,23 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "true" | "false" => "Built-in boolean value.",
         "null" => "Built-in null value.",
         "print" => "`print(...)` writes its arguments to standard output.",
-        _ => return None,
+        _ => {
+            let (_, symbol) = symbol_at(source, position)?;
+            let kind = match symbol.kind {
+                orvi_sema::SymbolKind::Variable => "let",
+                orvi_sema::SymbolKind::Constant => "const",
+                orvi_sema::SymbolKind::Function => "fn",
+                orvi_sema::SymbolKind::Parameter => "parameter",
+            };
+            let type_name = symbol.type_name.unwrap_or_else(|| "any".into());
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```orviscript\n{kind} {}: {type_name}\n```", symbol.name),
+                }),
+                range: Some(span_range(source, symbol.span)),
+            });
+        }
     };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -627,7 +689,7 @@ mod tests {
 
     #[test]
     fn offers_implemented_keywords_and_builtin() {
-        let items = completion_items();
+        let items = completion_items(None);
 
         assert!(items.iter().any(|item| item.label == "let"));
         assert!(items.iter().any(|item| {
@@ -643,6 +705,26 @@ mod tests {
             panic!("expected markdown hover");
         };
         assert!(contents.value.contains("standard output"));
+    }
+
+    #[test]
+    fn explains_declared_symbol_types_on_hover() {
+        let hover = hover_at("let answer: int = 42; print(answer);", Position::new(0, 30))
+            .expect("hover result");
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(contents.value.contains("answer: int"));
+    }
+
+    #[test]
+    fn completes_symbols_declared_in_the_document() {
+        let items = completion_items(Some("let answer: int = 42;"));
+        let answer = items
+            .iter()
+            .find(|item| item.label == "answer")
+            .expect("symbol completion");
+        assert_eq!(answer.detail.as_deref(), Some("int"));
     }
 
     #[test]
