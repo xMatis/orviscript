@@ -345,13 +345,8 @@ fn execute_internal(
     let mut interpreter = Interpreter::new(context, entry_file);
     let result = interpreter.execute_statements(&program.statements);
     let cleanup = interpreter.run_deferred();
-    let control = match result {
-        Ok(control) => {
-            cleanup?;
-            control
-        }
-        Err(error) => return Err(error),
-    };
+    let control = result?;
+    cleanup?;
     let value = match control {
         Control::Continue(value) => value,
         Control::Return(_) => {
