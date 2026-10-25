@@ -74,3 +74,41 @@ fn formats_source_and_checks_the_result() {
     fs::remove_file(path).expect("temporary source can be removed");
     assert!(after.status.success());
 }
+
+#[test]
+fn checks_import_exports_and_cycles() {
+    let first = source_file("let available = 1;");
+    let second = first.with_file_name(format!(
+        "{}-entry.orvi",
+        first.file_stem().unwrap().to_string_lossy()
+    ));
+    let import_name = first.file_name().unwrap().to_string_lossy();
+    fs::write(
+        &second,
+        format!("import {{ missing }} from \"./{import_name}\";"),
+    )
+    .unwrap();
+    let output = run(&["check", second.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("has no export 'missing'"));
+
+    fs::write(
+        &first,
+        format!(
+            "import {{ second }} from \"./{}\"; let first = 1;",
+            second.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        format!("import {{ first }} from \"./{import_name}\"; let second = 2;"),
+    )
+    .unwrap();
+    let output = run(&["check", second.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cyclic module import"));
+
+    fs::remove_file(first).unwrap();
+    fs::remove_file(second).unwrap();
+}

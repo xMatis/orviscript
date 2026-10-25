@@ -284,6 +284,8 @@ fn is_word(kind: TokenKind) -> bool {
             | TokenKind::Fn
             | TokenKind::Struct
             | TokenKind::Interface
+            | TokenKind::Import
+            | TokenKind::From
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While

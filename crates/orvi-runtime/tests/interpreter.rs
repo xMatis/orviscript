@@ -1,4 +1,4 @@
-use orvi_runtime::{ExecutionContext, execute, execute_with_context};
+use orvi_runtime::{ExecutionContext, execute, execute_file, execute_with_context};
 use orvi_syntax::parse;
 
 fn run(source: &str) -> Result<Vec<String>, String> {
@@ -285,4 +285,31 @@ fn provides_files_paths_environment_processes_and_context() {
     };
     let output = run_in(source, directory.path()).expect("process runs");
     assert!(output[0].starts_with("Ok({ exit_code: 0, success: true, stdout: orvi"));
+}
+
+#[test]
+fn imports_local_modules_once_and_standard_module_members() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let module_path = directory.path().join("math.orvi");
+    std::fs::write(
+        &module_path,
+        "print(\"loaded\"); let base: int = 40; fn add(value: int) -> int { return base + value }",
+    )
+    .expect("module source");
+    let entry_path = directory.path().join("main.orvi");
+    let source = "import { base } from \"./math.orvi\"; import { add } from \"./math.orvi\"; import { exists } from \"std:fs\"; print(add(2)); print(base); print(exists(\"math.orvi\"))";
+    std::fs::write(&entry_path, source).expect("entry source");
+    let parsed = parse(source);
+    assert!(!parsed.has_errors());
+    let execution = execute_file(
+        &parsed.program,
+        ExecutionContext {
+            cwd: directory.path().into(),
+            script_dir: directory.path().into(),
+            project_dir: directory.path().into(),
+        },
+        entry_path,
+    )
+    .expect("imports run");
+    assert_eq!(execution.output, ["loaded", "42", "40", "true"]);
 }

@@ -317,6 +317,8 @@ fn keyword_kind(identifier: &str) -> Option<TokenKind> {
         "fn" => TokenKind::Fn,
         "struct" => TokenKind::Struct,
         "interface" => TokenKind::Interface,
+        "import" => TokenKind::Import,
+        "from" => TokenKind::From,
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,

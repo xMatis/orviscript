@@ -41,7 +41,7 @@
     },
     "keywords": {
       "patterns": [
-        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|struct|interface)\\b" },
+        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|struct|interface|import|from)\\b" },
         { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return|match|using|defer)\\b" }
       ]
     },

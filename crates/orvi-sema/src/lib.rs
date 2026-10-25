@@ -33,6 +33,7 @@ pub enum SymbolKind {
     Parameter,
     Struct,
     Interface,
+    Import,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,6 +241,36 @@ impl Analyzer {
         }
 
         for statement in statements {
+            if let StatementKind::Import { names, source } = &statement.kind {
+                let standard_module = source.strip_prefix("std:");
+                for name in names {
+                    let value_type = if let Some(module) = standard_module {
+                        module_member_type(module, name.as_str()).unwrap_or_else(|| {
+                            self.errors.push(SemanticError {
+                                kind: SemanticErrorKind::UndefinedName,
+                                message: format!("module '{source}' has no export '{}'", name.name),
+                                span: name.span,
+                            });
+                            StaticType::Dynamic
+                        })
+                    } else {
+                        StaticType::Dynamic
+                    };
+                    self.declare(
+                        name,
+                        Symbol {
+                            kind: SymbolKind::Import,
+                            mutable: false,
+                            arity: None,
+                            definition: Some(name.span),
+                            value_type,
+                        },
+                    );
+                }
+            }
+        }
+
+        for statement in statements {
             if let StatementKind::Interface { name, fields } = &statement.kind {
                 self.interface_names.insert(name.name.clone());
                 let mut field_types = HashMap::new();
@@ -426,6 +457,7 @@ impl Analyzer {
                 }
             }
             StatementKind::Interface { .. } => {}
+            StatementKind::Import { .. } => {}
             StatementKind::Block(statements) => self.statements(statements, true),
             StatementKind::If {
                 condition,
@@ -1515,5 +1547,14 @@ mod tests {
 
         let errors = errors("fs.write_text(\"only-one\"); process.run(1, [])");
         assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn declares_named_imports_and_checks_standard_exports() {
+        assert!(errors("import { read_text } from \"std:fs\"; read_text(\"file\")").is_empty());
+        assert!(errors("import { value } from \"./module.orvi\"; print(value)").is_empty());
+        let errors = errors("import { missing } from \"std:fs\";");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, SemanticErrorKind::UndefinedName);
     }
 }

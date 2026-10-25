@@ -439,6 +439,8 @@ fn classify_token(
         | TokenKind::Fn
         | TokenKind::Struct
         | TokenKind::Interface
+        | TokenKind::Import
+        | TokenKind::From
         | TokenKind::Match
         | TokenKind::Using
         | TokenKind::Defer
@@ -501,6 +503,8 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             CompletionItemKind::KEYWORD,
             "structural interface declaration",
         ),
+        ("import", CompletionItemKind::KEYWORD, "named module import"),
+        ("from", CompletionItemKind::KEYWORD, "module import source"),
         (
             "match",
             CompletionItemKind::KEYWORD,
@@ -594,6 +598,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
                     orvi_sema::SymbolKind::Function => CompletionItemKind::FUNCTION,
                     orvi_sema::SymbolKind::Struct => CompletionItemKind::STRUCT,
                     orvi_sema::SymbolKind::Interface => CompletionItemKind::INTERFACE,
+                    orvi_sema::SymbolKind::Import => CompletionItemKind::VARIABLE,
                     orvi_sema::SymbolKind::Variable
                     | orvi_sema::SymbolKind::Constant
                     | orvi_sema::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
@@ -623,6 +628,8 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "fn" => "`fn` declares a function.",
         "struct" => "`struct` declares a stable set of typed fields.",
         "interface" => "`interface` declares a structural field contract.",
+        "import" => "`import { name } from \"module\"` imports selected names.",
+        "from" => "`from` introduces an import source.",
         "match" => "`match` selects an expression using exhaustive patterns.",
         "using" => "`using name = value => cleanup` registers scoped cleanup.",
         "defer" => "`defer expression` runs the expression when the scope exits.",
@@ -645,6 +652,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
                 orvi_sema::SymbolKind::Function => "fn",
                 orvi_sema::SymbolKind::Struct => "struct",
                 orvi_sema::SymbolKind::Interface => "interface",
+                orvi_sema::SymbolKind::Import => "import",
                 orvi_sema::SymbolKind::Parameter => "parameter",
             };
             let type_name = symbol.type_name.unwrap_or_else(|| "any".into());

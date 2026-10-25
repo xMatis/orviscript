@@ -180,3 +180,20 @@ fn parses_map_literals_and_string_indices() {
     };
     assert!(matches!(initializer.kind, ExpressionKind::Map(_)));
 }
+
+#[test]
+fn parses_named_imports() {
+    let parsed = parse("import { read_text, exists } from \"std:fs\";");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Import { names, source } = &parsed.program.statements[0].kind else {
+        panic!("expected import declaration")
+    };
+    assert_eq!(
+        names
+            .iter()
+            .map(|name| name.name.as_str())
+            .collect::<Vec<_>>(),
+        ["read_text", "exists"]
+    );
+    assert_eq!(source, "std:fs");
+}

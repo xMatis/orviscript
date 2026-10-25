@@ -205,6 +205,9 @@ impl Environment {
             .map(|binding| binding.value.clone())
             .or_else(|| data.parent.as_ref().and_then(|parent| parent.get(name)))
     }
+    fn get_local_binding(&self, name: &str) -> Option<Binding> {
+        self.0.borrow().values.get(name).cloned()
+    }
     fn assign(&self, name: &str, value: Value) -> Result<(), AssignError> {
         let parent = {
             let mut data = self.0.borrow_mut();
@@ -281,12 +284,28 @@ enum Control {
 }
 
 pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
-    execute_with_context(program, ExecutionContext::default())
+    execute_internal(program, ExecutionContext::default(), None)
 }
 
 pub fn execute_with_context(
     program: &Program,
     context: ExecutionContext,
+) -> Result<Execution, RuntimeError> {
+    execute_internal(program, context, None)
+}
+
+pub fn execute_file(
+    program: &Program,
+    context: ExecutionContext,
+    entry_file: PathBuf,
+) -> Result<Execution, RuntimeError> {
+    execute_internal(program, context, Some(entry_file))
+}
+
+fn execute_internal(
+    program: &Program,
+    context: ExecutionContext,
+    entry_file: Option<PathBuf>,
 ) -> Result<Execution, RuntimeError> {
     let globals = Environment::root();
     globals.define("print".into(), Value::NativePrint, false, None);
@@ -349,6 +368,7 @@ pub fn execute_with_context(
     globals.define("context".into(), context_value, false, None);
     let mut interpreter = Interpreter {
         environment: globals.clone(),
+        globals: globals.clone(),
         output: Vec::new(),
         function_depth: 0,
         environments: vec![Rc::downgrade(&globals.0)],
@@ -358,6 +378,9 @@ pub fn execute_with_context(
         collected_objects: 0,
         deferred: vec![Vec::new()],
         context,
+        current_files: entry_file.into_iter().collect(),
+        module_cache: HashMap::new(),
+        modules_in_progress: HashSet::new(),
     };
     let result = interpreter.execute_statements(&program.statements);
     let cleanup = interpreter.run_deferred();
@@ -388,6 +411,7 @@ pub fn execute_with_context(
 
 struct Interpreter {
     environment: Environment,
+    globals: Environment,
     output: Vec<String>,
     function_depth: usize,
     environments: Vec<Weak<RefCell<EnvironmentData>>>,
@@ -397,6 +421,9 @@ struct Interpreter {
     collected_objects: usize,
     deferred: Vec<Vec<Expression>>,
     context: ExecutionContext,
+    current_files: Vec<PathBuf>,
+    module_cache: HashMap<PathBuf, Environment>,
+    modules_in_progress: HashSet<PathBuf>,
 }
 
 impl Interpreter {
@@ -492,6 +519,49 @@ impl Interpreter {
                 );
                 Ok(Control::Continue(Value::Null))
             }
+            StatementKind::Import { names, source } => {
+                if let Some(module) = source.strip_prefix("std:") {
+                    let module = native_module(module).ok_or_else(|| {
+                        self.error(
+                            format!("unknown standard module '{source}'"),
+                            statement.span,
+                        )
+                    })?;
+                    for name in names {
+                        let function = module.member(name.as_str()).ok_or_else(|| {
+                            self.error(
+                                format!("module '{source}' has no export '{}'", name.name),
+                                name.span,
+                            )
+                        })?;
+                        self.environment.define(
+                            name.name.clone(),
+                            Value::NativeFunction(function),
+                            false,
+                            None,
+                        );
+                    }
+                    return Ok(Control::Continue(Value::Null));
+                }
+
+                let path = self.resolve_module_path(source, statement.span)?;
+                let module = self.load_module(&path, statement.span)?;
+                for name in names {
+                    let binding = module.get_local_binding(name.as_str()).ok_or_else(|| {
+                        self.error(
+                            format!("module '{}' has no export '{}'", path.display(), name.name),
+                            name.span,
+                        )
+                    })?;
+                    self.environment.define(
+                        name.name.clone(),
+                        binding.value,
+                        false,
+                        binding.type_annotation,
+                    );
+                }
+                Ok(Control::Continue(Value::Null))
+            }
             StatementKind::Block(statements) => {
                 let environment = self.child_environment(self.environment.clone());
                 self.execute_block(statements, environment)
@@ -575,6 +645,81 @@ impl Interpreter {
             Ok(control) => cleanup.map(|()| control),
             Err(error) => Err(error),
         }
+    }
+
+    fn resolve_module_path(&self, source: &str, span: Span) -> Result<PathBuf, RuntimeError> {
+        let source_path = PathBuf::from(source);
+        let path = if source_path.is_absolute() {
+            source_path
+        } else {
+            let Some(current_file) = self.current_files.last() else {
+                return Err(self.error("local imports require a source file path", span));
+            };
+            current_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(source_path)
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("orvi") {
+            return Err(self.error("local module path must end with '.orvi'", span));
+        }
+        path.canonicalize().map_err(|error| {
+            self.error(
+                format!("could not resolve module '{}': {error}", path.display()),
+                span,
+            )
+        })
+    }
+
+    fn load_module(&mut self, path: &Path, span: Span) -> Result<Environment, RuntimeError> {
+        if let Some(environment) = self.module_cache.get(path) {
+            return Ok(environment.clone());
+        }
+        if !self.modules_in_progress.insert(path.to_path_buf()) {
+            return Err(self.error(
+                format!("cyclic module import involving '{}'", path.display()),
+                span,
+            ));
+        }
+
+        let result = (|| {
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                self.error(
+                    format!("could not read module '{}': {error}", path.display()),
+                    span,
+                )
+            })?;
+            let parsed = orvi_syntax::parse(&source);
+            if let Some(error) = parsed.lexical_errors.first() {
+                return Err(self.error(format!("module '{}': {error}", path.display()), span));
+            }
+            if let Some(error) = parsed.parse_errors.first() {
+                return Err(self.error(
+                    format!("module '{}': {}", path.display(), error.message),
+                    span,
+                ));
+            }
+
+            let environment = self.child_environment(self.globals.clone());
+            let previous = std::mem::replace(&mut self.environment, environment.clone());
+            self.current_files.push(path.to_path_buf());
+            self.deferred.push(Vec::new());
+            let execution = self.execute_statements(&parsed.program.statements);
+            let cleanup = self.run_deferred();
+            self.deferred.pop();
+            self.current_files.pop();
+            self.environment = previous;
+            let control = execution.and_then(|control| cleanup.map(|()| control))?;
+            if matches!(control, Control::Return(_)) {
+                return Err(self.error("return is not valid at module top level", span));
+            }
+            self.module_cache
+                .insert(path.to_path_buf(), environment.clone());
+            Ok(environment)
+        })();
+
+        self.modules_in_progress.remove(path);
+        result
     }
 
     fn run_deferred(&mut self) -> Result<(), RuntimeError> {
@@ -1402,6 +1547,9 @@ impl Interpreter {
             &mut marked_environments,
             &mut marked_lists,
         );
+        for environment in self.module_cache.values() {
+            mark_environment(environment, &mut marked_environments, &mut marked_lists);
+        }
         for value in temporary_roots {
             mark_value(value, &mut marked_environments, &mut marked_lists);
         }
@@ -1412,6 +1560,9 @@ impl Interpreter {
     fn collect_finished(&mut self, result_roots: &[Value]) {
         let mut marked_environments = HashSet::new();
         let mut marked_lists = HashSet::new();
+        for environment in self.module_cache.values() {
+            mark_environment(environment, &mut marked_environments, &mut marked_lists);
+        }
         for value in result_roots {
             mark_value(value, &mut marked_environments, &mut marked_lists);
         }
@@ -1588,6 +1739,18 @@ impl NativeModule {
             (Self::Terminal, "password") => Some(NativeFunction::TerminalPassword),
             _ => None,
         }
+    }
+}
+
+fn native_module(name: &str) -> Option<NativeModule> {
+    match name {
+        "json" => Some(NativeModule::Json),
+        "fs" => Some(NativeModule::Fs),
+        "path" => Some(NativeModule::Path),
+        "env" => Some(NativeModule::Env),
+        "process" => Some(NativeModule::Process),
+        "terminal" => Some(NativeModule::Terminal),
+        _ => None,
     }
 }
 

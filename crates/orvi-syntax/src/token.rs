@@ -13,6 +13,8 @@ pub enum TokenKind {
     Fn,
     Struct,
     Interface,
+    Import,
+    From,
     If,
     Else,
     While,

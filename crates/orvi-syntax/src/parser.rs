@@ -90,6 +90,9 @@ impl Parser<'_> {
         if self.consume(TokenKind::Interface) {
             return self.interface_declaration();
         }
+        if self.consume(TokenKind::Import) {
+            return self.import_declaration();
+        }
         self.statement()
     }
 
@@ -216,6 +219,31 @@ impl Parser<'_> {
         Ok(Statement {
             span: start.cover(end),
             kind: StatementKind::Interface { name, fields },
+        })
+    }
+
+    fn import_declaration(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        self.expect(TokenKind::LeftBrace, "expected '{' after import")?;
+        let mut names = Vec::new();
+        if !self.at(TokenKind::RightBrace) {
+            loop {
+                names.push(self.expect_identifier("expected imported name")?);
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RightBrace, "expected '}' after imported names")?;
+        self.expect(TokenKind::From, "expected 'from' after imported names")?;
+        let source = self.expect(TokenKind::String, "expected module path after 'from'")?;
+        self.consume(TokenKind::Semicolon);
+        Ok(Statement {
+            span: start.cover(source.span),
+            kind: StatementKind::Import {
+                names,
+                source: unescape_string(source.text(self.source).unwrap_or_default()),
+            },
         })
     }
 
@@ -797,6 +825,7 @@ impl Parser<'_> {
                     | TokenKind::Fn
                     | TokenKind::Struct
                     | TokenKind::Interface
+                    | TokenKind::Import
                     | TokenKind::If
                     | TokenKind::While
                     | TokenKind::Return

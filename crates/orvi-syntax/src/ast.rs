@@ -89,6 +89,10 @@ pub enum StatementKind {
         name: Identifier,
         fields: Vec<StructField>,
     },
+    Import {
+        names: Vec<Identifier>,
+        source: String,
+    },
     Block(Vec<Statement>),
     If {
         condition: Expression,
