@@ -541,6 +541,12 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
         ("map", CompletionItemKind::TYPE_PARAMETER, "map type"),
         ("json", CompletionItemKind::MODULE, "JSON module"),
+        ("fs", CompletionItemKind::MODULE, "filesystem module"),
+        ("path", CompletionItemKind::MODULE, "path module"),
+        ("env", CompletionItemKind::MODULE, "environment module"),
+        ("process", CompletionItemKind::MODULE, "process module"),
+        ("terminal", CompletionItemKind::MODULE, "terminal module"),
+        ("context", CompletionItemKind::VARIABLE, "execution context"),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
         (

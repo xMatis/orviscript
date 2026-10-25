@@ -1,4 +1,4 @@
-use orvi_runtime::execute;
+use orvi_runtime::{ExecutionContext, execute, execute_with_context};
 use orvi_syntax::parse;
 
 fn run(source: &str) -> Result<Vec<String>, String> {
@@ -12,6 +12,26 @@ fn run(source: &str) -> Result<Vec<String>, String> {
     execute(&parsed.program)
         .map(|execution| execution.output)
         .map_err(|error| error.message)
+}
+
+fn run_in(source: &str, directory: &std::path::Path) -> Result<Vec<String>, String> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return Err(format!(
+            "syntax errors: {:?} {:?}",
+            parsed.lexical_errors, parsed.parse_errors
+        ));
+    }
+    execute_with_context(
+        &parsed.program,
+        ExecutionContext {
+            cwd: directory.into(),
+            script_dir: directory.into(),
+            project_dir: directory.into(),
+        },
+    )
+    .map(|execution| execution.output)
+    .map_err(|error| error.message)
 }
 
 #[test]
@@ -238,4 +258,31 @@ fn parses_and_stringifies_json_without_panics() {
         run(source).expect("cycle is returned as Err"),
         ["Err(JSON cannot represent cyclic values)"]
     );
+}
+
+#[test]
+fn provides_files_paths_environment_processes_and_context() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = "print(fs.write_text(\"note.txt\", \"hello\")); print(fs.exists(\"note.txt\")); print(fs.read_text(\"note.txt\")); print(path.file_name(path.join([\"folder\", \"note.txt\"]))); print(path.parent(\"folder/note.txt\")); print(path.is_absolute(context.cwd)); print(env.current_dir()); print(fs.remove_file(\"note.txt\")); print(fs.exists(\"note.txt\"))";
+    let output = run_in(source, directory.path()).expect("automation APIs run");
+    assert_eq!(output[0], "Ok(null)");
+    assert_eq!(output[1], "true");
+    assert_eq!(output[2], "Ok(hello)");
+    assert_eq!(output[3], "Some(note.txt)");
+    assert_eq!(output[4], "Some(folder)");
+    assert_eq!(output[5], directory.path().is_absolute().to_string());
+    assert_eq!(
+        output[6],
+        format!("Ok({})", directory.path().to_string_lossy())
+    );
+    assert_eq!(output[7], "Ok(null)");
+    assert_eq!(output[8], "false");
+
+    let source = if cfg!(windows) {
+        "print(process.run(\"cmd\", [\"/C\", \"echo orvi\"]))"
+    } else {
+        "print(process.run(\"sh\", [\"-c\", \"printf orvi\"]))"
+    };
+    let output = run_in(source, directory.path()).expect("process runs");
+    assert!(output[0].starts_with("Ok({ exit_code: 0, success: true, stdout: orvi"));
 }

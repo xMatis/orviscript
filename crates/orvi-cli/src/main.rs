@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use orvi_runtime::execute;
+use orvi_runtime::{ExecutionContext, execute_with_context};
 use orvi_sema::analyze;
 use orvi_syntax::{Span, format_source, line_column, parse};
 
@@ -109,7 +109,21 @@ fn run_file(path: &Path) -> ExitCode {
     if report_semantic_errors(path, &source, &parsed.program) {
         return ExitCode::from(1);
     }
-    match execute(&parsed.program) {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let script_dir = path
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| {
+            path.parent()
+                .map_or_else(|| cwd.clone(), |parent| cwd.join(parent))
+        });
+    let context = ExecutionContext {
+        cwd,
+        project_dir: find_project_dir(&script_dir),
+        script_dir,
+    };
+    match execute_with_context(&parsed.program, context) {
         Ok(execution) => {
             for line in execution.output {
                 println!("{line}");
@@ -121,6 +135,14 @@ fn run_file(path: &Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn find_project_dir(script_dir: &Path) -> PathBuf {
+    script_dir
+        .ancestors()
+        .find(|directory| directory.join("orvi.toml").is_file())
+        .unwrap_or(script_dir)
+        .to_path_buf()
 }
 
 fn format_file(path: &Path, check: bool) -> ExitCode {

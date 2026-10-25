@@ -193,7 +193,32 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
                 value_type: StaticType::Module("json".into()),
             },
         ),
+        ("fs".into(), module_symbol("fs")),
+        ("path".into(), module_symbol("path")),
+        ("env".into(), module_symbol("env")),
+        ("process".into(), module_symbol("process")),
+        ("terminal".into(), module_symbol("terminal")),
+        (
+            "context".into(),
+            Symbol {
+                kind: SymbolKind::Constant,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Map(Box::new(StaticType::String)),
+            },
+        ),
     ])
+}
+
+fn module_symbol(name: &str) -> Symbol {
+    Symbol {
+        kind: SymbolKind::Constant,
+        mutable: false,
+        arity: None,
+        definition: None,
+        value_type: StaticType::Module(name.into()),
+    }
 }
 
 struct Analyzer {
@@ -1220,22 +1245,73 @@ fn static_type_from_annotation(
 
 fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
     match (module, member) {
-        ("json", "parse") => Some(StaticType::Function {
-            parameters: vec![StaticType::String],
-            result: Box::new(StaticType::Result(
-                Box::new(StaticType::Dynamic),
-                Box::new(StaticType::String),
-            )),
-        }),
-        ("json", "stringify") => Some(StaticType::Function {
-            parameters: vec![StaticType::Dynamic],
-            result: Box::new(StaticType::Result(
-                Box::new(StaticType::String),
-                Box::new(StaticType::String),
-            )),
-        }),
+        ("json", "parse") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::Dynamic),
+        )),
+        ("json", "stringify") => Some(function_type(
+            vec![StaticType::Dynamic],
+            result_type(StaticType::String),
+        )),
+        ("fs", "read_text") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::String),
+        )),
+        ("fs", "write_text") => Some(function_type(
+            vec![StaticType::String, StaticType::String],
+            result_type(StaticType::Null),
+        )),
+        ("fs", "exists") => Some(function_type(vec![StaticType::String], StaticType::Bool)),
+        ("fs", "create_dir_all" | "remove_file") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::Null),
+        )),
+        ("path", "join") => Some(function_type(
+            vec![StaticType::List(Box::new(StaticType::String))],
+            StaticType::String,
+        )),
+        ("path", "parent" | "file_name") => Some(function_type(
+            vec![StaticType::String],
+            option_type(StaticType::String),
+        )),
+        ("path", "is_absolute") => Some(function_type(vec![StaticType::String], StaticType::Bool)),
+        ("env", "get") => Some(function_type(
+            vec![StaticType::String],
+            option_type(StaticType::String),
+        )),
+        ("env", "current_dir") => Some(function_type(Vec::new(), result_type(StaticType::String))),
+        ("process", "run") => Some(function_type(
+            vec![
+                StaticType::String,
+                StaticType::List(Box::new(StaticType::String)),
+            ],
+            result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
+        )),
+        ("terminal", "input" | "password") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::String),
+        )),
+        ("terminal", "confirm") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::Bool),
+        )),
         _ => None,
     }
+}
+
+fn function_type(parameters: Vec<StaticType>, result: StaticType) -> StaticType {
+    StaticType::Function {
+        parameters,
+        result: Box::new(result),
+    }
+}
+
+fn result_type(value: StaticType) -> StaticType {
+    StaticType::Result(Box::new(value), Box::new(StaticType::String))
+}
+
+fn option_type(value: StaticType) -> StaticType {
+    StaticType::Option(Box::new(value))
 }
 
 fn literal_type(literal: &Literal) -> StaticType {
@@ -1430,5 +1506,14 @@ mod tests {
                 .iter()
                 .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
         );
+    }
+
+    #[test]
+    fn checks_automation_module_calls() {
+        let source = "fs.read_text(\"file\"); fs.write_text(\"file\", \"text\"); path.join([\"a\", \"b\"]); env.get(\"NAME\"); env.current_dir(); process.run(\"tool\", [\"arg\"]); terminal.confirm(\"Continue?\"); print(context.cwd)";
+        assert!(errors(source).is_empty());
+
+        let errors = errors("fs.write_text(\"only-one\"); process.run(1, [])");
+        assert_eq!(errors.len(), 2);
     }
 }

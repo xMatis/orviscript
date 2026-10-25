@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::{Rc, Weak};
 
 use orvi_syntax::{
@@ -106,12 +109,50 @@ pub enum VariantTag {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeModule {
     Json,
+    Fs,
+    Path,
+    Env,
+    Process,
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeFunction {
     JsonParse,
     JsonStringify,
+    FsReadText,
+    FsWriteText,
+    FsExists,
+    FsCreateDirAll,
+    FsRemoveFile,
+    PathJoin,
+    PathParent,
+    PathFileName,
+    PathIsAbsolute,
+    EnvGet,
+    EnvCurrentDir,
+    ProcessRun,
+    TerminalInput,
+    TerminalConfirm,
+    TerminalPassword,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionContext {
+    pub cwd: PathBuf,
+    pub script_dir: PathBuf,
+    pub project_dir: PathBuf,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            cwd: cwd.clone(),
+            script_dir: cwd.clone(),
+            project_dir: cwd,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -240,6 +281,13 @@ enum Control {
 }
 
 pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
+    execute_with_context(program, ExecutionContext::default())
+}
+
+pub fn execute_with_context(
+    program: &Program,
+    context: ExecutionContext,
+) -> Result<Execution, RuntimeError> {
     let globals = Environment::root();
     globals.define("print".into(), Value::NativePrint, false, None);
     globals.define(
@@ -275,6 +323,30 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
         false,
         None,
     );
+    for (name, module) in [
+        ("fs", NativeModule::Fs),
+        ("path", NativeModule::Path),
+        ("env", NativeModule::Env),
+        ("process", NativeModule::Process),
+        ("terminal", NativeModule::Terminal),
+    ] {
+        globals.define(name.into(), Value::NativeModule(module), false, None);
+    }
+    let context_value = Value::Map(Rc::new(RefCell::new(vec![
+        (
+            "cwd".into(),
+            Value::String(context.cwd.to_string_lossy().into_owned()),
+        ),
+        (
+            "script_dir".into(),
+            Value::String(context.script_dir.to_string_lossy().into_owned()),
+        ),
+        (
+            "project_dir".into(),
+            Value::String(context.project_dir.to_string_lossy().into_owned()),
+        ),
+    ])));
+    globals.define("context".into(), context_value, false, None);
     let mut interpreter = Interpreter {
         environment: globals.clone(),
         output: Vec::new(),
@@ -285,6 +357,7 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
         objects: Vec::new(),
         collected_objects: 0,
         deferred: vec![Vec::new()],
+        context,
     };
     let result = interpreter.execute_statements(&program.statements);
     let cleanup = interpreter.run_deferred();
@@ -323,6 +396,7 @@ struct Interpreter {
     objects: Vec<Weak<RefCell<StructInstance>>>,
     collected_objects: usize,
     deferred: Vec<Vec<Expression>>,
+    context: ExecutionContext,
 }
 
 impl Interpreter {
@@ -976,22 +1050,21 @@ impl Interpreter {
         arguments: Vec<Value>,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        if arguments.len() != 1 {
+        if arguments.len() != function.arity() {
             return Err(self.error(
                 format!(
-                    "function '{}' expects 1 argument, received {}",
+                    "function '{}' expects {} arguments, received {}",
                     function.name(),
+                    function.arity(),
                     arguments.len()
                 ),
                 span,
             ));
         }
-        let value = arguments
-            .into_iter()
-            .next()
-            .expect("checked argument count");
+        let mut arguments = arguments.into_iter();
         match function {
             NativeFunction::JsonParse => {
+                let value = arguments.next().expect("checked argument count");
                 let Value::String(source) = value else {
                     return Err(self.error("json.parse expects string", span));
                 };
@@ -1007,6 +1080,7 @@ impl Interpreter {
                 }
             }
             NativeFunction::JsonStringify => {
+                let value = arguments.next().expect("checked argument count");
                 match value_to_json(&value, &mut HashSet::new()).and_then(|value| {
                     serde_json::to_string(&value).map_err(|error| error.to_string())
                 }) {
@@ -1020,6 +1094,188 @@ impl Interpreter {
                     }),
                 }
             }
+            NativeFunction::FsReadText => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(result_value(
+                    std::fs::read_to_string(self.resolve_path(path)).map(Value::String),
+                ))
+            }
+            NativeFunction::FsWriteText => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                let contents = self.string_argument(arguments.next(), function, span)?;
+                Ok(result_value(
+                    std::fs::write(self.resolve_path(path), contents).map(|()| Value::Null),
+                ))
+            }
+            NativeFunction::FsExists => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(Value::Bool(self.resolve_path(path).exists()))
+            }
+            NativeFunction::FsCreateDirAll => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(result_value(
+                    std::fs::create_dir_all(self.resolve_path(path)).map(|()| Value::Null),
+                ))
+            }
+            NativeFunction::FsRemoveFile => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(result_value(
+                    std::fs::remove_file(self.resolve_path(path)).map(|()| Value::Null),
+                ))
+            }
+            NativeFunction::PathJoin => {
+                let parts = self.string_list_argument(arguments.next(), function, span)?;
+                let mut path = PathBuf::new();
+                for part in parts {
+                    path.push(part);
+                }
+                Ok(Value::String(path.to_string_lossy().into_owned()))
+            }
+            NativeFunction::PathParent => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(option_value(Path::new(&path).parent().map(|path| {
+                    Value::String(path.to_string_lossy().into_owned())
+                })))
+            }
+            NativeFunction::PathFileName => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(option_value(Path::new(&path).file_name().map(|name| {
+                    Value::String(name.to_string_lossy().into_owned())
+                })))
+            }
+            NativeFunction::PathIsAbsolute => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(Value::Bool(Path::new(&path).is_absolute()))
+            }
+            NativeFunction::EnvGet => {
+                let name = self.string_argument(arguments.next(), function, span)?;
+                Ok(option_value(std::env::var(name).ok().map(Value::String)))
+            }
+            NativeFunction::EnvCurrentDir => Ok(ok_value(Value::String(
+                self.context.cwd.to_string_lossy().into_owned(),
+            ))),
+            NativeFunction::ProcessRun => {
+                let program = self.string_argument(arguments.next(), function, span)?;
+                let args = self.string_list_argument(arguments.next(), function, span)?;
+                match Command::new(program)
+                    .args(args)
+                    .current_dir(&self.context.cwd)
+                    .output()
+                {
+                    Ok(output) => {
+                        let values = Rc::new(RefCell::new(vec![
+                            (
+                                "exit_code".into(),
+                                output
+                                    .status
+                                    .code()
+                                    .map_or(Value::Null, |code| Value::Integer(i64::from(code))),
+                            ),
+                            ("success".into(), Value::Bool(output.status.success())),
+                            (
+                                "stdout".into(),
+                                Value::String(String::from_utf8_lossy(&output.stdout).into_owned()),
+                            ),
+                            (
+                                "stderr".into(),
+                                Value::String(String::from_utf8_lossy(&output.stderr).into_owned()),
+                            ),
+                        ]));
+                        self.maps.push(Rc::downgrade(&values));
+                        Ok(ok_value(Value::Map(values)))
+                    }
+                    Err(error) => Ok(err_value(error.to_string())),
+                }
+            }
+            NativeFunction::TerminalInput | NativeFunction::TerminalConfirm => {
+                let prompt = self.string_argument(arguments.next(), function, span)?;
+                if !io::stdin().is_terminal() {
+                    return Ok(err_value("terminal input is not interactive"));
+                }
+                print!("{prompt}");
+                if let Err(error) = io::stdout().flush() {
+                    return Ok(err_value(error.to_string()));
+                }
+                let mut input = String::new();
+                if let Err(error) = io::stdin().read_line(&mut input) {
+                    return Ok(err_value(error.to_string()));
+                }
+                let input = input.trim_end_matches(['\r', '\n']);
+                if function == NativeFunction::TerminalInput {
+                    Ok(ok_value(Value::String(input.into())))
+                } else {
+                    match input.to_ascii_lowercase().as_str() {
+                        "y" | "yes" => Ok(ok_value(Value::Bool(true))),
+                        "n" | "no" => Ok(ok_value(Value::Bool(false))),
+                        _ => Ok(err_value("expected yes or no")),
+                    }
+                }
+            }
+            NativeFunction::TerminalPassword => {
+                let prompt = self.string_argument(arguments.next(), function, span)?;
+                if !io::stdin().is_terminal() {
+                    return Ok(err_value("terminal input is not interactive"));
+                }
+                match rpassword::prompt_password(prompt) {
+                    Ok(password) => Ok(ok_value(Value::String(password))),
+                    Err(error) => Ok(err_value(error.to_string())),
+                }
+            }
+        }
+    }
+
+    fn string_argument(
+        &self,
+        value: Option<Value>,
+        function: NativeFunction,
+        span: Span,
+    ) -> Result<String, RuntimeError> {
+        match value.expect("checked argument count") {
+            Value::String(value) => Ok(value),
+            value => Err(self.error(
+                format!(
+                    "{} expects string, received {}",
+                    function.name(),
+                    value.type_name()
+                ),
+                span,
+            )),
+        }
+    }
+
+    fn string_list_argument(
+        &self,
+        value: Option<Value>,
+        function: NativeFunction,
+        span: Span,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let value = value.expect("checked argument count");
+        let Value::List(values) = value else {
+            return Err(self.error(format!("{} expects list<string>", function.name()), span));
+        };
+        values
+            .borrow()
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                value => Err(self.error(
+                    format!(
+                        "{} expects list<string>, received element {}",
+                        function.name(),
+                        value.type_name()
+                    ),
+                    span,
+                )),
+            })
+            .collect()
+    }
+
+    fn resolve_path(&self, path: String) -> PathBuf {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            self.context.cwd.join(path)
         }
     }
 
@@ -1265,10 +1521,49 @@ impl VariantTag {
     }
 }
 
+fn ok_value(value: Value) -> Value {
+    Value::Variant {
+        tag: VariantTag::Ok,
+        payload: Some(Box::new(value)),
+    }
+}
+
+fn err_value(error: impl ToString) -> Value {
+    Value::Variant {
+        tag: VariantTag::Err,
+        payload: Some(Box::new(Value::String(error.to_string()))),
+    }
+}
+
+fn result_value<E: ToString>(result: Result<Value, E>) -> Value {
+    match result {
+        Ok(value) => ok_value(value),
+        Err(error) => err_value(error),
+    }
+}
+
+fn option_value(value: Option<Value>) -> Value {
+    value.map_or(
+        Value::Variant {
+            tag: VariantTag::None,
+            payload: None,
+        },
+        |value| Value::Variant {
+            tag: VariantTag::Some,
+            payload: Some(Box::new(value)),
+        },
+    )
+}
+
 impl NativeModule {
     fn name(self) -> &'static str {
         match self {
             Self::Json => "json",
+            Self::Fs => "fs",
+            Self::Path => "path",
+            Self::Env => "env",
+            Self::Process => "process",
+            Self::Terminal => "terminal",
         }
     }
 
@@ -1276,6 +1571,21 @@ impl NativeModule {
         match (self, name) {
             (Self::Json, "parse") => Some(NativeFunction::JsonParse),
             (Self::Json, "stringify") => Some(NativeFunction::JsonStringify),
+            (Self::Fs, "read_text") => Some(NativeFunction::FsReadText),
+            (Self::Fs, "write_text") => Some(NativeFunction::FsWriteText),
+            (Self::Fs, "exists") => Some(NativeFunction::FsExists),
+            (Self::Fs, "create_dir_all") => Some(NativeFunction::FsCreateDirAll),
+            (Self::Fs, "remove_file") => Some(NativeFunction::FsRemoveFile),
+            (Self::Path, "join") => Some(NativeFunction::PathJoin),
+            (Self::Path, "parent") => Some(NativeFunction::PathParent),
+            (Self::Path, "file_name") => Some(NativeFunction::PathFileName),
+            (Self::Path, "is_absolute") => Some(NativeFunction::PathIsAbsolute),
+            (Self::Env, "get") => Some(NativeFunction::EnvGet),
+            (Self::Env, "current_dir") => Some(NativeFunction::EnvCurrentDir),
+            (Self::Process, "run") => Some(NativeFunction::ProcessRun),
+            (Self::Terminal, "input") => Some(NativeFunction::TerminalInput),
+            (Self::Terminal, "confirm") => Some(NativeFunction::TerminalConfirm),
+            (Self::Terminal, "password") => Some(NativeFunction::TerminalPassword),
             _ => None,
         }
     }
@@ -1286,6 +1596,29 @@ impl NativeFunction {
         match self {
             Self::JsonParse => "json.parse",
             Self::JsonStringify => "json.stringify",
+            Self::FsReadText => "fs.read_text",
+            Self::FsWriteText => "fs.write_text",
+            Self::FsExists => "fs.exists",
+            Self::FsCreateDirAll => "fs.create_dir_all",
+            Self::FsRemoveFile => "fs.remove_file",
+            Self::PathJoin => "path.join",
+            Self::PathParent => "path.parent",
+            Self::PathFileName => "path.file_name",
+            Self::PathIsAbsolute => "path.is_absolute",
+            Self::EnvGet => "env.get",
+            Self::EnvCurrentDir => "env.current_dir",
+            Self::ProcessRun => "process.run",
+            Self::TerminalInput => "terminal.input",
+            Self::TerminalConfirm => "terminal.confirm",
+            Self::TerminalPassword => "terminal.password",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::FsWriteText | Self::ProcessRun => 2,
+            Self::EnvCurrentDir => 0,
+            _ => 1,
         }
     }
 }

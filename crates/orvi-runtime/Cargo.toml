@@ -10,4 +10,8 @@ publish = false
 [dependencies]
 orvi-syntax = { path = "../orvi-syntax" }
 serde_json = "1"
+rpassword = "7"
+
+[dev-dependencies]
+tempfile = "3"
 
