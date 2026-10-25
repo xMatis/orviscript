@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-The project is at an early but runnable stage. It includes a reusable lexer and parser, semantic checks, a tree-walk interpreter, `run` and `check` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition, syntax and semantic highlighting, live diagnostics, initial completion, and hover help. The language remains incomplete and does not yet include modules, static types, async I/O, packages, or a standard library beyond `print`.
+The project is at an early but runnable stage. It includes a reusable lexer and parser, semantic checks, a tree-walk interpreter, `run` and `check` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition, syntax and semantic highlighting, live diagnostics, initial completion, hover help, go-to-definition, references, and rename. The language remains incomplete and does not yet include modules, static types, async I/O, packages, or a standard library beyond `print`.
 
 ## Goals
 

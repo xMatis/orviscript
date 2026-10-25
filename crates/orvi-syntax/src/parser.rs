@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::{
-    BinaryOperator, Expression, ExpressionKind, LexError, Literal, Program, Span, Statement,
-    StatementKind, Token, TokenKind, UnaryOperator, lex,
+    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, Program, Span,
+    Statement, StatementKind, Token, TokenKind, UnaryOperator, lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -386,7 +386,10 @@ impl Parser<'_> {
                 })?))
             }
             TokenKind::String => ExpressionKind::Literal(Literal::String(unescape_string(text))),
-            TokenKind::Identifier => ExpressionKind::Variable(text.to_owned()),
+            TokenKind::Identifier => ExpressionKind::Variable(Identifier {
+                name: text.to_owned(),
+                span: token.span,
+            }),
             TokenKind::LeftParenthesis => {
                 let expression = self.expression()?;
                 self.expect(TokenKind::RightParenthesis, "expected ')' after expression")?;
@@ -405,9 +408,12 @@ impl Parser<'_> {
         })
     }
 
-    fn expect_identifier(&mut self, message: &str) -> Result<String, ParseError> {
+    fn expect_identifier(&mut self, message: &str) -> Result<Identifier, ParseError> {
         let token = self.expect(TokenKind::Identifier, message)?;
-        Ok(token.text(self.source).unwrap_or_default().to_owned())
+        Ok(Identifier {
+            name: token.text(self.source).unwrap_or_default().to_owned(),
+            span: token.span,
+        })
     }
 
     fn expect(&mut self, kind: TokenKind, message: &str) -> Result<Token, ParseError> {

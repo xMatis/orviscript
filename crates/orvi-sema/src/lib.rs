@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use orvi_syntax::{Expression, ExpressionKind, Program, Span, Statement, StatementKind};
+use orvi_syntax::{
+    Expression, ExpressionKind, Identifier, Program, Span, Statement, StatementKind,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SemanticErrorKind {
@@ -19,6 +21,29 @@ pub struct SemanticError {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymbolKind {
+    Variable,
+    Constant,
+    Function,
+    Parameter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolOccurrence {
+    pub name: String,
+    pub span: Span,
+    pub definition: Span,
+    pub kind: SymbolKind,
+    pub is_definition: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Analysis {
+    pub errors: Vec<SemanticError>,
+    pub symbols: Vec<SymbolOccurrence>,
+}
+
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
@@ -26,25 +51,43 @@ impl fmt::Display for SemanticError {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Symbol {
-    Variable { mutable: bool },
-    Function { arity: usize },
-    VariadicFunction,
+struct Symbol {
+    kind: SymbolKind,
+    mutable: bool,
+    arity: Option<usize>,
+    definition: Option<Span>,
 }
 
 pub fn analyze(program: &Program) -> Vec<SemanticError> {
+    analyze_program(program).errors
+}
+
+pub fn analyze_program(program: &Program) -> Analysis {
     let mut analyzer = Analyzer {
-        scopes: vec![HashMap::from([("print".into(), Symbol::VariadicFunction)])],
+        scopes: vec![HashMap::from([(
+            "print".into(),
+            Symbol {
+                kind: SymbolKind::Function,
+                mutable: false,
+                arity: None,
+                definition: None,
+            },
+        )])],
         errors: Vec::new(),
+        symbols: Vec::new(),
         function_depth: 0,
     };
     analyzer.statements(&program.statements, false);
-    analyzer.errors
+    Analysis {
+        errors: analyzer.errors,
+        symbols: analyzer.symbols,
+    }
 }
 
 struct Analyzer {
     scopes: Vec<HashMap<String, Symbol>>,
     errors: Vec<SemanticError>,
+    symbols: Vec<SymbolOccurrence>,
     function_depth: usize,
 }
 
@@ -61,10 +104,12 @@ impl Analyzer {
             {
                 self.declare(
                     name,
-                    Symbol::Function {
-                        arity: parameters.len(),
+                    Symbol {
+                        kind: SymbolKind::Function,
+                        mutable: false,
+                        arity: Some(parameters.len()),
+                        definition: Some(name.span),
                     },
-                    statement.span,
                 );
             }
         }
@@ -97,7 +142,19 @@ impl Analyzer {
                 initializer,
             } => {
                 self.expression(initializer);
-                self.declare(name, Symbol::Variable { mutable: *mutable }, statement.span);
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: if *mutable {
+                            SymbolKind::Variable
+                        } else {
+                            SymbolKind::Constant
+                        },
+                        mutable: *mutable,
+                        arity: None,
+                        definition: Some(name.span),
+                    },
+                );
             }
             StatementKind::Function { .. } => unreachable!("function bodies are analyzed last"),
             StatementKind::Block(statements) => self.statements(statements, true),
@@ -132,10 +189,18 @@ impl Analyzer {
         }
     }
 
-    fn function(&mut self, parameters: &[String], body: &[Statement], span: Span) {
+    fn function(&mut self, parameters: &[Identifier], body: &[Statement], _: Span) {
         self.scopes.push(HashMap::new());
         for parameter in parameters {
-            self.declare(parameter, Symbol::Variable { mutable: true }, span);
+            self.declare(
+                parameter,
+                Symbol {
+                    kind: SymbolKind::Parameter,
+                    mutable: true,
+                    arity: None,
+                    definition: Some(parameter.span),
+                },
+            );
         }
         self.function_depth += 1;
         self.statements(body, false);
@@ -147,26 +212,22 @@ impl Analyzer {
         match &expression.kind {
             ExpressionKind::Literal(_) => {}
             ExpressionKind::Variable(name) => {
-                if self.resolve(name).is_none() {
-                    self.undefined(name, expression.span);
+                if self.resolve_reference(name).is_none() {
+                    self.undefined(name);
                 }
             }
             ExpressionKind::Assign { name, value } => {
                 self.expression(value);
-                match self.resolve(name) {
-                    None => self.undefined(name, expression.span),
-                    Some(
-                        Symbol::Variable { mutable: false }
-                        | Symbol::Function { .. }
-                        | Symbol::VariadicFunction,
-                    ) => {
+                match self.resolve_reference(name) {
+                    None => self.undefined(name),
+                    Some(symbol) if !symbol.mutable => {
                         self.errors.push(SemanticError {
                             kind: SemanticErrorKind::ImmutableAssignment,
-                            message: format!("cannot assign to immutable name '{name}'"),
-                            span: expression.span,
+                            message: format!("cannot assign to immutable name '{}'", name.name),
+                            span: name.span,
                         });
                     }
-                    Some(Symbol::Variable { mutable: true }) => {}
+                    Some(_) => {}
                 }
             }
             ExpressionKind::Unary { operand, .. } => self.expression(operand),
@@ -180,13 +241,16 @@ impl Analyzer {
                     self.expression(argument);
                 }
                 if let ExpressionKind::Variable(name) = &callee.kind
-                    && let Some(Symbol::Function { arity }) = self.resolve(name)
+                    && let Some(Symbol {
+                        arity: Some(arity), ..
+                    }) = self.resolve(name.as_str())
                     && arity != arguments.len()
                 {
                     self.errors.push(SemanticError {
                         kind: SemanticErrorKind::ArgumentCount,
                         message: format!(
-                            "function '{name}' expects {arity} arguments but received {}",
+                            "function '{}' expects {arity} arguments but received {}",
+                            name.name,
                             arguments.len()
                         ),
                         span: expression.span,
@@ -196,15 +260,22 @@ impl Analyzer {
         }
     }
 
-    fn declare(&mut self, name: &str, symbol: Symbol, span: Span) {
+    fn declare(&mut self, name: &Identifier, symbol: Symbol) {
         let scope = self.scopes.last_mut().expect("analyzer always has a scope");
-        if scope.insert(name.into(), symbol).is_some() {
+        if scope.insert(name.name.clone(), symbol).is_some() {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::DuplicateName,
-                message: format!("name '{name}' is already declared in this scope"),
-                span,
+                message: format!("name '{}' is already declared in this scope", name.name),
+                span: name.span,
             });
         }
+        self.symbols.push(SymbolOccurrence {
+            name: name.name.clone(),
+            span: name.span,
+            definition: name.span,
+            kind: symbol.kind,
+            is_definition: true,
+        });
     }
 
     fn resolve(&self, name: &str) -> Option<Symbol> {
@@ -214,18 +285,32 @@ impl Analyzer {
             .find_map(|scope| scope.get(name).copied())
     }
 
-    fn undefined(&mut self, name: &str, span: Span) {
+    fn resolve_reference(&mut self, name: &Identifier) -> Option<Symbol> {
+        let symbol = self.resolve(name.as_str())?;
+        if let Some(definition) = symbol.definition {
+            self.symbols.push(SymbolOccurrence {
+                name: name.name.clone(),
+                span: name.span,
+                definition,
+                kind: symbol.kind,
+                is_definition: false,
+            });
+        }
+        Some(symbol)
+    }
+
+    fn undefined(&mut self, name: &Identifier) {
         self.errors.push(SemanticError {
             kind: SemanticErrorKind::UndefinedName,
-            message: format!("undefined name '{name}'"),
-            span,
+            message: format!("undefined name '{}'", name.name),
+            span: name.span,
         });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticErrorKind, analyze};
+    use super::{SemanticErrorKind, analyze, analyze_program};
     use orvi_syntax::parse;
 
     fn errors(source: &str) -> Vec<super::SemanticError> {
@@ -270,5 +355,26 @@ mod tests {
     #[test]
     fn closures_can_capture_names_declared_later_in_the_same_scope() {
         assert!(errors("fn show() { print(value); } let value = 42; show();").is_empty());
+    }
+
+    #[test]
+    fn indexes_definitions_and_resolved_references() {
+        let parsed = parse("let value = 1; { let value = 2; print(value); } print(value);");
+        let analysis = analyze_program(&parsed.program);
+        let definitions = analysis
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.is_definition)
+            .collect::<Vec<_>>();
+        let references = analysis
+            .symbols
+            .iter()
+            .filter(|symbol| !symbol.is_definition)
+            .collect::<Vec<_>>();
+
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].definition, definitions[1].definition);
+        assert_eq!(references[1].definition, definitions[0].definition);
     }
 }

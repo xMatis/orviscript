@@ -74,8 +74,11 @@ class LanguageServerConnection {
         general: { positionEncodings: ["utf-16"] },
         textDocument: {
           completion: { completionItem: {} },
+          definition: {},
           hover: { contentFormat: ["markdown", "plaintext"] },
           publishDiagnostics: { versionSupport: true },
+          references: {},
+          rename: { prepareSupport: true },
           semanticTokens: {
             requests: { full: true },
             tokenTypes: ["variable", "function", "parameter", "keyword", "string", "number", "comment", "operator"],
@@ -157,6 +160,53 @@ class LanguageServerConnection {
             response.range.end.character,
           );
           return new vscode.Hover(new vscode.MarkdownString(value), range);
+        },
+      }));
+    }
+
+    if (capabilities.definitionProvider) {
+      this.disposables.push(vscode.languages.registerDefinitionProvider(selector, {
+        provideDefinition: async (document, position) => {
+          const response = await this.request("textDocument/definition", documentPosition(document, position));
+          if (!response) return undefined;
+          return (Array.isArray(response) ? response : [response]).map(asLocation);
+        },
+      }));
+    }
+
+    if (capabilities.referencesProvider) {
+      this.disposables.push(vscode.languages.registerReferenceProvider(selector, {
+        provideReferences: async (document, position, context) => {
+          const response = await this.request("textDocument/references", {
+            ...documentPosition(document, position),
+            context: { includeDeclaration: context.includeDeclaration },
+          });
+          return response?.map(asLocation) ?? [];
+        },
+      }));
+    }
+
+    if (capabilities.renameProvider) {
+      this.disposables.push(vscode.languages.registerRenameProvider(selector, {
+        prepareRename: async (document, position) => {
+          const response = await this.request("textDocument/prepareRename", documentPosition(document, position));
+          if (!response) throw new Error("The selected symbol cannot be renamed");
+          const range = asRange(response.range ?? response);
+          return response.placeholder ? { range, placeholder: response.placeholder } : range;
+        },
+        provideRenameEdits: async (document, position, newName) => {
+          const response = await this.request("textDocument/rename", {
+            ...documentPosition(document, position),
+            newName,
+          });
+          if (!response) throw new Error("The selected symbol cannot be renamed");
+          const edit = new vscode.WorkspaceEdit();
+          for (const [uri, changes] of Object.entries(response?.changes ?? {})) {
+            for (const change of changes) {
+              edit.replace(vscode.Uri.parse(uri), asRange(change.range), change.newText);
+            }
+          }
+          return edit;
         },
       }));
     }
@@ -289,6 +339,19 @@ function completionKind(kind) {
     21: vscode.CompletionItemKind.Constant,
   };
   return kinds[kind] ?? vscode.CompletionItemKind.Text;
+}
+
+function asRange(range) {
+  return new vscode.Range(
+    range.start.line,
+    range.start.character,
+    range.end.line,
+    range.end.character,
+  );
+}
+
+function asLocation(location) {
+  return new vscode.Location(vscode.Uri.parse(location.uri), asRange(location.range));
 }
 
 module.exports = { activate, deactivate };

@@ -183,7 +183,7 @@ impl Interpreter {
             } => {
                 let value = self.evaluate(initializer)?;
                 self.environment
-                    .define(name.clone(), value.clone(), *mutable);
+                    .define(name.name.clone(), value.clone(), *mutable);
                 Ok(Control::Continue(value))
             }
             StatementKind::Function {
@@ -192,13 +192,19 @@ impl Interpreter {
                 body,
             } => {
                 let function = UserFunction {
-                    name: name.clone(),
-                    parameters: parameters.clone(),
+                    name: name.name.clone(),
+                    parameters: parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
                     body: body.clone(),
                     closure: self.environment.clone(),
                 };
-                self.environment
-                    .define(name.clone(), Value::Function(Rc::new(function)), false);
+                self.environment.define(
+                    name.name.clone(),
+                    Value::Function(Rc::new(function)),
+                    false,
+                );
                 Ok(Control::Continue(Value::Null))
             }
             StatementKind::Block(statements) => {
@@ -267,20 +273,25 @@ impl Interpreter {
                 Literal::Float(value) => Value::Float(*value),
                 Literal::String(value) => Value::String(value.clone()),
             }),
-            ExpressionKind::Variable(name) => self
-                .environment
-                .get(name)
-                .ok_or_else(|| self.error(format!("undefined variable '{name}'"), expression.span)),
+            ExpressionKind::Variable(name) => {
+                self.environment.get(name.as_str()).ok_or_else(|| {
+                    self.error(
+                        format!("undefined variable '{}'", name.name),
+                        expression.span,
+                    )
+                })
+            }
             ExpressionKind::Assign { name, value } => {
                 let value = self.evaluate(value)?;
                 self.environment
-                    .assign(name, value.clone())
+                    .assign(name.as_str(), value.clone())
                     .map_err(|error| match error {
-                        AssignError::Undefined => {
-                            self.error(format!("undefined variable '{name}'"), expression.span)
-                        }
+                        AssignError::Undefined => self.error(
+                            format!("undefined variable '{}'", name.name),
+                            expression.span,
+                        ),
                         AssignError::Immutable => self.error(
-                            format!("cannot assign to constant '{name}'"),
+                            format!("cannot assign to constant '{}'", name.name),
                             expression.span,
                         ),
                     })?;

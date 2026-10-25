@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use orvi_sema::analyze;
+use orvi_sema::{Analysis, SymbolOccurrence, analyze, analyze_program};
 use orvi_syntax::{Span, TokenKind, lex, parse};
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MarkupContent, MarkupKind, MessageType,
-    Position, Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, WorkDoneProgressOptions,
+    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkupContent, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse,
+    Range, ReferenceParams, RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
+    ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextEdit, WorkDoneProgressOptions, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -62,6 +64,12 @@ impl LanguageServer for Backend {
                 completion_provider: Some(CompletionOptions::default()),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(semantic_tokens_options().into()),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -141,6 +149,118 @@ impl LanguageServer for Backend {
             data: semantic_tokens(&source),
         })))
     }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let document = params.text_document_position_params.text_document;
+        let Some(source) = self.document(&document.uri) else {
+            return Ok(None);
+        };
+        let Some((_, symbol)) = symbol_at(&source, params.text_document_position_params.position)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+            document.uri,
+            span_range(&source, symbol.definition),
+        ))))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let document = params.text_document_position.text_document;
+        let Some(source) = self.document(&document.uri) else {
+            return Ok(None);
+        };
+        let Some((analysis, selected)) = symbol_at(&source, params.text_document_position.position)
+        else {
+            return Ok(None);
+        };
+        let locations = analysis
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.definition == selected.definition
+                    && (params.context.include_declaration || !symbol.is_definition)
+            })
+            .map(|symbol| Location::new(document.uri.clone(), span_range(&source, symbol.span)))
+            .collect();
+        Ok(Some(locations))
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let Some(source) = self.document(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let Some((_, symbol)) = symbol_at(&source, params.position) else {
+            return Ok(None);
+        };
+        Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: span_range(&source, symbol.span),
+            placeholder: symbol.name.clone(),
+        }))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        if !is_identifier(&params.new_name) {
+            return Err(Error::invalid_params("new name is not a valid identifier"));
+        }
+        let document = params.text_document_position.text_document;
+        let Some(source) = self.document(&document.uri) else {
+            return Ok(None);
+        };
+        let Some((analysis, selected)) = symbol_at(&source, params.text_document_position.position)
+        else {
+            return Ok(None);
+        };
+        if analysis.symbols.iter().any(|symbol| {
+            symbol.is_definition
+                && symbol.name == params.new_name
+                && symbol.definition != selected.definition
+        }) {
+            return Err(Error::invalid_params(format!(
+                "name '{}' is already declared in this document",
+                params.new_name
+            )));
+        }
+        let edits = analysis
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.definition == selected.definition)
+            .map(|symbol| TextEdit::new(span_range(&source, symbol.span), params.new_name.clone()))
+            .collect();
+        Ok(Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(document.uri, edits)])),
+            ..WorkspaceEdit::default()
+        }))
+    }
+}
+
+fn symbol_at(source: &str, position: Position) -> Option<(Analysis, SymbolOccurrence)> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return None;
+    }
+    let offset = offset_at_position(source, position)?;
+    let analysis = analyze_program(&parsed.program);
+    let symbol = analysis
+        .symbols
+        .iter()
+        .find(|symbol| symbol.span.start() <= offset && offset <= symbol.span.end())?
+        .clone();
+    Some((analysis, symbol))
+}
+
+fn is_identifier(name: &str) -> bool {
+    let lexed = lex(name);
+    lexed.errors.is_empty()
+        && lexed.tokens.len() == 2
+        && lexed.tokens[0].kind == TokenKind::Identifier
+        && lexed.tokens[0].span.text(name) == Some(name)
 }
 
 pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
@@ -439,7 +559,10 @@ fn offset_at_position(source: &str, position: Position) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_items, diagnostics, hover_at, semantic_tokens, span_range};
+    use super::{
+        completion_items, diagnostics, hover_at, is_identifier, semantic_tokens, span_range,
+        symbol_at,
+    };
     use orvi_syntax::Span;
     use tower_lsp_server::ls_types::{
         CompletionItemKind, DiagnosticSeverity, HoverContents, Position, Range,
@@ -520,5 +643,25 @@ mod tests {
             panic!("expected markdown hover");
         };
         assert!(contents.value.contains("standard output"));
+    }
+
+    #[test]
+    fn resolves_a_reference_to_its_definition() {
+        let source = "let answer = 42; print(answer);";
+        let (_, symbol) = symbol_at(source, Position::new(0, 25)).expect("resolved symbol");
+
+        assert_eq!(
+            span_range(source, symbol.definition).start,
+            Position::new(0, 4)
+        );
+        assert!(!symbol.is_definition);
+    }
+
+    #[test]
+    fn validates_rename_identifiers_with_the_language_lexer() {
+        assert!(is_identifier("wynik"));
+        assert!(is_identifier("żółw"));
+        assert!(!is_identifier("let"));
+        assert!(!is_identifier("two words"));
     }
 }

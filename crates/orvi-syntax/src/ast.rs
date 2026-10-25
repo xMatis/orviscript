@@ -11,16 +11,28 @@ pub struct Statement {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Identifier {
+    pub name: String,
+    pub span: Span,
+}
+
+impl Identifier {
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatementKind {
     Variable {
-        name: String,
+        name: Identifier,
         mutable: bool,
         initializer: Expression,
     },
     Function {
-        name: String,
-        parameters: Vec<String>,
+        name: Identifier,
+        parameters: Vec<Identifier>,
         body: Vec<Statement>,
     },
     Block(Vec<Statement>),
@@ -46,9 +58,9 @@ pub struct Expression {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpressionKind {
     Literal(Literal),
-    Variable(String),
+    Variable(Identifier),
     Assign {
-        name: String,
+        name: Identifier,
         value: Box<Expression>,
     },
     Unary {

@@ -15,7 +15,7 @@ const executable = path.join(
   process.platform === "win32" ? "orvi-lsp.exe" : "orvi-lsp",
 );
 
-test("language server publishes diagnostics for an open document", { timeout: 30000 }, async () => {
+test("language server publishes diagnostics for an open document", { timeout: 60000 }, async () => {
   const server = childProcess.spawn(executable, [], { stdio: ["pipe", "pipe", "pipe"] });
   const exited = new Promise((resolve) => server.once("exit", resolve));
   const reader = new MessageReader();
@@ -118,6 +118,56 @@ test("language server publishes diagnostics for an open document", { timeout: 30
 
     send({
       jsonrpc: "2.0",
+      id: 5,
+      method: "textDocument/definition",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 25 },
+      },
+    });
+    const definition = await waitFor((message) => message.id === 5);
+    assert.equal(definition.result.range.start.character, 4);
+
+    send({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "textDocument/references",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 25 },
+        context: { includeDeclaration: true },
+      },
+    });
+    const references = await waitFor((message) => message.id === 6);
+    assert.equal(references.result.length, 2);
+
+    send({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "textDocument/prepareRename",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 25 },
+      },
+    });
+    const preparation = await waitFor((message) => message.id === 7);
+    assert.equal(preparation.result.placeholder, "answer");
+
+    send({
+      jsonrpc: "2.0",
+      id: 8,
+      method: "textDocument/rename",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 25 },
+        newName: "result",
+      },
+    });
+    const rename = await waitFor((message) => message.id === 8);
+    assert.equal(rename.result.changes["file:///diagnostic.orvi"].length, 2);
+
+    send({
+      jsonrpc: "2.0",
       method: "textDocument/didClose",
       params: { textDocument: { uri: "file:///diagnostic.orvi" } },
     });
@@ -127,8 +177,8 @@ test("language server publishes diagnostics for an open document", { timeout: 30
     );
     assert.deepEqual(closed.params.diagnostics, []);
 
-    send({ jsonrpc: "2.0", id: 5, method: "shutdown", params: null });
-    await waitFor((message) => message.id === 5);
+    send({ jsonrpc: "2.0", id: 9, method: "shutdown", params: null });
+    await waitFor((message) => message.id === 9);
     send({ jsonrpc: "2.0", method: "exit", params: null });
     server.stdin.end();
     await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2000))]);
