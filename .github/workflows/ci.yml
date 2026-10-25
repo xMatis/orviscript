@@ -31,6 +31,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Validate synchronized release versions
+        shell: pwsh
+        run: ./scripts/release/Get-OrviVersion.ps1
+
       - name: Check example formatting
         run: cargo run --bin orviscript -- fmt --check examples/v0_2.orvi
 

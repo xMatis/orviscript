@@ -15,6 +15,8 @@ Usage: orviscript [OPTIONS]
        orviscript <COMMAND> <FILE>
 
 Commands:
+  init [DIRECTORY]
+                Create a new OrviScript project (defaults to the current directory)
   run <FILE>    Run an OrviScript program
   check <FILE>  Check an OrviScript program for syntax and semantic errors
   test <FILE>   Run tasks whose names start with test_
@@ -37,6 +39,7 @@ Options:
 enum Command {
     Help,
     Version,
+    Init(PathBuf),
     Run(PathBuf),
     Check(PathBuf),
     Test(PathBuf),
@@ -52,6 +55,8 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [] => Ok(Command::Help),
         [argument] if argument == "-h" || argument == "--help" => Ok(Command::Help),
         [argument] if argument == "-V" || argument == "--version" => Ok(Command::Version),
+        [command] if command == "init" => Ok(Command::Init(PathBuf::from("."))),
+        [command, path] if command == "init" => Ok(Command::Init(PathBuf::from(path))),
         [command, path] if command == "run" => Ok(Command::Run(PathBuf::from(path))),
         [command, path] if command == "check" => Ok(Command::Check(PathBuf::from(path))),
         [command, path] if command == "test" => Ok(Command::Test(PathBuf::from(path))),
@@ -106,6 +111,7 @@ fn main() -> ExitCode {
             println!("orviscript {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Ok(Command::Init(path)) => init_project(&path),
         Ok(Command::Check(path)) => check_file(&path),
         Ok(Command::Run(path)) => run_file(&path),
         Ok(Command::Test(path)) => test_file(&path),
@@ -119,6 +125,60 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn init_project(path: &Path) -> ExitCode {
+    let project_name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if !name.is_empty() && name != "." => name.to_owned(),
+        _ => env::current_dir()
+            .ok()
+            .and_then(|directory| directory.file_name().map(|name| name.to_owned()))
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .unwrap_or_else(|| "orviscript-project".into()),
+    };
+    let manifest = path.join("orvi.toml");
+    let source_directory = path.join("src");
+    let entry = source_directory.join("main.orvi");
+    let gitignore = path.join(".gitignore");
+    let conflicts = [&manifest, &entry, &gitignore]
+        .into_iter()
+        .filter(|candidate| candidate.exists())
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        eprintln!(
+            "error: project initialization would overwrite: {}",
+            conflicts.join(", ")
+        );
+        return ExitCode::from(1);
+    }
+    if let Err(error) = fs::create_dir_all(&source_directory) {
+        eprintln!(
+            "error: could not create project directory '{}': {error}",
+            source_directory.display()
+        );
+        return ExitCode::from(1);
+    }
+    let escaped_name = project_name.replace('\\', "\\\\").replace('"', "\\\"");
+    let files = [
+        (
+            &manifest,
+            format!(
+                "[project]\nname = \"{escaped_name}\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n"
+            ),
+        ),
+        (&entry, format!("print(\"Hello from {escaped_name}!\")\n")),
+        (&gitignore, "/dist/\n/.orvi/\n".into()),
+    ];
+    for (file, contents) in files {
+        if let Err(error) = fs::write(file, contents) {
+            eprintln!("error: could not write '{}': {error}", file.display());
+            return ExitCode::from(1);
+        }
+    }
+    println!("Created OrviScript project at {}", path.display());
+    println!("Run it with: orviscript run {}", entry.display());
+    ExitCode::SUCCESS
 }
 
 fn check_file(path: &Path) -> ExitCode {
@@ -718,6 +778,17 @@ mod tests {
         assert_eq!(
             parse_arguments(&[OsString::from("run"), OsString::from("app.orvi")]),
             Ok(Command::Run(PathBuf::from("app.orvi")))
+        );
+    }
+    #[test]
+    fn parses_init_commands() {
+        assert_eq!(
+            parse_arguments(&[OsString::from("init")]),
+            Ok(Command::Init(PathBuf::from(".")))
+        );
+        assert_eq!(
+            parse_arguments(&[OsString::from("init"), OsString::from("demo")]),
+            Ok(Command::Init(PathBuf::from("demo")))
         );
     }
     #[test]

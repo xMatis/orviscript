@@ -29,6 +29,36 @@ fn run_with_home(arguments: &[&str], home: &std::path::Path) -> std::process::Ou
 }
 
 #[test]
+fn initializes_a_project_without_overwriting_it() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!("orviscript-init-{id}"));
+    let project_text = project.to_str().expect("UTF-8 temporary path");
+
+    let output = run(&["init", project_text]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.join("orvi.toml").is_file());
+    assert!(project.join("src/main.orvi").is_file());
+    assert!(project.join(".gitignore").is_file());
+    assert!(
+        fs::read_to_string(project.join("orvi.toml"))
+            .unwrap()
+            .contains("entry = \"src/main.orvi\"")
+    );
+
+    let second = run(&["init", project_text]);
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("would overwrite"));
+    fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
 fn runs_a_program_from_disk() {
     let path = source_file("print(6 * 7)");
     let output = run(&["run", path.to_str().expect("UTF-8 temporary path")]);

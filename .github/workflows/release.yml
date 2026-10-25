@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = ./scripts/release/Get-OrviVersion.ps1
+          if ("v$version" -ne "$env:GITHUB_REF_NAME") {
+            throw "Tag $env:GITHUB_REF_NAME does not match project version $version."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+  portable:
+    needs: validate
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin orviscript --bin orvi-lsp
+
+      - name: Package archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          name="orviscript-${version}-${{ matrix.target }}"
+          mkdir -p "artifacts/${name}"
+          cp "target/${{ matrix.target }}/release/orviscript" "artifacts/${name}/"
+          cp "target/${{ matrix.target }}/release/orvi-lsp" "artifacts/${name}/"
+          cp README.md LICENSE "artifacts/${name}/"
+          tar -C artifacts -czf "artifacts/${name}.tar.gz" "${name}"
+          cd artifacts
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - name: Upload portable distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          if-no-files-found: error
+
+  windows:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Stage binaries and extension
+        id: stage
+        shell: pwsh
+        run: |
+          $staged = ./scripts/release/Stage-Windows.ps1 -OutputDirectory "$PWD/artifacts/stage"
+          "source=$($staged.SourceDirectory)" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer and portable archive
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate.outputs.version }}"
+          $releaseDirectory = "$PWD/artifacts/release"
+          New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=$version" "/DSourceDir=${{ steps.stage.outputs.source }}" "/DOutputDir=$releaseDirectory" "installer/windows/orviscript.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed." }
+
+          $archive = Join-Path $releaseDirectory "orviscript-$version-windows-x64.zip"
+          Compress-Archive -Path "artifacts/stage/*" -DestinationPath $archive
+          Copy-Item "artifacts/stage/orviscript-vscode.vsix" (Join-Path $releaseDirectory "orviscript-$version-vscode.vsix")
+          Get-ChildItem $releaseDirectory -File | Where-Object Extension -ne ".sha256" | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Set-Content "$($_.FullName).sha256" -NoNewline
+          }
+
+      - name: Upload Windows distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: artifacts/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, portable, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --verify-tag --generate-notes --title "OrviScript ${{ needs.validate.outputs.version }}"

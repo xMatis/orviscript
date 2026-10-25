@@ -41,6 +41,15 @@ cargo run --bin orviscript -- task link project.test_artifact examples/v0_3/auto
 cargo run --bin orviscript -- task run project.test_artifact
 ```
 
+Create a project in a new directory and run its entry file:
+
+```sh
+orviscript init hello-orvi
+orviscript run hello-orvi/src/main.orvi
+```
+
+`init` creates `orvi.toml`, `src/main.orvi`, and a project `.gitignore`. It refuses to overwrite any of these files if they already exist.
+
 The 0.3.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, distinct `void` and `null` types, numbers, strings, booleans, mutable reference lists and maps, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, explicit exports, local and standard module imports, JSON, filesystem, path, environment, process and terminal APIs, explicit execution context paths, native `task` declarations, a sequential dependency scheduler, a test command and a global task registry. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, task dependency errors and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, struct field, interface and task result types. A tracing collector reclaims unreachable collection, map, struct and closure-environment cycles.
 
 The VS Code extension lives in `editors/vscode`. It provides document formatting through the same formatter used by the CLI. Build the language server, then launch a development window with the extension enabled:
@@ -51,6 +60,10 @@ code --new-window --extensionDevelopmentPath=editors/vscode examples/hello.orvi
 ```
 
 The extension finds the workspace build automatically. For another installation, set `orviscript.server.path` to the `orvi-lsp` executable or place it on `PATH`.
+
+## Distribution
+
+The release workflow builds portable archives for Windows, Linux, and macOS, an installable VSIX, SHA-256 checksum files, and a per-user Windows installer. The installer upgrades the same installation across versions, adds the CLI and LSP to `PATH`, registers `.orvi`, and can install or update the VS Code extension. See [installer/README.md](installer/README.md) for the release contract and local build command.
 
 Project website: [orviscript.com](https://orviscript.com)
 

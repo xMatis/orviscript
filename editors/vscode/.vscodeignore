@@ -1,0 +1,3 @@
+test/**
+validate.mjs
+**/*.test.mjs
