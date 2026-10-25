@@ -171,3 +171,18 @@ fn propagates_none_and_err_with_try() {
         ["Some(5)", "None", "Ok(10)", "Err(failed)"]
     );
 }
+
+#[test]
+fn runs_defer_and_using_cleanup_in_lifo_order() {
+    let source = "fn work() { defer print(\"first\"); using handle = \"db\" => print(\"close\", handle); defer print(\"last\"); return 7 } print(work())";
+    assert_eq!(
+        run(source).expect("program runs"),
+        ["last", "close db", "first", "7"]
+    );
+}
+
+#[test]
+fn runs_cleanup_when_try_propagates() {
+    let source = "fn work(value: Option<int>) -> Option<int> { defer print(\"cleanup\"); let inner = value?; return Some(inner) } print(work(None))";
+    assert_eq!(run(source).expect("program runs"), ["cleanup", "None"]);
+}

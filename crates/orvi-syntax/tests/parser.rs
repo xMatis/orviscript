@@ -145,3 +145,16 @@ fn parses_match_patterns_and_try_operator() {
     };
     assert!(matches!(initializer.kind, ExpressionKind::Try(_)));
 }
+
+#[test]
+fn parses_defer_and_using_cleanup() {
+    let parsed = parse(
+        "fn work() { defer print(\"deferred\"); using handle = \"db\" => print(\"close\", handle); return handle }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Function { body, .. } = &parsed.program.statements[0].kind else {
+        panic!("expected function")
+    };
+    assert!(matches!(body[0].kind, StatementKind::Defer(_)));
+    assert!(matches!(body[1].kind, StatementKind::Using { .. }));
+}

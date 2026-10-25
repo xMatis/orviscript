@@ -214,8 +214,18 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
         lists: Vec::new(),
         objects: Vec::new(),
         collected_objects: 0,
+        deferred: vec![Vec::new()],
     };
-    let value = match interpreter.execute_statements(&program.statements)? {
+    let result = interpreter.execute_statements(&program.statements);
+    let cleanup = interpreter.run_deferred();
+    let control = match result {
+        Ok(control) => {
+            cleanup?;
+            control
+        }
+        Err(error) => return Err(error),
+    };
+    let value = match control {
         Control::Continue(value) => value,
         Control::Return(_) => {
             return Err(RuntimeError {
@@ -241,6 +251,7 @@ struct Interpreter {
     lists: Vec<Weak<RefCell<Vec<Value>>>>,
     objects: Vec<Weak<RefCell<StructInstance>>>,
     collected_objects: usize,
+    deferred: Vec<Vec<Expression>>,
 }
 
 impl Interpreter {
@@ -355,6 +366,27 @@ impl Interpreter {
                     .map_or(Ok(Value::Null), |expression| self.evaluate(expression))?;
                 Ok(Control::Return(value))
             }
+            StatementKind::Defer(expression) => {
+                self.deferred
+                    .last_mut()
+                    .expect("interpreter always has a cleanup scope")
+                    .push(expression.clone());
+                Ok(Control::Continue(Value::Null))
+            }
+            StatementKind::Using {
+                name,
+                initializer,
+                cleanup,
+            } => {
+                let value = self.evaluate(initializer)?;
+                self.environment
+                    .define(name.name.clone(), value.clone(), false, None);
+                self.deferred
+                    .last_mut()
+                    .expect("interpreter always has a cleanup scope")
+                    .push(cleanup.clone());
+                Ok(Control::Continue(value))
+            }
             StatementKind::Expression(expression) => {
                 Ok(Control::Continue(self.evaluate(expression)?))
             }
@@ -367,9 +399,32 @@ impl Interpreter {
         environment: Environment,
     ) -> Result<Control, RuntimeError> {
         let previous = std::mem::replace(&mut self.environment, environment);
+        self.deferred.push(Vec::new());
         let result = self.execute_statements(statements);
+        let cleanup = self.run_deferred();
+        self.deferred.pop();
         self.environment = previous;
-        result
+        match result {
+            Ok(control) => cleanup.map(|()| control),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn run_deferred(&mut self) -> Result<(), RuntimeError> {
+        let deferred = std::mem::take(
+            self.deferred
+                .last_mut()
+                .expect("interpreter always has a cleanup scope"),
+        );
+        let mut first_error = None;
+        for expression in deferred.into_iter().rev() {
+            if let Err(error) = self.evaluate(&expression)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn evaluate(&mut self, expression: &Expression) -> Result<Value, RuntimeError> {

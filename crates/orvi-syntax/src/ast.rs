@@ -96,6 +96,12 @@ pub enum StatementKind {
         body: Box<Statement>,
     },
     Return(Option<Expression>),
+    Defer(Expression),
+    Using {
+        name: Identifier,
+        initializer: Expression,
+        cleanup: Expression,
+    },
     Expression(Expression),
 }
 

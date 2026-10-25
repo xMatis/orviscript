@@ -200,6 +200,18 @@ impl Parser<'_> {
         if self.consume(TokenKind::Return) {
             return self.return_statement();
         }
+        if self.consume(TokenKind::Defer) {
+            let start = self.previous().span;
+            let expression = self.expression()?;
+            self.consume(TokenKind::Semicolon);
+            return Ok(Statement {
+                span: start.cover(expression.span),
+                kind: StatementKind::Defer(expression),
+            });
+        }
+        if self.consume(TokenKind::Using) {
+            return self.using_statement();
+        }
         if self.at(TokenKind::LeftBrace) {
             let start = self.advance().span;
             let statements = self.block_contents()?;
@@ -263,6 +275,24 @@ impl Parser<'_> {
         Ok(Statement {
             span: start.cover(end),
             kind: StatementKind::Return(value),
+        })
+    }
+
+    fn using_statement(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let name = self.expect_identifier("expected resource name")?;
+        self.expect(TokenKind::Equal, "expected '=' after resource name")?;
+        let initializer = self.expression()?;
+        self.expect(TokenKind::FatArrow, "expected '=>' before resource cleanup")?;
+        let cleanup = self.expression()?;
+        self.consume(TokenKind::Semicolon);
+        Ok(Statement {
+            span: start.cover(cleanup.span),
+            kind: StatementKind::Using {
+                name,
+                initializer,
+                cleanup,
+            },
         })
     }
 

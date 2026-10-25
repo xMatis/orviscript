@@ -371,6 +371,27 @@ impl Analyzer {
                     self.require_assignable(&expected, &actual, statement.span);
                 }
             }
+            StatementKind::Defer(expression) => {
+                self.expression(expression);
+            }
+            StatementKind::Using {
+                name,
+                initializer,
+                cleanup,
+            } => {
+                let value_type = self.expression(initializer);
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Constant,
+                        mutable: false,
+                        arity: None,
+                        definition: Some(name.span),
+                        value_type,
+                    },
+                );
+                self.expression(cleanup);
+            }
             StatementKind::Expression(expression) => {
                 self.expression(expression);
             }
@@ -1137,5 +1158,11 @@ mod tests {
                 .iter()
                 .any(|error| error.kind == SemanticErrorKind::NonExhaustiveMatch)
         );
+    }
+
+    #[test]
+    fn analyzes_deferred_and_using_cleanup_in_scope() {
+        let source = "fn work(value: Option<int>) -> Option<int> { defer print(\"done\"); using handle = \"db\" => print(\"close\", handle); let inner = value?; return Some(inner) }";
+        assert!(errors(source).is_empty());
     }
 }

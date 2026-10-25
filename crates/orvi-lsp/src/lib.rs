@@ -426,6 +426,8 @@ fn classify_token(
         | TokenKind::Fn
         | TokenKind::Struct
         | TokenKind::Match
+        | TokenKind::Using
+        | TokenKind::Defer
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::While
@@ -485,6 +487,12 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             CompletionItemKind::KEYWORD,
             "pattern matching expression",
         ),
+        (
+            "using",
+            CompletionItemKind::KEYWORD,
+            "scoped resource cleanup",
+        ),
+        ("defer", CompletionItemKind::KEYWORD, "deferred cleanup"),
         ("if", CompletionItemKind::KEYWORD, "conditional branch"),
         ("else", CompletionItemKind::KEYWORD, "alternative branch"),
         ("while", CompletionItemKind::KEYWORD, "loop"),
@@ -587,6 +595,8 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "fn" => "`fn` declares a function.",
         "struct" => "`struct` declares a stable set of typed fields.",
         "match" => "`match` selects an expression using exhaustive patterns.",
+        "using" => "`using name = value => cleanup` registers scoped cleanup.",
+        "defer" => "`defer expression` runs the expression when the scope exits.",
         "if" => "`if` executes a branch when its condition is `true`.",
         "else" => "`else` provides an alternative branch.",
         "while" => "`while` repeats a block while its condition is `true`.",
