@@ -57,3 +57,20 @@ fn prints_semantic_diagnostics() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("error: undefined name 'missing'"));
 }
+
+#[test]
+fn formats_source_and_checks_the_result() {
+    let path = source_file("let value=1+2");
+    let path_text = path.to_str().expect("UTF-8 temporary path");
+
+    let before = run(&["fmt", "--check", path_text]);
+    assert_eq!(before.status.code(), Some(1));
+
+    let formatted = run(&["fmt", path_text]);
+    assert!(formatted.status.success());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "let value = 1 + 2\n");
+
+    let after = run(&["fmt", "--check", path_text]);
+    fs::remove_file(path).expect("temporary source can be removed");
+    assert!(after.status.success());
+}

@@ -168,6 +168,30 @@ test("language server publishes diagnostics for an open document", { timeout: 60
 
     send({
       jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi", version: 3 },
+        contentChanges: [{ text: "let answer=42;print(answer)" }],
+      },
+    });
+    await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.version === 3,
+    );
+    send({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "textDocument/formatting",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        options: { tabSize: 4, insertSpaces: true },
+      },
+    });
+    const formatting = await waitFor((message) => message.id === 9);
+    assert.equal(formatting.result[0].newText, "let answer = 42;\nprint(answer)\n");
+
+    send({
+      jsonrpc: "2.0",
       method: "textDocument/didClose",
       params: { textDocument: { uri: "file:///diagnostic.orvi" } },
     });
@@ -177,8 +201,8 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     );
     assert.deepEqual(closed.params.diagnostics, []);
 
-    send({ jsonrpc: "2.0", id: 9, method: "shutdown", params: null });
-    await waitFor((message) => message.id === 9);
+    send({ jsonrpc: "2.0", id: 10, method: "shutdown", params: null });
+    await waitFor((message) => message.id === 10);
     send({ jsonrpc: "2.0", method: "exit", params: null });
     server.stdin.end();
     await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2000))]);

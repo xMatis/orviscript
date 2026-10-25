@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use orvi_runtime::execute;
 use orvi_sema::analyze;
-use orvi_syntax::{Span, line_column, parse};
+use orvi_syntax::{Span, format_source, line_column, parse};
 
 const HELP: &str = "OrviScript
 
@@ -16,6 +16,9 @@ Usage: orviscript [OPTIONS]
 Commands:
   run <FILE>    Run an OrviScript program
   check <FILE>  Check an OrviScript program for syntax and semantic errors
+  fmt <FILE>    Format an OrviScript program in place
+  fmt --check <FILE>
+                Check whether an OrviScript program is formatted
 
 Options:
   -h, --help     Print help
@@ -27,6 +30,7 @@ enum Command {
     Version,
     Run(PathBuf),
     Check(PathBuf),
+    Format { path: PathBuf, check: bool },
 }
 
 fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
@@ -36,7 +40,18 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [argument] if argument == "-V" || argument == "--version" => Ok(Command::Version),
         [command, path] if command == "run" => Ok(Command::Run(PathBuf::from(path))),
         [command, path] if command == "check" => Ok(Command::Check(PathBuf::from(path))),
-        [command] if command == "run" || command == "check" => Err(format!(
+        [command, option] if command == "fmt" && option == "--check" => {
+            Err("command 'fmt --check' requires a file".into())
+        }
+        [command, path] if command == "fmt" => Ok(Command::Format {
+            path: PathBuf::from(path),
+            check: false,
+        }),
+        [command, option, path] if command == "fmt" && option == "--check" => Ok(Command::Format {
+            path: PathBuf::from(path),
+            check: true,
+        }),
+        [command] if command == "run" || command == "check" || command == "fmt" => Err(format!(
             "command '{}' requires a file",
             command.to_string_lossy()
         )),
@@ -61,6 +76,7 @@ fn main() -> ExitCode {
         }
         Ok(Command::Check(path)) => check_file(&path),
         Ok(Command::Run(path)) => run_file(&path),
+        Ok(Command::Format { path, check }) => format_file(&path, check),
         Err(message) => {
             eprintln!("error: {message}\n\nFor usage information, try 'orviscript --help'.");
             ExitCode::from(2)
@@ -105,6 +121,38 @@ fn run_file(path: &Path) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn format_file(path: &Path, check: bool) -> ExitCode {
+    let Some((source, parsed)) = load_and_parse(path) else {
+        return ExitCode::from(1);
+    };
+    if report_syntax_errors(path, &source, &parsed) {
+        return ExitCode::from(1);
+    }
+    let formatted = match format_source(&source) {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            eprintln!("error: could not format '{}': {error}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    if check {
+        if source == formatted {
+            println!("Format check passed: {}", path.display());
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("error: '{}' is not formatted", path.display());
+        return ExitCode::from(1);
+    }
+    if source != formatted
+        && let Err(error) = fs::write(path, formatted)
+    {
+        eprintln!("error: could not write '{}': {error}", path.display());
+        return ExitCode::from(1);
+    }
+    println!("Formatted: {}", path.display());
+    ExitCode::SUCCESS
 }
 
 fn load_and_parse(path: &Path) -> Option<(String, orvi_syntax::Parsed)> {
@@ -175,6 +223,27 @@ mod tests {
         assert_eq!(
             parse_arguments(&[OsString::from("check"), OsString::from("app.orvi")]),
             Ok(Command::Check(PathBuf::from("app.orvi")))
+        );
+    }
+    #[test]
+    fn parses_format_commands() {
+        assert_eq!(
+            parse_arguments(&[OsString::from("fmt"), OsString::from("app.orvi")]),
+            Ok(Command::Format {
+                path: PathBuf::from("app.orvi"),
+                check: false,
+            })
+        );
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("fmt"),
+                OsString::from("--check"),
+                OsString::from("app.orvi"),
+            ]),
+            Ok(Command::Format {
+                path: PathBuf::from("app.orvi"),
+                check: true,
+            })
         );
     }
     #[test]

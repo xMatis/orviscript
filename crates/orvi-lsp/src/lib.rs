@@ -2,19 +2,20 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use orvi_sema::{Analysis, SymbolOccurrence, analyze, analyze_program};
-use orvi_syntax::{Span, TokenKind, lex, parse};
+use orvi_syntax::{Span, TokenKind, format_source, lex, parse};
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkupContent, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse,
-    Range, ReferenceParams, RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
-    ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, WorkDoneProgressOptions, WorkspaceEdit,
+    DidOpenTextDocumentParams, DocumentFormattingParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
+    MessageType, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions,
+    RenameParams, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, WorkDoneProgressOptions,
+    WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -70,6 +71,7 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -152,6 +154,13 @@ impl LanguageServer for Backend {
             result_id: None,
             data: semantic_tokens(&source),
         })))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let Some(source) = self.document(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(format_document(&source).map(|edit| vec![edit]))
     }
 
     async fn goto_definition(
@@ -646,6 +655,14 @@ fn diagnostic(source: &str, span: Span, message: String) -> Diagnostic {
     }
 }
 
+fn format_document(source: &str) -> Option<TextEdit> {
+    let formatted = format_source(source).ok()?;
+    Some(TextEdit::new(
+        Range::new(Position::new(0, 0), position(source, source.len())),
+        formatted,
+    ))
+}
+
 pub fn span_range(source: &str, span: Span) -> Range {
     Range {
         start: position(source, span.start()),
@@ -691,8 +708,8 @@ fn offset_at_position(source: &str, position: Position) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_items, diagnostics, hover_at, is_identifier, semantic_tokens, span_range,
-        symbol_at,
+        completion_items, diagnostics, format_document, hover_at, is_identifier, semantic_tokens,
+        span_range, symbol_at,
     };
     use orvi_syntax::Span;
     use tower_lsp_server::ls_types::{
@@ -720,6 +737,14 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].message, "undefined name 'missing'");
+    }
+
+    #[test]
+    fn formats_a_complete_document_with_the_shared_formatter() {
+        let edit = format_document("let value=1+2").expect("format edit");
+        assert_eq!(edit.new_text, "let value = 1 + 2\n");
+        assert_eq!(edit.range.start, Position::new(0, 0));
+        assert_eq!(edit.range.end, Position::new(0, 13));
     }
 
     #[test]

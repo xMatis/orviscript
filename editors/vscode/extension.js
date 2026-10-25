@@ -81,7 +81,7 @@ class LanguageServerConnection {
           rename: { prepareSupport: true },
           semanticTokens: {
             requests: { full: true },
-            tokenTypes: ["variable", "function", "parameter", "keyword", "string", "number", "comment", "operator"],
+            tokenTypes: ["variable", "function", "parameter", "keyword", "string", "number", "comment", "operator", "type", "property"],
             tokenModifiers: ["declaration", "readonly", "defaultLibrary"],
             formats: ["relative"],
           },
@@ -211,6 +211,21 @@ class LanguageServerConnection {
       }));
     }
 
+    if (capabilities.documentFormattingProvider) {
+      this.disposables.push(vscode.languages.registerDocumentFormattingEditProvider(selector, {
+        provideDocumentFormattingEdits: async (document, options) => {
+          const response = await this.request("textDocument/formatting", {
+            textDocument: { uri: document.uri.toString() },
+            options: {
+              tabSize: options.tabSize,
+              insertSpaces: options.insertSpaces,
+            },
+          });
+          return response?.map((edit) => vscode.TextEdit.replace(asRange(edit.range), edit.newText)) ?? [];
+        },
+      }));
+    }
+
     const semantic = capabilities.semanticTokensProvider;
     if (semantic?.legend) {
       const legend = new vscode.SemanticTokensLegend(
@@ -333,10 +348,15 @@ function documentPosition(document, position) {
 function completionKind(kind) {
   const kinds = {
     3: vscode.CompletionItemKind.Function,
+    4: vscode.CompletionItemKind.Constructor,
     6: vscode.CompletionItemKind.Variable,
     12: vscode.CompletionItemKind.Value,
+    13: vscode.CompletionItemKind.Enum,
     14: vscode.CompletionItemKind.Keyword,
+    20: vscode.CompletionItemKind.EnumMember,
     21: vscode.CompletionItemKind.Constant,
+    22: vscode.CompletionItemKind.Struct,
+    25: vscode.CompletionItemKind.TypeParameter,
   };
   return kinds[kind] ?? vscode.CompletionItemKind.Text;
 }
