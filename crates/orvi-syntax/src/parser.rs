@@ -2,7 +2,8 @@ use std::fmt;
 
 use crate::{
     BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, Parameter, Program,
-    Span, Statement, StatementKind, Token, TokenKind, TypeAnnotation, UnaryOperator, lex,
+    Span, Statement, StatementKind, StructField, Token, TokenKind, TypeAnnotation, UnaryOperator,
+    lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +84,9 @@ impl Parser<'_> {
         if self.consume(TokenKind::Fn) {
             return self.function();
         }
+        if self.consume(TokenKind::Struct) {
+            return self.struct_declaration();
+        }
         self.statement()
     }
 
@@ -149,6 +153,40 @@ impl Parser<'_> {
                 return_type,
                 body,
             },
+        })
+    }
+
+    fn struct_declaration(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let name = self.expect_identifier("expected struct name")?;
+        self.expect(TokenKind::LeftBrace, "expected '{' after struct name")?;
+        let mut fields = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at(TokenKind::EndOfFile) {
+            let field_name = self.expect_identifier("expected field name")?;
+            self.expect(TokenKind::Colon, "expected ':' after field name")?;
+            let type_annotation = self.type_annotation()?;
+            let default = if self.consume(TokenKind::Equal) {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            self.consume(TokenKind::Semicolon);
+            let end = default
+                .as_ref()
+                .map_or(type_annotation.span, |value| value.span);
+            fields.push(StructField {
+                span: field_name.span.cover(end),
+                name: field_name,
+                type_annotation,
+                default,
+            });
+        }
+        let end = self
+            .expect(TokenKind::RightBrace, "expected '}' after struct fields")?
+            .span;
+        Ok(Statement {
+            span: start.cover(end),
+            kind: StatementKind::Struct { name, fields },
         })
     }
 
@@ -264,6 +302,14 @@ impl Parser<'_> {
                     kind: ExpressionKind::IndexAssign {
                         object,
                         index,
+                        value: Box::new(value),
+                    },
+                }),
+                ExpressionKind::Member { object, field } => Ok(Expression {
+                    span,
+                    kind: ExpressionKind::MemberAssign {
+                        object,
+                        field,
                         value: Box::new(value),
                     },
                 }),
@@ -402,6 +448,15 @@ impl Parser<'_> {
                     kind: ExpressionKind::Index {
                         object: Box::new(expression),
                         index: Box::new(index),
+                    },
+                };
+            } else if self.consume(TokenKind::Dot) {
+                let field = self.expect_identifier("expected field name after '.'")?;
+                expression = Expression {
+                    span: expression.span.cover(field.span),
+                    kind: ExpressionKind::Member {
+                        object: Box::new(expression),
+                        field,
                     },
                 };
             } else {
@@ -550,6 +605,7 @@ impl Parser<'_> {
                 TokenKind::Let
                     | TokenKind::Const
                     | TokenKind::Fn
+                    | TokenKind::Struct
                     | TokenKind::If
                     | TokenKind::While
                     | TokenKind::Return

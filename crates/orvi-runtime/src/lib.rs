@@ -5,7 +5,7 @@ use std::rc::{Rc, Weak};
 
 use orvi_syntax::{
     BinaryOperator, Expression, ExpressionKind, Literal, Parameter, Program, Span, Statement,
-    StatementKind, TypeAnnotation, UnaryOperator,
+    StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone)]
@@ -16,6 +16,8 @@ pub enum Value {
     Float(f64),
     String(String),
     List(Rc<RefCell<Vec<Value>>>),
+    StructType(Rc<StructDefinition>),
+    StructInstance(Rc<RefCell<StructInstance>>),
     Function(Rc<UserFunction>),
     NativePrint,
 }
@@ -60,6 +62,18 @@ pub struct UserFunction {
     return_type: Option<TypeAnnotation>,
     body: Vec<Statement>,
     closure: Environment,
+}
+
+#[derive(Clone)]
+pub struct StructDefinition {
+    name: String,
+    fields: Vec<StructField>,
+    closure: Environment,
+}
+
+pub struct StructInstance {
+    definition: Rc<StructDefinition>,
+    fields: HashMap<String, Value>,
 }
 
 #[derive(Clone)]
@@ -141,10 +155,7 @@ impl Environment {
 enum AssignError {
     Undefined,
     Immutable,
-    TypeMismatch {
-        expected: String,
-        actual: &'static str,
-    },
+    TypeMismatch { expected: String, actual: String },
 }
 enum Control {
     Continue(Value),
@@ -160,6 +171,7 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
         function_depth: 0,
         environments: vec![Rc::downgrade(&globals.0)],
         lists: Vec::new(),
+        objects: Vec::new(),
         collected_objects: 0,
     };
     let value = match interpreter.execute_statements(&program.statements)? {
@@ -185,6 +197,7 @@ struct Interpreter {
     function_depth: usize,
     environments: Vec<Weak<RefCell<EnvironmentData>>>,
     lists: Vec<Weak<RefCell<Vec<Value>>>>,
+    objects: Vec<Weak<RefCell<StructInstance>>>,
     collected_objects: usize,
 }
 
@@ -240,6 +253,20 @@ impl Interpreter {
                 self.environment.define(
                     name.name.clone(),
                     Value::Function(Rc::new(function)),
+                    false,
+                    None,
+                );
+                Ok(Control::Continue(Value::Null))
+            }
+            StatementKind::Struct { name, fields } => {
+                let definition = StructDefinition {
+                    name: name.name.clone(),
+                    fields: fields.clone(),
+                    closure: self.environment.clone(),
+                };
+                self.environment.define(
+                    name.name.clone(),
+                    Value::StructType(Rc::new(definition)),
                     false,
                     None,
                 );
@@ -367,6 +394,39 @@ impl Interpreter {
                 *slot = value.clone();
                 Ok(value)
             }
+            ExpressionKind::MemberAssign {
+                object,
+                field,
+                value,
+            } => {
+                let object = self.evaluate(object)?;
+                let value = self.evaluate(value)?;
+                let Value::StructInstance(instance) = object else {
+                    return Err(self.error("value has no fields", expression.span));
+                };
+                let mut instance = instance.borrow_mut();
+                let Some(field_definition) = instance
+                    .definition
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.name.name == field.name)
+                else {
+                    return Err(self.error(
+                        format!(
+                            "struct '{}' has no field '{}'",
+                            instance.definition.name, field.name
+                        ),
+                        field.span,
+                    ));
+                };
+                self.require_type(
+                    &value,
+                    Some(&field_definition.type_annotation),
+                    expression.span,
+                )?;
+                instance.fields.insert(field.name.clone(), value.clone());
+                Ok(value)
+            }
             ExpressionKind::Unary { operator, operand } => {
                 let value = self.evaluate(operand)?;
                 match (operator, value) {
@@ -408,6 +468,22 @@ impl Interpreter {
                         self.error("list index is out of bounds", expression.span)
                     })?;
                 Ok(value)
+            }
+            ExpressionKind::Member { object, field } => {
+                let object = self.evaluate(object)?;
+                let Value::StructInstance(instance) = object else {
+                    return Err(self.error("value has no fields", expression.span));
+                };
+                let instance = instance.borrow();
+                instance.fields.get(field.as_str()).cloned().ok_or_else(|| {
+                    self.error(
+                        format!(
+                            "struct '{}' has no field '{}'",
+                            instance.definition.name, field.name
+                        ),
+                        field.span,
+                    )
+                })
             }
         }
     }
@@ -517,6 +593,55 @@ impl Interpreter {
                 };
                 self.require_type(&value, function.return_type.as_ref(), span)?;
                 Ok(value)
+            }
+            Value::StructType(definition) => {
+                let required = definition
+                    .fields
+                    .iter()
+                    .take_while(|field| field.default.is_none())
+                    .count();
+                if arguments.len() < required || arguments.len() > definition.fields.len() {
+                    return Err(self.error(
+                        format!(
+                            "struct '{}' expects between {required} and {} arguments, received {}",
+                            definition.name,
+                            definition.fields.len(),
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                let environment = self.child_environment(definition.closure.clone());
+                let previous = std::mem::replace(&mut self.environment, environment);
+                let values = (|| {
+                    let mut values = HashMap::new();
+                    for (index, field) in definition.fields.iter().enumerate() {
+                        let value = if let Some(value) = arguments.get(index) {
+                            value.clone()
+                        } else if let Some(default) = &field.default {
+                            self.evaluate(default)?
+                        } else {
+                            return Err(self.error("missing required struct field", field.span));
+                        };
+                        self.require_type(&value, Some(&field.type_annotation), field.span)?;
+                        self.environment.define(
+                            field.name.name.clone(),
+                            value.clone(),
+                            false,
+                            Some(field.type_annotation.clone()),
+                        );
+                        values.insert(field.name.name.clone(), value);
+                    }
+                    Ok(values)
+                })();
+                self.environment = previous;
+                let values = values?;
+                let instance = Rc::new(RefCell::new(StructInstance {
+                    definition,
+                    fields: values,
+                }));
+                self.objects.push(Rc::downgrade(&instance));
+                Ok(Value::StructInstance(instance))
             }
             _ => Err(self.error("value is not callable", span)),
         }
@@ -635,6 +760,17 @@ impl Interpreter {
             }
             Rc::strong_count(&values) > 1
         });
+        self.objects.retain(|entry| {
+            let Some(instance) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&instance) as usize;
+            if !marked_lists.contains(&identity) {
+                instance.borrow_mut().fields.clear();
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&instance) > 1
+        });
         self.environments.retain(|entry| {
             let Some(environment) = entry.upgrade() else {
                 return false;
@@ -728,6 +864,26 @@ fn mark_value(
                 mark_value(value, marked_environments, marked_lists);
             }
         }
+        Value::StructInstance(instance) => {
+            let identity = Rc::as_ptr(instance) as usize;
+            if !marked_lists.insert(identity) {
+                return;
+            }
+            let (closure, values) = {
+                let instance = instance.borrow();
+                (
+                    instance.definition.closure.clone(),
+                    instance.fields.values().cloned().collect::<Vec<_>>(),
+                )
+            };
+            mark_environment(&closure, marked_environments, marked_lists);
+            for value in &values {
+                mark_value(value, marked_environments, marked_lists);
+            }
+        }
+        Value::StructType(definition) => {
+            mark_environment(&definition.closure, marked_environments, marked_lists)
+        }
         Value::Function(function) => {
             mark_environment(&function.closure, marked_environments, marked_lists)
         }
@@ -736,15 +892,17 @@ fn mark_value(
 }
 
 impl Value {
-    fn type_name(&self) -> &'static str {
+    fn type_name(&self) -> String {
         match self {
-            Self::Null => "null",
-            Self::Bool(_) => "bool",
-            Self::Integer(_) => "int",
-            Self::Float(_) => "float",
-            Self::String(_) => "string",
-            Self::List(_) => "list",
-            Self::Function(_) | Self::NativePrint => "fn",
+            Self::Null => "null".into(),
+            Self::Bool(_) => "bool".into(),
+            Self::Integer(_) => "int".into(),
+            Self::Float(_) => "float".into(),
+            Self::String(_) => "string".into(),
+            Self::List(_) => "list".into(),
+            Self::Function(_) | Self::NativePrint => "fn".into(),
+            Self::StructType(definition) => format!("type {}", definition.name),
+            Self::StructInstance(instance) => instance.borrow().definition.name.clone(),
         }
     }
 }
@@ -785,7 +943,10 @@ fn value_matches_type_inner(
             matches
         }
         "fn" => matches!(value, Value::Function(_) | Value::NativePrint),
-        _ => false,
+        name => matches!(
+            value,
+            Value::StructInstance(instance) if instance.borrow().definition.name == name
+        ),
     }
 }
 
@@ -844,6 +1005,22 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
                     .zip(b.iter())
                     .all(|(a, b)| values_equal_inner(a, b, visited))
         }
+        (Value::StructType(a), Value::StructType(b)) => Rc::ptr_eq(a, b),
+        (Value::StructInstance(a), Value::StructInstance(b)) => {
+            let identity = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+            if !visited.insert(identity) {
+                return true;
+            }
+            let a = a.borrow();
+            let b = b.borrow();
+            a.definition.name == b.definition.name
+                && a.fields.len() == b.fields.len()
+                && a.fields.iter().all(|(name, value)| {
+                    b.fields
+                        .get(name)
+                        .is_some_and(|other| values_equal_inner(value, other, visited))
+                })
+        }
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
@@ -870,6 +1047,27 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
                 .join(", ");
             visited.remove(&identity);
             format!("[{formatted}]")
+        }
+        Value::StructType(definition) => format!("<struct {}>", definition.name),
+        Value::StructInstance(instance) => {
+            let identity = Rc::as_ptr(instance) as usize;
+            if !visited.insert(identity) {
+                return "<cycle>".into();
+            }
+            let instance = instance.borrow();
+            let formatted = instance
+                .definition
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    instance.fields.get(field.name.as_str()).map(|value| {
+                        format!("{}: {}", field.name.name, format_value(value, visited))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            visited.remove(&identity);
+            format!("{} {{ {formatted} }}", instance.definition.name)
         }
         Value::Function(function) => format!("<fn {}>", function.name),
         Value::NativePrint => "<native fn print>".into(),

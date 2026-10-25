@@ -41,7 +41,7 @@
     },
     "keywords": {
       "patterns": [
-        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn)\\b" },
+        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|struct)\\b" },
         { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return)\\b" }
       ]
     },
@@ -57,7 +57,8 @@
     },
     "functionDeclarations": {
       "patterns": [
-        { "name": "entity.name.function.orviscript", "match": "(?<=\\bfn\\s)[\\p{L}_][\\p{L}\\p{N}_]*" }
+        { "name": "entity.name.function.orviscript", "match": "(?<=\\bfn\\s)[\\p{L}_][\\p{L}\\p{N}_]*" },
+        { "name": "entity.name.type.struct.orviscript", "match": "(?<=\\bstruct\\s)[\\p{L}_][\\p{L}\\p{N}_]*" }
       ]
     },
     "functionCalls": {

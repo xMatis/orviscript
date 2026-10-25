@@ -29,7 +29,7 @@ const grammar = readJson(grammarContribution.path);
 assert(grammar.scopeName === grammarContribution.scopeName, "grammar scope does not match manifest");
 assert(Array.isArray(grammar.patterns) && grammar.patterns.length > 0, "grammar has no patterns");
 const keywordPatterns = grammar.repository.keywords.patterns.map((pattern) => pattern.match).join(" ");
-for (const unsupported of ["struct", "match", "async", "await", "parallel", "task", "using", "defer"]) {
+for (const unsupported of ["match", "async", "await", "parallel", "task", "using", "defer"]) {
   assert(!keywordPatterns.includes(unsupported), `grammar advertises unsupported keyword '${unsupported}'`);
 }
 

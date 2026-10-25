@@ -108,3 +108,25 @@ fn parses_lists_indexing_and_index_assignment() {
         ExpressionKind::IndexAssign { .. }
     ));
 }
+
+#[test]
+fn parses_struct_fields_defaults_and_member_assignment() {
+    let parsed = parse(
+        "struct Server { host: string; port: int = 22 } let server = Server(\"localhost\"); server.port = 8080",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Struct { name, fields } = &parsed.program.statements[0].kind else {
+        panic!("expected struct declaration")
+    };
+    assert_eq!(name.name, "Server");
+    assert_eq!(fields.len(), 2);
+    assert!(fields[0].default.is_none());
+    assert!(fields[1].default.is_some());
+    let StatementKind::Expression(expression) = &parsed.program.statements[2].kind else {
+        panic!("expected field assignment")
+    };
+    assert!(matches!(
+        expression.kind,
+        ExpressionKind::MemberAssign { .. }
+    ));
+}

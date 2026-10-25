@@ -131,3 +131,28 @@ fn collects_unreachable_list_and_closure_cycles() {
     assert_eq!(execution.output, ["alive"]);
     assert!(execution.collected_objects >= 2);
 }
+
+#[test]
+fn constructs_reads_and_updates_structs() {
+    let source = "struct Server { host: string; port: int = 22 } let server: Server = Server(\"localhost\"); print(server.port); server.port = 8080; print(server)";
+    assert_eq!(
+        run(source).expect("program runs"),
+        ["22", "Server { host: localhost, port: 8080 }"]
+    );
+}
+
+#[test]
+fn enforces_struct_field_types_and_collects_cycles() {
+    assert_eq!(
+        run("struct Server { port: int } let server = Server(80); server.port = \"wrong\"")
+            .expect_err("field assignment fails"),
+        "expected int, received string"
+    );
+
+    let source = "{ struct Node { next: any = null } let node = Node(); node.next = node; print(node) } print(\"alive\")";
+    let parsed = parse(source);
+    assert!(!parsed.has_errors());
+    let execution = execute(&parsed.program).expect("program runs");
+    assert_eq!(execution.output, ["Node { next: <cycle> }", "alive"]);
+    assert!(execution.collected_objects >= 1);
+}

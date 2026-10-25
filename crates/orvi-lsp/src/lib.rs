@@ -311,6 +311,7 @@ pub fn semantic_tokens_legend() -> SemanticTokensLegend {
             SemanticTokenType::COMMENT,
             SemanticTokenType::OPERATOR,
             SemanticTokenType::TYPE,
+            SemanticTokenType::PROPERTY,
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,
@@ -399,6 +400,8 @@ fn classify_token(
         {
             (8, 0)
         }
+        TokenKind::Identifier if previous == Some(TokenKind::Struct) => (8, DECLARATION),
+        TokenKind::Identifier if previous == Some(TokenKind::Dot) => (9, 0),
         TokenKind::Identifier if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) => {
             (8, 0)
         }
@@ -412,6 +415,7 @@ fn classify_token(
         TokenKind::Let
         | TokenKind::Const
         | TokenKind::Fn
+        | TokenKind::Struct
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::While
@@ -465,6 +469,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "immutable variable declaration",
         ),
         ("fn", CompletionItemKind::KEYWORD, "function declaration"),
+        ("struct", CompletionItemKind::KEYWORD, "struct declaration"),
         ("if", CompletionItemKind::KEYWORD, "conditional branch"),
         ("else", CompletionItemKind::KEYWORD, "alternative branch"),
         ("while", CompletionItemKind::KEYWORD, "loop"),
@@ -515,6 +520,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
                 }
                 let kind = match symbol.kind {
                     orvi_sema::SymbolKind::Function => CompletionItemKind::FUNCTION,
+                    orvi_sema::SymbolKind::Struct => CompletionItemKind::STRUCT,
                     orvi_sema::SymbolKind::Variable
                     | orvi_sema::SymbolKind::Constant
                     | orvi_sema::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
@@ -542,6 +548,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "let" => "`let` declares a mutable variable.",
         "const" => "`const` declares an immutable variable.",
         "fn" => "`fn` declares a function.",
+        "struct" => "`struct` declares a stable set of typed fields.",
         "if" => "`if` executes a branch when its condition is `true`.",
         "else" => "`else` provides an alternative branch.",
         "while" => "`while` repeats a block while its condition is `true`.",
@@ -555,6 +562,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
                 orvi_sema::SymbolKind::Variable => "let",
                 orvi_sema::SymbolKind::Constant => "const",
                 orvi_sema::SymbolKind::Function => "fn",
+                orvi_sema::SymbolKind::Struct => "struct",
                 orvi_sema::SymbolKind::Parameter => "parameter",
             };
             let type_name = symbol.type_name.unwrap_or_else(|| "any".into());
@@ -704,7 +712,7 @@ mod tests {
         assert!(items.iter().any(|item| {
             item.label == "print" && item.kind == Some(CompletionItemKind::FUNCTION)
         }));
-        assert!(!items.iter().any(|item| item.label == "struct"));
+        assert!(items.iter().any(|item| item.label == "struct"));
     }
 
     #[test]

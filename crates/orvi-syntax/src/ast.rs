@@ -30,6 +30,14 @@ pub struct Parameter {
     pub type_annotation: Option<TypeAnnotation>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructField {
+    pub name: Identifier,
+    pub type_annotation: TypeAnnotation,
+    pub default: Option<Expression>,
+    pub span: Span,
+}
+
 impl Identifier {
     pub fn as_str(&self) -> &str {
         &self.name
@@ -49,6 +57,10 @@ pub enum StatementKind {
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
+    },
+    Struct {
+        name: Identifier,
+        fields: Vec<StructField>,
     },
     Block(Vec<Statement>),
     If {
@@ -84,6 +96,11 @@ pub enum ExpressionKind {
         index: Box<Expression>,
         value: Box<Expression>,
     },
+    MemberAssign {
+        object: Box<Expression>,
+        field: Identifier,
+        value: Box<Expression>,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<Expression>,
@@ -100,6 +117,10 @@ pub enum ExpressionKind {
     Index {
         object: Box<Expression>,
         index: Box<Expression>,
+    },
+    Member {
+        object: Box<Expression>,
+        field: Identifier,
     },
 }
 

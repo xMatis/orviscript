@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use orvi_syntax::{
@@ -30,6 +30,7 @@ pub enum SymbolKind {
     Constant,
     Function,
     Parameter,
+    Struct,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +74,7 @@ enum StaticType {
     Number,
     String,
     List(Box<StaticType>),
+    Struct(String),
     Function {
         parameters: Vec<StaticType>,
         result: Box<StaticType>,
@@ -84,6 +86,14 @@ pub fn analyze(program: &Program) -> Vec<SemanticError> {
 }
 
 pub fn analyze_program(program: &Program) -> Analysis {
+    let struct_names = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::Struct { name, .. } => Some(name.name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut analyzer = Analyzer {
         scopes: vec![HashMap::from([(
             "print".into(),
@@ -102,6 +112,8 @@ pub fn analyze_program(program: &Program) -> Analysis {
         symbols: Vec::new(),
         function_depth: 0,
         current_return_type: None,
+        struct_names,
+        structs: HashMap::new(),
     };
     analyzer.statements(&program.statements, false);
     Analysis {
@@ -116,12 +128,55 @@ struct Analyzer {
     symbols: Vec<SymbolOccurrence>,
     function_depth: usize,
     current_return_type: Option<StaticType>,
+    struct_names: HashSet<String>,
+    structs: HashMap<String, HashMap<String, StaticType>>,
 }
 
 impl Analyzer {
     fn statements(&mut self, statements: &[Statement], create_scope: bool) {
         if create_scope {
             self.scopes.push(HashMap::new());
+        }
+
+        for statement in statements {
+            if let StatementKind::Struct { name, fields } = &statement.kind {
+                self.struct_names.insert(name.name.clone());
+                let mut field_types = HashMap::new();
+                let mut parameters = Vec::new();
+                for field in fields {
+                    let field_type = self
+                        .annotation_type(Some(&field.type_annotation))
+                        .unwrap_or(StaticType::Dynamic);
+                    if field_types
+                        .insert(field.name.name.clone(), field_type.clone())
+                        .is_some()
+                    {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::DuplicateName,
+                            message: format!(
+                                "field '{}' is already declared in struct '{}'",
+                                field.name.name, name.name
+                            ),
+                            span: field.name.span,
+                        });
+                    }
+                    parameters.push(field_type);
+                }
+                self.structs.insert(name.name.clone(), field_types);
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Struct,
+                        mutable: false,
+                        arity: None,
+                        definition: Some(name.span),
+                        value_type: StaticType::Function {
+                            parameters,
+                            result: Box::new(StaticType::Struct(name.name.clone())),
+                        },
+                    },
+                );
+            }
         }
 
         for statement in statements {
@@ -210,6 +265,29 @@ impl Analyzer {
                 );
             }
             StatementKind::Function { .. } => unreachable!("function bodies are analyzed last"),
+            StatementKind::Struct { name, fields } => {
+                let mut saw_default = false;
+                for field in fields {
+                    if let Some(default) = &field.default {
+                        saw_default = true;
+                        let actual = self.expression(default);
+                        let expected = self
+                            .structs
+                            .get(name.as_str())
+                            .and_then(|fields| fields.get(field.name.as_str()))
+                            .cloned()
+                            .unwrap_or(StaticType::Dynamic);
+                        self.require_assignable(&expected, &actual, default.span);
+                    } else if saw_default {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::ArgumentCount,
+                            message: "required struct fields must precede fields with defaults"
+                                .into(),
+                            span: field.span,
+                        });
+                    }
+                }
+            }
             StatementKind::Block(statements) => self.statements(statements, true),
             StatementKind::If {
                 condition,
@@ -260,7 +338,7 @@ impl Analyzer {
             let value_type = parameter
                 .type_annotation
                 .as_ref()
-                .and_then(static_type_from_annotation)
+                .and_then(|annotation| static_type_from_annotation(annotation, &self.struct_names))
                 .unwrap_or(StaticType::Dynamic);
             self.declare(
                 &parameter.name,
@@ -274,7 +352,8 @@ impl Analyzer {
             );
         }
         let previous_return_type = self.current_return_type.clone();
-        self.current_return_type = return_type.and_then(static_type_from_annotation);
+        self.current_return_type = return_type
+            .and_then(|annotation| static_type_from_annotation(annotation, &self.struct_names));
         self.function_depth += 1;
         self.statements(body, false);
         self.function_depth -= 1;
@@ -348,6 +427,37 @@ impl Analyzer {
                     }
                 }
             }
+            ExpressionKind::MemberAssign {
+                object,
+                field,
+                value,
+            } => {
+                let object_type = self.expression(object);
+                let value_type = self.expression(value);
+                match object_type {
+                    StaticType::Struct(name) => {
+                        if let Some(field_type) = self
+                            .structs
+                            .get(&name)
+                            .and_then(|fields| fields.get(field.as_str()))
+                            .cloned()
+                        {
+                            self.require_assignable(&field_type, &value_type, value.span);
+                        } else {
+                            self.type_error(
+                                format!("struct '{name}' has no field '{}'", field.name),
+                                field.span,
+                            );
+                        }
+                        value_type
+                    }
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    _ => {
+                        self.type_error("value has no fields", object.span);
+                        StaticType::Dynamic
+                    }
+                }
+            }
             ExpressionKind::Unary { operator, operand } => {
                 let operand_type = self.expression(operand);
                 match operator {
@@ -417,6 +527,32 @@ impl Analyzer {
                     StaticType::Dynamic => StaticType::Dynamic,
                     _ => {
                         self.type_error("value is not indexable", object.span);
+                        StaticType::Dynamic
+                    }
+                }
+            }
+            ExpressionKind::Member { object, field } => {
+                let object_type = self.expression(object);
+                match object_type {
+                    StaticType::Struct(name) => {
+                        if let Some(field_type) = self
+                            .structs
+                            .get(&name)
+                            .and_then(|fields| fields.get(field.as_str()))
+                            .cloned()
+                        {
+                            field_type
+                        } else {
+                            self.type_error(
+                                format!("struct '{name}' has no field '{}'", field.name),
+                                field.span,
+                            );
+                            StaticType::Dynamic
+                        }
+                    }
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    _ => {
+                        self.type_error("value has no fields", object.span);
                         StaticType::Dynamic
                     }
                 }
@@ -527,7 +663,7 @@ impl Analyzer {
 
     fn annotation_type(&mut self, annotation: Option<&TypeAnnotation>) -> Option<StaticType> {
         let annotation = annotation?;
-        let Some(value_type) = static_type_from_annotation(annotation) else {
+        let Some(value_type) = static_type_from_annotation(annotation, &self.struct_names) else {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::UnknownType,
                 message: format!("unknown type '{}'", annotation.name.name),
@@ -596,6 +732,7 @@ impl StaticType {
             Self::Number => "number".into(),
             Self::String => "string".into(),
             Self::List(element) => format!("list<{}>", element.display_name()),
+            Self::Struct(name) => name.clone(),
             Self::Function { parameters, result } => format!(
                 "fn({}) -> {}",
                 parameters
@@ -622,7 +759,10 @@ impl StaticType {
     }
 }
 
-fn static_type_from_annotation(annotation: &TypeAnnotation) -> Option<StaticType> {
+fn static_type_from_annotation(
+    annotation: &TypeAnnotation,
+    struct_names: &HashSet<String>,
+) -> Option<StaticType> {
     match annotation.name.as_str() {
         "any" => Some(StaticType::Dynamic),
         "null" => Some(StaticType::Null),
@@ -632,13 +772,16 @@ fn static_type_from_annotation(annotation: &TypeAnnotation) -> Option<StaticType
         "number" => Some(StaticType::Number),
         "string" => Some(StaticType::String),
         "list" if annotation.arguments.len() == 1 => {
-            static_type_from_annotation(&annotation.arguments[0])
+            static_type_from_annotation(&annotation.arguments[0], struct_names)
                 .map(|element| StaticType::List(Box::new(element)))
         }
         "fn" => Some(StaticType::Function {
             parameters: Vec::new(),
             result: Box::new(StaticType::Dynamic),
         }),
+        name if struct_names.contains(name) && annotation.arguments.is_empty() => {
+            Some(StaticType::Struct(name.into()))
+        }
         _ => None,
     }
 }
@@ -739,5 +882,22 @@ mod tests {
         let errors = errors("let values: list<int> = [1, 2]; values[0] = \"wrong\";");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::TypeMismatch);
+    }
+
+    #[test]
+    fn checks_struct_constructors_and_fields() {
+        assert!(
+            errors("struct Server { host: string; port: int = 22 } let server: Server = Server(\"localhost\"); server.port = 80;")
+                .is_empty()
+        );
+        let errors = errors(
+            "struct Server { host: string; port: int = 22 } let server = Server(1); server.port = \"wrong\"; server.missing;",
+        );
+        assert_eq!(errors.len(), 3);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
     }
 }
