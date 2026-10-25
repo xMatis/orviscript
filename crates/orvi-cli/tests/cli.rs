@@ -85,7 +85,7 @@ fn formats_source_and_checks_the_result() {
 
 #[test]
 fn checks_import_exports_and_cycles() {
-    let first = source_file("let available = 1;");
+    let first = source_file("const hidden = 0; export const available = 1;");
     let second = first.with_file_name(format!(
         "{}-entry.orvi",
         first.file_stem().unwrap().to_string_lossy()
@@ -99,6 +99,15 @@ fn checks_import_exports_and_cycles() {
     let output = run(&["check", second.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("has no export 'missing'"));
+
+    fs::write(
+        &second,
+        format!("import {{ hidden }} from \"./{import_name}\";"),
+    )
+    .unwrap();
+    let output = run(&["check", second.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("has no export 'hidden'"));
 
     fs::write(
         &first,

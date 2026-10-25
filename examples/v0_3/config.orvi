@@ -1,4 +1,4 @@
 const artifact_name: string = "orviscript-demo.txt";
-fn artifact_path() -> string {
+export fn artifact_path() -> string {
     return path.join([context.project_dir, "dist", artifact_name]);
 }

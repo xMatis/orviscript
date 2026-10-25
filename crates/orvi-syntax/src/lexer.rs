@@ -318,6 +318,7 @@ fn keyword_kind(identifier: &str) -> Option<TokenKind> {
         "struct" => TokenKind::Struct,
         "interface" => TokenKind::Interface,
         "import" => TokenKind::Import,
+        "export" => TokenKind::Export,
         "from" => TokenKind::From,
         "if" => TokenKind::If,
         "else" => TokenKind::Else,

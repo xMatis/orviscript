@@ -199,6 +199,20 @@ fn parses_named_imports() {
 }
 
 #[test]
+fn parses_explicit_export_declarations() {
+    let parsed = parse("export const version: string = \"0.3\"; export fn load() -> void {}");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    assert!(matches!(
+        parsed.program.statements[0].kind,
+        StatementKind::Export(_)
+    ));
+    let StatementKind::Export(declaration) = &parsed.program.statements[1].kind else {
+        panic!("expected export")
+    };
+    assert!(matches!(declaration.kind, StatementKind::Function { .. }));
+}
+
+#[test]
 fn parses_task_dependencies_and_result_access() {
     let parsed = parse(
         "task deploy -> Result<string, string> { needs: [build, check]; return task.result(\"build\") }",

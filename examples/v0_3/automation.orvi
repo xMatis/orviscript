@@ -8,11 +8,11 @@ task build -> Result<string, string> {
     fs.write_text(output, "built by OrviScript 0.3")?;
     return Ok(output);
 }
-task test_artifact -> Result<null, string> {
+task test_artifact -> Result<void, string> {
     needs: [build];
     let output = task.result("build")?;
-    if !fs.exists(output) {
+    if ! fs.exists(output) {
         return Err("artifact was not created");
     }
-    return Ok(null);
+    return Ok();
 }

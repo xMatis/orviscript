@@ -75,6 +75,9 @@ impl Parser<'_> {
     }
 
     fn declaration(&mut self) -> Result<Statement, ParseError> {
+        if self.consume(TokenKind::Export) {
+            return self.export_declaration();
+        }
         if self.consume(TokenKind::Let) {
             return self.variable(true);
         }
@@ -98,6 +101,28 @@ impl Parser<'_> {
             return self.task_declaration();
         }
         self.statement()
+    }
+
+    fn export_declaration(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let declaration = self.declaration()?;
+        if !matches!(
+            declaration.kind,
+            StatementKind::Variable { .. }
+                | StatementKind::Function { .. }
+                | StatementKind::Struct { .. }
+                | StatementKind::Interface { .. }
+        ) {
+            return Err(ParseError {
+                message: "export requires let, const, fn, struct or interface declaration".into(),
+                span: declaration.span,
+            });
+        }
+        let span = start.cover(declaration.span);
+        Ok(Statement {
+            kind: StatementKind::Export(Box::new(declaration)),
+            span,
+        })
     }
 
     fn variable(&mut self, mutable: bool) -> Result<Statement, ParseError> {
@@ -896,6 +921,7 @@ impl Parser<'_> {
                     | TokenKind::Struct
                     | TokenKind::Interface
                     | TokenKind::Import
+                    | TokenKind::Export
                     | TokenKind::If
                     | TokenKind::While
                     | TokenKind::Return

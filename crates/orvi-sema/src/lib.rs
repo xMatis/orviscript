@@ -71,6 +71,7 @@ struct Symbol {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StaticType {
     Dynamic,
+    Void,
     Null,
     Bool,
     Int,
@@ -98,7 +99,7 @@ pub fn analyze_program(program: &Program) -> Analysis {
     let struct_names = program
         .statements
         .iter()
-        .filter_map(|statement| match &statement.kind {
+        .filter_map(|statement| match &declaration_statement(statement).kind {
             StatementKind::Struct { name, .. } => Some(name.name.clone()),
             _ => None,
         })
@@ -106,7 +107,7 @@ pub fn analyze_program(program: &Program) -> Analysis {
     let interface_names = program
         .statements
         .iter()
-        .filter_map(|statement| match &statement.kind {
+        .filter_map(|statement| match &declaration_statement(statement).kind {
             StatementKind::Interface { name, .. } => Some(name.name.clone()),
             _ => None,
         })
@@ -124,7 +125,7 @@ pub fn analyze_program(program: &Program) -> Analysis {
         task_names: program
             .statements
             .iter()
-            .filter_map(|statement| match &statement.kind {
+            .filter_map(|statement| match &declaration_statement(statement).kind {
                 StatementKind::Task { name, .. } => Some(name.name.clone()),
                 _ => None,
             })
@@ -136,6 +137,13 @@ pub fn analyze_program(program: &Program) -> Analysis {
     Analysis {
         errors: analyzer.errors,
         symbols: analyzer.symbols,
+    }
+}
+
+fn declaration_statement(statement: &Statement) -> &Statement {
+    match &statement.kind {
+        StatementKind::Export(declaration) => declaration_statement(declaration),
+        _ => statement,
     }
 }
 
@@ -215,7 +223,7 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
                 definition: None,
                 value_type: StaticType::Function {
                     parameters: Vec::new(),
-                    result: Box::new(StaticType::Null),
+                    result: Box::new(StaticType::Void),
                 },
             },
         ),
@@ -238,10 +246,19 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
         ),
         (
             "Ok".into(),
-            function(
-                StaticType::Dynamic,
-                StaticType::Result(Box::new(StaticType::Dynamic), Box::new(StaticType::Dynamic)),
-            ),
+            Symbol {
+                kind: SymbolKind::Function,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Function {
+                    parameters: vec![StaticType::Dynamic],
+                    result: Box::new(StaticType::Result(
+                        Box::new(StaticType::Dynamic),
+                        Box::new(StaticType::Dynamic),
+                    )),
+                },
+            },
         ),
         (
             "Err".into(),
@@ -309,7 +326,16 @@ impl Analyzer {
             self.scopes.push(HashMap::new());
         }
 
+        if self.function_depth > 0 || self.scopes.len() > 1 {
+            for statement in statements {
+                if matches!(statement.kind, StatementKind::Export(_)) {
+                    self.type_error("export is only valid at module top level", statement.span);
+                }
+            }
+        }
+
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Import { names, source } = &statement.kind {
                 let standard_module = source.strip_prefix("std:");
                 for name in names {
@@ -340,6 +366,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Task { name, .. } = &statement.kind {
                 self.declare(
                     name,
@@ -355,6 +382,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Interface { name, fields } = &statement.kind {
                 self.interface_names.insert(name.name.clone());
                 let mut field_types = HashMap::new();
@@ -391,6 +419,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Struct { name, fields } = &statement.kind {
                 self.struct_names.insert(name.name.clone());
                 let mut field_types = HashMap::new();
@@ -432,6 +461,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Function {
                 name,
                 parameters,
@@ -467,7 +497,7 @@ impl Analyzer {
 
         for statement in statements {
             if !matches!(
-                &statement.kind,
+                &declaration_statement(statement).kind,
                 StatementKind::Function { .. } | StatementKind::Task { .. }
             ) {
                 self.statement(statement);
@@ -475,6 +505,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Function {
                 parameters,
                 return_type,
@@ -487,6 +518,7 @@ impl Analyzer {
         }
 
         for statement in statements {
+            let statement = declaration_statement(statement);
             if let StatementKind::Task {
                 needs,
                 return_type,
@@ -583,6 +615,7 @@ impl Analyzer {
             }
             StatementKind::Interface { .. } => {}
             StatementKind::Import { .. } => {}
+            StatementKind::Export(declaration) => self.statement(declaration),
             StatementKind::Task { .. } => unreachable!("task bodies are analyzed last"),
             StatementKind::Block(statements) => self.statements(statements, true),
             StatementKind::If {
@@ -612,7 +645,7 @@ impl Analyzer {
                 }
                 let actual = value
                     .as_ref()
-                    .map_or(StaticType::Null, |value| self.expression(value));
+                    .map_or(StaticType::Void, |value| self.expression(value));
                 if let Some(expected) = self.current_return_type.clone() {
                     self.require_assignable(&expected, &actual, statement.span);
                 }
@@ -843,6 +876,24 @@ impl Analyzer {
                     .iter()
                     .map(|argument| self.expression(argument))
                     .collect::<Vec<_>>();
+                if let ExpressionKind::Variable(name) = &callee.kind
+                    && name.name == "Ok"
+                {
+                    if arguments.len() > 1 {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::ArgumentCount,
+                            message: format!(
+                                "function 'Ok' expects 0 or 1 arguments but received {}",
+                                arguments.len()
+                            ),
+                            span: expression.span,
+                        });
+                    }
+                    return StaticType::Result(
+                        Box::new(argument_types.first().cloned().unwrap_or(StaticType::Void)),
+                        Box::new(StaticType::Dynamic),
+                    );
+                }
                 if let ExpressionKind::Variable(name) = &callee.kind
                     && let Some(Symbol {
                         arity: Some(arity), ..
@@ -1349,6 +1400,7 @@ impl StaticType {
     fn display_name(&self) -> String {
         match self {
             Self::Dynamic => "any".into(),
+            Self::Void => "void".into(),
             Self::Null => "null".into(),
             Self::Bool => "bool".into(),
             Self::Int => "int".into(),
@@ -1397,6 +1449,7 @@ fn static_type_from_annotation(
 ) -> Option<StaticType> {
     match annotation.name.as_str() {
         "any" => Some(StaticType::Dynamic),
+        "void" => Some(StaticType::Void),
         "null" => Some(StaticType::Null),
         "bool" => Some(StaticType::Bool),
         "int" => Some(StaticType::Int),
@@ -1458,12 +1511,12 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
         )),
         ("fs", "write_text") => Some(function_type(
             vec![StaticType::String, StaticType::String],
-            result_type(StaticType::Null),
+            result_type(StaticType::Void),
         )),
         ("fs", "exists") => Some(function_type(vec![StaticType::String], StaticType::Bool)),
         ("fs", "create_dir_all" | "remove_file") => Some(function_type(
             vec![StaticType::String],
-            result_type(StaticType::Null),
+            result_type(StaticType::Void),
         )),
         ("path", "join") => Some(function_type(
             vec![StaticType::List(Box::new(StaticType::String))],
@@ -1731,6 +1784,23 @@ mod tests {
         let errors = errors("import { missing } from \"std:fs\";");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::UndefinedName);
+    }
+
+    #[test]
+    fn checks_void_and_explicit_exports() {
+        assert!(
+            errors(
+                "export fn finish() -> void { return } fn work() -> Result<void, string> { return Ok() }",
+            )
+            .is_empty()
+        );
+        let bad_return = errors("fn bad() -> void { return null }");
+        assert_eq!(bad_return.len(), 1);
+        assert_eq!(bad_return[0].kind, SemanticErrorKind::TypeMismatch);
+
+        let nested_export = errors("fn outer() -> void { export fn inner() -> void {} }");
+        assert_eq!(nested_export.len(), 1);
+        assert!(nested_export[0].message.contains("module top level"));
     }
 
     #[test]

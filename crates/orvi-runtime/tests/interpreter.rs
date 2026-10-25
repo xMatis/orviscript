@@ -267,7 +267,7 @@ fn provides_files_paths_environment_processes_and_context() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let source = "print(fs.write_text(\"note.txt\", \"hello\")); print(fs.exists(\"note.txt\")); print(fs.read_text(\"note.txt\")); print(path.file_name(path.join([\"folder\", \"note.txt\"]))); print(path.parent(\"folder/note.txt\")); print(path.is_absolute(context.cwd)); print(env.current_dir()); print(fs.remove_file(\"note.txt\")); print(fs.exists(\"note.txt\"))";
     let output = run_in(source, directory.path()).expect("automation APIs run");
-    assert_eq!(output[0], "Ok(null)");
+    assert_eq!(output[0], "Ok()");
     assert_eq!(output[1], "true");
     assert_eq!(output[2], "Ok(hello)");
     assert_eq!(output[3], "Some(note.txt)");
@@ -277,7 +277,7 @@ fn provides_files_paths_environment_processes_and_context() {
         output[6],
         format!("Ok({})", directory.path().to_string_lossy())
     );
-    assert_eq!(output[7], "Ok(null)");
+    assert_eq!(output[7], "Ok()");
     assert_eq!(output[8], "false");
 
     let source = if cfg!(windows) {
@@ -295,7 +295,7 @@ fn imports_local_modules_once_and_standard_module_members() {
     let module_path = directory.path().join("math.orvi");
     std::fs::write(
         &module_path,
-        "print(\"loaded\"); let base: int = 40; fn add(value: int) -> int { return base + value }",
+        "print(\"loaded\"); export const base: int = 40; export fn add(value: int) -> int { return base + value }",
     )
     .expect("module source");
     let entry_path = directory.path().join("main.orvi");
@@ -314,6 +314,40 @@ fn imports_local_modules_once_and_standard_module_members() {
     )
     .expect("imports run");
     assert_eq!(execution.output, ["loaded", "42", "40", "true"]);
+}
+
+#[test]
+fn keeps_unexported_module_bindings_private() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let module_path = directory.path().join("module.orvi");
+    std::fs::write(&module_path, "const hidden = 1; export const visible = 2;")
+        .expect("module source");
+    let entry_path = directory.path().join("main.orvi");
+    let source = "import { hidden } from \"./module.orvi\"; print(hidden)";
+    let parsed = parse(source);
+    let error = execute_file(
+        &parsed.program,
+        ExecutionContext {
+            cwd: directory.path().into(),
+            script_dir: directory.path().into(),
+            project_dir: directory.path().into(),
+        },
+        entry_path,
+    )
+    .expect_err("private binding must not be importable");
+    assert!(error.message.contains("has no export 'hidden'"));
+}
+
+#[test]
+fn distinguishes_void_from_null_and_supports_empty_ok() {
+    let source = r#"
+        fn finish() -> void { return }
+        fn empty() -> Result<void, string> { return Ok() }
+        print(finish());
+        print(empty());
+    "#;
+    let output = run(source).expect("void program runs");
+    assert_eq!(output, ["void", "Ok()"]);
 }
 
 #[test]

@@ -31,6 +31,7 @@ assert(Array.isArray(grammar.patterns) && grammar.patterns.length > 0, "grammar 
 const keywordPatterns = grammar.repository.keywords.patterns.map((pattern) => pattern.match).join(" ");
 assert(keywordPatterns.includes("interface"), "grammar must highlight the interface keyword");
 assert(keywordPatterns.includes("task"), "grammar must highlight the task keyword");
+assert(keywordPatterns.includes("export"), "grammar must highlight the export keyword");
 for (const unsupported of ["async", "await", "parallel"]) {
   assert(!keywordPatterns.includes(unsupported), `grammar advertises unsupported keyword '${unsupported}'`);
 }

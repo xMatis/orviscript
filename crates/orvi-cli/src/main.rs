@@ -602,12 +602,17 @@ fn exported_names(program: &Program) -> HashSet<&str> {
     program
         .statements
         .iter()
-        .filter_map(|statement| match &statement.kind {
-            StatementKind::Variable { name, .. }
-            | StatementKind::Function { name, .. }
-            | StatementKind::Struct { name, .. }
-            | StatementKind::Interface { name, .. } => Some(name.as_str()),
-            _ => None,
+        .filter_map(|statement| {
+            let StatementKind::Export(declaration) = &statement.kind else {
+                return None;
+            };
+            match &declaration.kind {
+                StatementKind::Variable { name, .. }
+                | StatementKind::Function { name, .. }
+                | StatementKind::Struct { name, .. }
+                | StatementKind::Interface { name, .. } => Some(name.as_str()),
+                _ => None,
+            }
         })
         .collect()
 }

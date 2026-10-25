@@ -41,7 +41,7 @@
     },
     "keywords": {
       "patterns": [
-        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|struct|interface|import|from|task)\\b" },
+        { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|struct|interface|import|export|from|task)\\b" },
         { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return|match|using|defer)\\b" }
       ]
     },
@@ -52,7 +52,7 @@
     },
     "types": {
       "patterns": [
-        { "name": "support.type.builtin.orviscript", "match": "\\b(?:Option|Result|any|bool|float|fn|int|list|map|null|number|string)\\b" }
+        { "name": "support.type.builtin.orviscript", "match": "\\b(?:Option|Result|any|bool|float|fn|int|list|map|null|number|string|void)\\b" }
       ]
     },
     "functionDeclarations": {

@@ -93,6 +93,7 @@ pub enum StatementKind {
         names: Vec<Identifier>,
         source: String,
     },
+    Export(Box<Statement>),
     Task {
         name: Identifier,
         needs: Vec<Identifier>,

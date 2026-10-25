@@ -15,6 +15,7 @@ type MapEntries = Vec<(String, Value)>;
 
 #[derive(Clone)]
 pub enum Value {
+    Void,
     Null,
     Bool(bool),
     Integer(i64),
@@ -404,6 +405,7 @@ struct Interpreter {
     context: ExecutionContext,
     current_files: Vec<PathBuf>,
     module_cache: HashMap<PathBuf, Environment>,
+    module_exports: HashMap<PathBuf, HashSet<String>>,
     modules_in_progress: HashSet<PathBuf>,
     task_results: HashMap<String, Value>,
     active_task_needs: Option<HashSet<String>>,
@@ -439,6 +441,25 @@ fn collect_tasks(program: &Program) -> Result<Vec<TaskDefinition>, RuntimeError>
         });
     }
     Ok(tasks)
+}
+
+fn exported_names(program: &Program) -> HashSet<String> {
+    program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Export(declaration) = &statement.kind else {
+                return None;
+            };
+            match &declaration.kind {
+                StatementKind::Variable { name, .. }
+                | StatementKind::Function { name, .. }
+                | StatementKind::Struct { name, .. }
+                | StatementKind::Interface { name, .. } => Some(name.name.clone()),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn validate_task_cycles(
@@ -580,6 +601,7 @@ impl Interpreter {
             context,
             current_files: entry_file.into_iter().collect(),
             module_cache: HashMap::new(),
+            module_exports: HashMap::new(),
             modules_in_progress: HashSet::new(),
             task_results: HashMap::new(),
             active_task_needs: None,
@@ -704,7 +726,7 @@ impl Interpreter {
         self.function_depth -= 1;
         self.active_task_needs = previous_needs;
         let value = match result {
-            Ok(Control::Continue(_)) => Value::Null,
+            Ok(Control::Continue(_)) => Value::Void,
             Ok(Control::Return(value)) => value,
             Err(mut error) => match error.propagated.take() {
                 Some(value) => value,
@@ -827,6 +849,16 @@ impl Interpreter {
                 let path = self.resolve_module_path(source, statement.span)?;
                 let module = self.load_module(&path, statement.span)?;
                 for name in names {
+                    if !self
+                        .module_exports
+                        .get(&path)
+                        .is_some_and(|exports| exports.contains(name.as_str()))
+                    {
+                        return Err(self.error(
+                            format!("module '{}' has no export '{}'", path.display(), name.name),
+                            name.span,
+                        ));
+                    }
                     let binding = module.get_local_binding(name.as_str()).ok_or_else(|| {
                         self.error(
                             format!("module '{}' has no export '{}'", path.display(), name.name),
@@ -842,6 +874,7 @@ impl Interpreter {
                 }
                 Ok(Control::Continue(Value::Null))
             }
+            StatementKind::Export(declaration) => self.execute_statement(declaration),
             StatementKind::Task { .. } => Ok(Control::Continue(Value::Null)),
             StatementKind::Block(statements) => {
                 let environment = self.child_environment(self.environment.clone());
@@ -881,7 +914,7 @@ impl Interpreter {
                 }
                 let value = expression
                     .as_ref()
-                    .map_or(Ok(Value::Null), |expression| self.evaluate(expression))?;
+                    .map_or(Ok(Value::Void), |expression| self.evaluate(expression))?;
                 Ok(Control::Return(value))
             }
             StatementKind::Defer(expression) => {
@@ -983,6 +1016,8 @@ impl Interpreter {
                 ));
             }
 
+            let exports = exported_names(&parsed.program);
+
             let environment = self.child_environment(self.globals.clone());
             let previous = std::mem::replace(&mut self.environment, environment.clone());
             self.current_files.push(path.to_path_buf());
@@ -998,6 +1033,7 @@ impl Interpreter {
             }
             self.module_cache
                 .insert(path.to_path_buf(), environment.clone());
+            self.module_exports.insert(path.to_path_buf(), exports);
             Ok(environment)
         })();
 
@@ -1358,14 +1394,22 @@ impl Interpreter {
                         .collect::<Vec<_>>()
                         .join(" "),
                 );
-                Ok(Value::Null)
+                Ok(Value::Void)
             }
             Value::NativeConstructor(tag) => {
+                if tag == VariantTag::Ok && arguments.is_empty() {
+                    return Ok(Value::Variant {
+                        tag,
+                        payload: Some(Box::new(Value::Void)),
+                    });
+                }
                 if arguments.len() != 1 {
                     return Err(self.error(
                         format!(
-                            "constructor '{}' expects 1 argument, received {}",
+                            "constructor '{}' expects {} argument{}, received {}",
                             tag.name(),
+                            if tag == VariantTag::Ok { "0 or 1" } else { "1" },
+                            if tag == VariantTag::Ok { "s" } else { "" },
                             arguments.len()
                         ),
                         span,
@@ -1407,7 +1451,7 @@ impl Interpreter {
                 let result = self.execute_block(&function.body, environment);
                 self.function_depth -= 1;
                 let value = match result {
-                    Ok(Control::Continue(_)) => Value::Null,
+                    Ok(Control::Continue(_)) => Value::Void,
                     Ok(Control::Return(value)) => value,
                     Err(mut error) => {
                         let Some(value) = error.propagated.take() else {
@@ -1532,7 +1576,7 @@ impl Interpreter {
                 let path = self.string_argument(arguments.next(), function, span)?;
                 let contents = self.string_argument(arguments.next(), function, span)?;
                 Ok(result_value(
-                    std::fs::write(self.resolve_path(path), contents).map(|()| Value::Null),
+                    std::fs::write(self.resolve_path(path), contents).map(|()| Value::Void),
                 ))
             }
             NativeFunction::FsExists => {
@@ -1542,13 +1586,13 @@ impl Interpreter {
             NativeFunction::FsCreateDirAll => {
                 let path = self.string_argument(arguments.next(), function, span)?;
                 Ok(result_value(
-                    std::fs::create_dir_all(self.resolve_path(path)).map(|()| Value::Null),
+                    std::fs::create_dir_all(self.resolve_path(path)).map(|()| Value::Void),
                 ))
             }
             NativeFunction::FsRemoveFile => {
                 let path = self.string_argument(arguments.next(), function, span)?;
                 Ok(result_value(
-                    std::fs::remove_file(self.resolve_path(path)).map(|()| Value::Null),
+                    std::fs::remove_file(self.resolve_path(path)).map(|()| Value::Void),
                 ))
             }
             NativeFunction::PathJoin => {
@@ -2208,6 +2252,7 @@ fn mark_value(
 impl Value {
     fn type_name(&self) -> String {
         match self {
+            Self::Void => "void".into(),
             Self::Null => "null".into(),
             Self::Bool(_) => "bool".into(),
             Self::Integer(_) => "int".into(),
@@ -2240,6 +2285,7 @@ fn value_matches_type_inner(
 ) -> bool {
     match type_annotation.name.as_str() {
         "any" => true,
+        "void" => matches!(value, Value::Void),
         "null" => matches!(value, Value::Null),
         "bool" => matches!(value, Value::Bool(_)),
         "int" => matches!(value, Value::Integer(_)),
@@ -2365,6 +2411,7 @@ fn display_type(type_annotation: &TypeAnnotation) -> String {
 
 fn value_to_json(value: &Value, visited: &mut HashSet<usize>) -> Result<serde_json::Value, String> {
     match value {
+        Value::Void => Err("JSON cannot represent void".into()),
         Value::Null => Ok(serde_json::Value::Null),
         Value::Bool(value) => Ok(serde_json::Value::Bool(*value)),
         Value::Integer(value) => Ok(serde_json::Value::Number((*value).into())),
@@ -2424,6 +2471,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 
 fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize, usize)>) -> bool {
     match (left, right) {
+        (Value::Void, Value::Void) => true,
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Integer(a), Value::Integer(b)) => a == b,
@@ -2502,6 +2550,7 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
 
 fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
     match value {
+        Value::Void => "void".into(),
         Value::Null => "null".into(),
         Value::Bool(value) => value.to_string(),
         Value::Integer(value) => value.to_string(),
@@ -2557,10 +2606,11 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             visited.remove(&identity);
             format!("{} {{ {formatted} }}", instance.definition.name)
         }
-        Value::Variant { tag, payload } => payload.as_ref().map_or_else(
-            || tag.name().into(),
-            |value| format!("{}({})", tag.name(), format_value(value, visited)),
-        ),
+        Value::Variant { tag, payload } => match payload.as_deref() {
+            Some(Value::Void) if *tag == VariantTag::Ok => "Ok()".into(),
+            Some(value) => format!("{}({})", tag.name(), format_value(value, visited)),
+            None => tag.name().into(),
+        },
         Value::NativeConstructor(tag) => format!("<native fn {}>", tag.name()),
         Value::NativeModule(module) => format!("<module {}>", module.name()),
         Value::NativeFunction(function) => format!("<native fn {}>", function.name()),

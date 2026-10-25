@@ -14,6 +14,7 @@ pub enum TokenKind {
     Struct,
     Interface,
     Import,
+    Export,
     From,
     If,
     Else,

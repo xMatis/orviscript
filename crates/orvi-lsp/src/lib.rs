@@ -456,6 +456,7 @@ fn classify_token(
         | TokenKind::Struct
         | TokenKind::Interface
         | TokenKind::Import
+        | TokenKind::Export
         | TokenKind::From
         | TokenKind::Task
         | TokenKind::Match
@@ -521,6 +522,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "structural interface declaration",
         ),
         ("import", CompletionItemKind::KEYWORD, "named module import"),
+        (
+            "export",
+            CompletionItemKind::KEYWORD,
+            "public module declaration",
+        ),
         ("from", CompletionItemKind::KEYWORD, "module import source"),
         (
             "task",
@@ -564,6 +570,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("string", CompletionItemKind::TYPE_PARAMETER, "string type"),
         ("bool", CompletionItemKind::TYPE_PARAMETER, "boolean type"),
         ("any", CompletionItemKind::TYPE_PARAMETER, "dynamic type"),
+        (
+            "void",
+            CompletionItemKind::TYPE_PARAMETER,
+            "absence of a value",
+        ),
         ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
         ("map", CompletionItemKind::TYPE_PARAMETER, "map type"),
         ("json", CompletionItemKind::MODULE, "JSON module"),
@@ -719,6 +730,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "struct" => "`struct` declares a stable set of typed fields.",
         "interface" => "`interface` declares a structural field contract.",
         "import" => "`import { name } from \"module\"` imports selected names.",
+        "export" => "`export` makes a top-level declaration available to importers.",
         "from" => "`from` introduces an import source.",
         "task" => "`task name -> Result<T, E> { ... }` declares an inert workflow task.",
         "match" => "`match` selects an expression using exhaustive patterns.",
@@ -730,13 +742,14 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "return" => "`return` exits the current function.",
         "true" | "false" => "Built-in boolean value.",
         "null" => "Built-in null value.",
+        "void" => "`void` is the absence-of-value return type and is distinct from `null`.",
         "print" => "`print(...)` writes its arguments to standard output.",
         "Some" => "`Some(value)` creates a present `Option` value.",
         "None" => "`None` is an `Option` without a value.",
         "Ok" => "`Ok(value)` creates a successful `Result`.",
         "Err" => "`Err(error)` creates a failed `Result`.",
         "read_text" => "`fs.read_text(path)` returns `Result<string, string>`.",
-        "write_text" => "`fs.write_text(path, contents)` returns `Result<null, string>`.",
+        "write_text" => "`fs.write_text(path, contents)` returns `Result<void, string>`.",
         "exists" => "`fs.exists(path)` returns whether the path exists.",
         "create_dir_all" => "`fs.create_dir_all(path)` creates directories recursively.",
         "remove_file" => "`fs.remove_file(path)` removes one file.",
@@ -968,6 +981,8 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "struct"));
         assert!(items.iter().any(|item| item.label == "interface"));
         assert!(items.iter().any(|item| item.label == "task"));
+        assert!(items.iter().any(|item| item.label == "export"));
+        assert!(items.iter().any(|item| item.label == "void"));
         assert!(items.iter().any(|item| item.label == "read_text"));
     }
 
