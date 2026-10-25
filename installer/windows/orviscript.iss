@@ -40,7 +40,7 @@ ChangesEnvironment=yes
 ChangesAssociations=yes
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
-UninstallDisplayIcon={app}\orviscript.exe
+UninstallDisplayIcon={app}\assets\orviscript-file-icon.ico
 #ifdef SignToolName
 SignTool={#SignToolName}
 SignedUninstaller=yes
@@ -55,11 +55,12 @@ Source: "{#SourceDir}\orvi-lsp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\orviscript-vscode.vsix"; DestDir: "{app}\editors"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\orviscript-file-icon.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\.orvi"; ValueType: string; ValueName: ""; ValueData: "OrviScript.Source"; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\OrviScript.Source"; ValueType: string; ValueName: ""; ValueData: "OrviScript source file"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\OrviScript.Source\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\orviscript.exe,0"
+Root: HKCU; Subkey: "Software\Classes\OrviScript.Source\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\assets\orviscript-file-icon.ico,0"
 Root: HKCU; Subkey: "Software\Classes\OrviScript.Source\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{sys}\notepad.exe"" ""%1"""
 
 [Run]

@@ -63,7 +63,7 @@ The extension finds the workspace build automatically. For another installation,
 
 ## Distribution
 
-The release workflow builds portable archives for Windows, Linux, and macOS, an installable VSIX, SHA-256 checksum files, and a per-user Windows installer. The installer upgrades the same installation across versions, adds the CLI and LSP to `PATH`, registers `.orvi`, and can install or update the VS Code extension. See [installer/README.md](installer/README.md) for the release contract and local build command.
+The release workflow builds portable archives for Windows, Linux, and macOS, an installable VSIX, SHA-256 checksum files, and a per-user Windows installer. The installer upgrades the same installation across versions, adds the CLI and LSP to `PATH`, registers `.orvi` with the OrviScript file icon, and can install or update the VS Code extension. See [installer/README.md](installer/README.md) for the release contract and local build command.
 
 Project website: [orviscript.com](https://orviscript.com)
 

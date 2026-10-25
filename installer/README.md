@@ -11,7 +11,7 @@ $staged = ./scripts/release/Stage-Windows.ps1
 iscc /DAppVersion=$($staged.Version) /DSourceDir=$($staged.SourceDirectory) /DOutputDir="$PWD/artifacts" installer/windows/orviscript.iss
 ```
 
-The installer places `orviscript.exe` and `orvi-lsp.exe` in a stable directory, adds that directory to the current user's `PATH`, registers `.orvi`, includes the VSIX, and removes its own `PATH` entry during uninstall. The optional VS Code task installs or upgrades the bundled extension when a standard VS Code installation is detected.
+The installer places `orviscript.exe` and `orvi-lsp.exe` in a stable directory, adds that directory to the current user's `PATH`, registers `.orvi` with the bundled OrviScript file icon, includes the VSIX, and removes its own `PATH` entry during uninstall. The optional VS Code task installs or upgrades the bundled extension when a standard VS Code installation is detected.
 
 For code signing, configure an Inno Setup signing tool and pass `/DSignToolName=NAME`. Secrets and signing commands belong in CI, not in this repository.
 
