@@ -19,6 +19,9 @@ const language = manifest.contributes.languages.find(({ id }) => id === "orviscr
 assert(language, "missing OrviScript language contribution");
 assert(language.extensions.includes(".orvi"), "missing .orvi file extension");
 assert(fs.existsSync(path.join(root, language.configuration)), "missing language configuration");
+assert(language.icon?.light && language.icon?.dark, "missing OrviScript file icons");
+assert(fs.existsSync(path.join(root, language.icon.light)), "missing light file icon");
+assert(fs.existsSync(path.join(root, language.icon.dark)), "missing dark file icon");
 
 const grammarContribution = manifest.contributes.grammars.find(({ language: id }) => id === "orviscript");
 assert(grammarContribution, "missing OrviScript grammar contribution");
