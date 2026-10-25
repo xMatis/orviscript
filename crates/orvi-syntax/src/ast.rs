@@ -38,6 +38,29 @@ pub struct StructField {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub value: Expression,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PatternKind {
+    Variant {
+        name: Identifier,
+        binding: Option<Identifier>,
+    },
+    Literal(Literal),
+    Wildcard,
+}
+
 impl Identifier {
     pub fn as_str(&self) -> &str {
         &self.name
@@ -122,6 +145,11 @@ pub enum ExpressionKind {
         object: Box<Expression>,
         field: Identifier,
     },
+    Match {
+        value: Box<Expression>,
+        arms: Vec<MatchArm>,
+    },
+    Try(Box<Expression>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

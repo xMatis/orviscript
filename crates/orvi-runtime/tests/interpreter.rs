@@ -156,3 +156,18 @@ fn enforces_struct_field_types_and_collects_cycles() {
     assert_eq!(execution.output, ["Node { next: <cycle> }", "alive"]);
     assert!(execution.collected_objects >= 1);
 }
+
+#[test]
+fn matches_option_and_result_variants() {
+    let source = "print(match Some(5) { Some(value) => value * 2, None => 0 }); print(match Err(\"failed\") { Ok(value) => value, Err(message) => message })";
+    assert_eq!(run(source).expect("program runs"), ["10", "failed"]);
+}
+
+#[test]
+fn propagates_none_and_err_with_try() {
+    let source = "fn increment(value: Option<int>) -> Option<int> { let inner = value?; return Some(inner + 1) } fn work(value: Result<int, string>) -> Result<int, string> { return Ok(value? + 1) } print(increment(Some(4))); print(increment(None)); print(work(Ok(9))); print(work(Err(\"failed\")))";
+    assert_eq!(
+        run(source).expect("program runs"),
+        ["Some(5)", "None", "Ok(10)", "Err(failed)"]
+    );
+}

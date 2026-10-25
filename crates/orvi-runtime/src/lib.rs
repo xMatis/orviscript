@@ -4,8 +4,8 @@ use std::fmt;
 use std::rc::{Rc, Weak};
 
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Literal, Parameter, Program, Span, Statement,
-    StatementKind, StructField, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, Literal, Parameter, PatternKind, Program, Span,
+    Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone)]
@@ -18,6 +18,11 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     StructType(Rc<StructDefinition>),
     StructInstance(Rc<RefCell<StructInstance>>),
+    Variant {
+        tag: VariantTag,
+        payload: Option<Box<Value>>,
+    },
+    NativeConstructor(VariantTag),
     Function(Rc<UserFunction>),
     NativePrint,
 }
@@ -38,6 +43,7 @@ impl fmt::Display for Value {
 pub struct RuntimeError {
     pub message: String,
     pub span: Span,
+    propagated: Option<Value>,
 }
 
 impl fmt::Display for RuntimeError {
@@ -74,6 +80,14 @@ pub struct StructDefinition {
 pub struct StructInstance {
     definition: Rc<StructDefinition>,
     fields: HashMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VariantTag {
+    Some,
+    None,
+    Ok,
+    Err,
 }
 
 #[derive(Clone)]
@@ -165,6 +179,33 @@ enum Control {
 pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
     let globals = Environment::root();
     globals.define("print".into(), Value::NativePrint, false, None);
+    globals.define(
+        "Some".into(),
+        Value::NativeConstructor(VariantTag::Some),
+        false,
+        None,
+    );
+    globals.define(
+        "None".into(),
+        Value::Variant {
+            tag: VariantTag::None,
+            payload: None,
+        },
+        false,
+        None,
+    );
+    globals.define(
+        "Ok".into(),
+        Value::NativeConstructor(VariantTag::Ok),
+        false,
+        None,
+    );
+    globals.define(
+        "Err".into(),
+        Value::NativeConstructor(VariantTag::Err),
+        false,
+        None,
+    );
     let mut interpreter = Interpreter {
         environment: globals.clone(),
         output: Vec::new(),
@@ -180,6 +221,7 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
             return Err(RuntimeError {
                 message: "return is only valid inside a function".into(),
                 span: Span::empty(0),
+                propagated: None,
             });
         }
     };
@@ -485,6 +527,45 @@ impl Interpreter {
                     )
                 })
             }
+            ExpressionKind::Match { value, arms } => {
+                let value = self.evaluate(value)?;
+                for arm in arms {
+                    let Some(binding_value) = pattern_binding(&arm.pattern.kind, &value) else {
+                        continue;
+                    };
+                    let environment = self.child_environment(self.environment.clone());
+                    if let PatternKind::Variant {
+                        binding: Some(binding),
+                        ..
+                    } = &arm.pattern.kind
+                    {
+                        let Some(binding_value) = binding_value else {
+                            continue;
+                        };
+                        environment.define(binding.name.clone(), binding_value, false, None);
+                    }
+                    let previous = std::mem::replace(&mut self.environment, environment);
+                    let result = self.evaluate(&arm.value);
+                    self.environment = previous;
+                    return result;
+                }
+                Err(self.error("match expression has no matching arm", expression.span))
+            }
+            ExpressionKind::Try(value) => match self.evaluate(value)? {
+                Value::Variant {
+                    tag: VariantTag::Some | VariantTag::Ok,
+                    payload: Some(value),
+                } => Ok(*value),
+                value @ Value::Variant {
+                    tag: VariantTag::None | VariantTag::Err,
+                    ..
+                } => Err(RuntimeError {
+                    message: "value propagated by '?'".into(),
+                    span: expression.span,
+                    propagated: Some(value),
+                }),
+                _ => Err(self.error("operator '?' requires Option or Result", expression.span)),
+            },
         }
     }
 
@@ -558,6 +639,22 @@ impl Interpreter {
                 );
                 Ok(Value::Null)
             }
+            Value::NativeConstructor(tag) => {
+                if arguments.len() != 1 {
+                    return Err(self.error(
+                        format!(
+                            "constructor '{}' expects 1 argument, received {}",
+                            tag.name(),
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                Ok(Value::Variant {
+                    tag,
+                    payload: arguments.into_iter().next().map(Box::new),
+                })
+            }
             Value::Function(function) => {
                 if arguments.len() != function.parameters.len() {
                     return Err(self.error(
@@ -587,9 +684,15 @@ impl Interpreter {
                 self.function_depth += 1;
                 let result = self.execute_block(&function.body, environment);
                 self.function_depth -= 1;
-                let value = match result? {
-                    Control::Continue(_) => Value::Null,
-                    Control::Return(value) => value,
+                let value = match result {
+                    Ok(Control::Continue(_)) => Value::Null,
+                    Ok(Control::Return(value)) => value,
+                    Err(mut error) => {
+                        let Some(value) = error.propagated.take() else {
+                            return Err(error);
+                        };
+                        value
+                    }
                 };
                 self.require_type(&value, function.return_type.as_ref(), span)?;
                 Ok(value)
@@ -818,7 +921,51 @@ impl Interpreter {
         RuntimeError {
             message: message.into(),
             span,
+            propagated: None,
         }
+    }
+}
+
+impl VariantTag {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Some => "Some",
+            Self::None => "None",
+            Self::Ok => "Ok",
+            Self::Err => "Err",
+        }
+    }
+}
+
+fn pattern_binding(pattern: &PatternKind, value: &Value) -> Option<Option<Value>> {
+    match pattern {
+        PatternKind::Wildcard => Some(None),
+        PatternKind::Literal(literal) => {
+            let literal = match literal {
+                Literal::Null => Value::Null,
+                Literal::Bool(value) => Value::Bool(*value),
+                Literal::Integer(value) => Value::Integer(*value),
+                Literal::Float(value) => Value::Float(*value),
+                Literal::String(value) => Value::String(value.clone()),
+            };
+            values_equal(&literal, value).then_some(None)
+        }
+        PatternKind::Variant { name, .. } => {
+            let Value::Variant { tag, payload } = value else {
+                return None;
+            };
+            (*tag == variant_tag(name.as_str())?).then(|| payload.as_deref().cloned())
+        }
+    }
+}
+
+fn variant_tag(name: &str) -> Option<VariantTag> {
+    match name {
+        "Some" => Some(VariantTag::Some),
+        "None" => Some(VariantTag::None),
+        "Ok" => Some(VariantTag::Ok),
+        "Err" => Some(VariantTag::Err),
+        _ => None,
     }
 }
 
@@ -887,6 +1034,10 @@ fn mark_value(
         Value::Function(function) => {
             mark_environment(&function.closure, marked_environments, marked_lists)
         }
+        Value::Variant {
+            payload: Some(value),
+            ..
+        } => mark_value(value, marked_environments, marked_lists),
         _ => {}
     }
 }
@@ -903,6 +1054,11 @@ impl Value {
             Self::Function(_) | Self::NativePrint => "fn".into(),
             Self::StructType(definition) => format!("type {}", definition.name),
             Self::StructInstance(instance) => instance.borrow().definition.name.clone(),
+            Self::Variant { tag, .. } => match tag {
+                VariantTag::Some | VariantTag::None => "Option".into(),
+                VariantTag::Ok | VariantTag::Err => "Result".into(),
+            },
+            Self::NativeConstructor(_) => "fn".into(),
         }
     }
 }
@@ -942,7 +1098,41 @@ fn value_matches_type_inner(
             visited.remove(&identity);
             matches
         }
-        "fn" => matches!(value, Value::Function(_) | Value::NativePrint),
+        "fn" => matches!(
+            value,
+            Value::Function(_) | Value::NativePrint | Value::NativeConstructor(_)
+        ),
+        "Option" => match value {
+            Value::Variant {
+                tag: VariantTag::None,
+                ..
+            } => true,
+            Value::Variant {
+                tag: VariantTag::Some,
+                payload: Some(payload),
+            } => type_annotation
+                .arguments
+                .first()
+                .is_some_and(|inner| value_matches_type_inner(payload, inner, visited)),
+            _ => false,
+        },
+        "Result" => match value {
+            Value::Variant {
+                tag: VariantTag::Ok,
+                payload: Some(payload),
+            } => type_annotation
+                .arguments
+                .first()
+                .is_some_and(|inner| value_matches_type_inner(payload, inner, visited)),
+            Value::Variant {
+                tag: VariantTag::Err,
+                payload: Some(payload),
+            } => type_annotation
+                .arguments
+                .get(1)
+                .is_some_and(|inner| value_matches_type_inner(payload, inner, visited)),
+            _ => false,
+        },
         name => matches!(
             value,
             Value::StructInstance(instance) if instance.borrow().definition.name == name
@@ -1021,6 +1211,24 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
                         .is_some_and(|other| values_equal_inner(value, other, visited))
                 })
         }
+        (
+            Value::Variant {
+                tag: a_tag,
+                payload: a_payload,
+            },
+            Value::Variant {
+                tag: b_tag,
+                payload: b_payload,
+            },
+        ) => {
+            a_tag == b_tag
+                && match (a_payload, b_payload) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => values_equal_inner(a, b, visited),
+                    _ => false,
+                }
+        }
+        (Value::NativeConstructor(a), Value::NativeConstructor(b)) => a == b,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
@@ -1069,6 +1277,11 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             visited.remove(&identity);
             format!("{} {{ {formatted} }}", instance.definition.name)
         }
+        Value::Variant { tag, payload } => payload.as_ref().map_or_else(
+            || tag.name().into(),
+            |value| format!("{}({})", tag.name(), format_value(value, visited)),
+        ),
+        Value::NativeConstructor(tag) => format!("<native fn {}>", tag.name()),
         Value::Function(function) => format!("<fn {}>", function.name),
         Value::NativePrint => "<native fn print>".into(),
     }

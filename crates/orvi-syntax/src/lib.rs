@@ -6,8 +6,8 @@ mod span;
 mod token;
 
 pub use ast::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, Parameter, Program, Statement,
-    StatementKind, StructField, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, MatchArm, Parameter, Pattern,
+    PatternKind, Program, Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 pub use diagnostic::{LexError, LexErrorKind};
 pub use lexer::{Lexed, lex};

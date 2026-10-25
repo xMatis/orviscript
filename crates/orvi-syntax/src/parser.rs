@@ -1,9 +1,9 @@
 use std::fmt;
 
 use crate::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, Parameter, Program,
-    Span, Statement, StatementKind, StructField, Token, TokenKind, TypeAnnotation, UnaryOperator,
-    lex,
+    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, MatchArm, Parameter,
+    Pattern, PatternKind, Program, Span, Statement, StatementKind, StructField, Token, TokenKind,
+    TypeAnnotation, UnaryOperator, lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -459,6 +459,12 @@ impl Parser<'_> {
                         field,
                     },
                 };
+            } else if self.consume(TokenKind::Question) {
+                let span = expression.span.cover(self.previous().span);
+                expression = Expression {
+                    span,
+                    kind: ExpressionKind::Try(Box::new(expression)),
+                };
             } else {
                 break;
             }
@@ -469,6 +475,9 @@ impl Parser<'_> {
     fn primary(&mut self) -> Result<Expression, ParseError> {
         let token = self.advance();
         let text = token.text(self.source).unwrap_or_default();
+        if token.kind == TokenKind::Match {
+            return self.match_expression(token.span);
+        }
         let kind = match token.kind {
             TokenKind::Null => ExpressionKind::Literal(Literal::Null),
             TokenKind::True => ExpressionKind::Literal(Literal::Bool(true)),
@@ -521,6 +530,94 @@ impl Parser<'_> {
             }
         };
         Ok(Expression {
+            kind,
+            span: token.span,
+        })
+    }
+
+    fn match_expression(&mut self, start: Span) -> Result<Expression, ParseError> {
+        let value = self.expression()?;
+        self.expect(TokenKind::LeftBrace, "expected '{' after match value")?;
+        let mut arms = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at(TokenKind::EndOfFile) {
+            let pattern = self.pattern()?;
+            self.expect(TokenKind::FatArrow, "expected '=>' after match pattern")?;
+            let arm_value = self.expression()?;
+            let span = pattern.span.cover(arm_value.span);
+            arms.push(MatchArm {
+                pattern,
+                value: arm_value,
+                span,
+            });
+            if !self.consume(TokenKind::Comma) && !self.at(TokenKind::RightBrace) {
+                return Err(ParseError {
+                    message: "expected ',' between match arms".into(),
+                    span: self.peek().span,
+                });
+            }
+        }
+        let end = self
+            .expect(TokenKind::RightBrace, "expected '}' after match arms")?
+            .span;
+        Ok(Expression {
+            span: start.cover(end),
+            kind: ExpressionKind::Match {
+                value: Box::new(value),
+                arms,
+            },
+        })
+    }
+
+    fn pattern(&mut self) -> Result<Pattern, ParseError> {
+        let token = self.advance();
+        let text = token.text(self.source).unwrap_or_default();
+        let kind = match token.kind {
+            TokenKind::Identifier if text == "_" => PatternKind::Wildcard,
+            TokenKind::Identifier => {
+                let name = Identifier {
+                    name: text.to_owned(),
+                    span: token.span,
+                };
+                let binding = if self.consume(TokenKind::LeftParenthesis) {
+                    let binding = self.expect_identifier("expected variant binding")?;
+                    self.expect(
+                        TokenKind::RightParenthesis,
+                        "expected ')' after variant binding",
+                    )?;
+                    Some(binding)
+                } else {
+                    None
+                };
+                let end = binding.as_ref().map_or(name.span, |binding| binding.span);
+                return Ok(Pattern {
+                    span: token.span.cover(end),
+                    kind: PatternKind::Variant { name, binding },
+                });
+            }
+            TokenKind::Null => PatternKind::Literal(Literal::Null),
+            TokenKind::True => PatternKind::Literal(Literal::Bool(true)),
+            TokenKind::False => PatternKind::Literal(Literal::Bool(false)),
+            TokenKind::Integer => {
+                PatternKind::Literal(Literal::Integer(text.parse().map_err(|_| ParseError {
+                    message: "integer literal is out of range".into(),
+                    span: token.span,
+                })?))
+            }
+            TokenKind::Float => {
+                PatternKind::Literal(Literal::Float(text.parse().map_err(|_| ParseError {
+                    message: "invalid float literal".into(),
+                    span: token.span,
+                })?))
+            }
+            TokenKind::String => PatternKind::Literal(Literal::String(unescape_string(text))),
+            _ => {
+                return Err(ParseError {
+                    message: "expected match pattern".into(),
+                    span: token.span,
+                });
+            }
+        };
+        Ok(Pattern {
             kind,
             span: token.span,
         })

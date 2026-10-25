@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, Parameter, Program, Span,
-    Statement, StatementKind, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, Parameter, PatternKind,
+    Program, Span, Statement, StatementKind, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +15,7 @@ pub enum SemanticErrorKind {
     ArgumentCount,
     UnknownType,
     TypeMismatch,
+    NonExhaustiveMatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +76,8 @@ enum StaticType {
     String,
     List(Box<StaticType>),
     Struct(String),
+    Option(Box<StaticType>),
+    Result(Box<StaticType>, Box<StaticType>),
     Function {
         parameters: Vec<StaticType>,
         result: Box<StaticType>,
@@ -95,19 +98,7 @@ pub fn analyze_program(program: &Program) -> Analysis {
         })
         .collect();
     let mut analyzer = Analyzer {
-        scopes: vec![HashMap::from([(
-            "print".into(),
-            Symbol {
-                kind: SymbolKind::Function,
-                mutable: false,
-                arity: None,
-                definition: None,
-                value_type: StaticType::Function {
-                    parameters: Vec::new(),
-                    result: Box::new(StaticType::Null),
-                },
-            },
-        )])],
+        scopes: vec![builtin_symbols()],
         errors: Vec::new(),
         symbols: Vec::new(),
         function_depth: 0,
@@ -120,6 +111,65 @@ pub fn analyze_program(program: &Program) -> Analysis {
         errors: analyzer.errors,
         symbols: analyzer.symbols,
     }
+}
+
+fn builtin_symbols() -> HashMap<String, Symbol> {
+    let function = |parameter: StaticType, result: StaticType| Symbol {
+        kind: SymbolKind::Function,
+        mutable: false,
+        arity: Some(1),
+        definition: None,
+        value_type: StaticType::Function {
+            parameters: vec![parameter],
+            result: Box::new(result),
+        },
+    };
+    HashMap::from([
+        (
+            "print".into(),
+            Symbol {
+                kind: SymbolKind::Function,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Function {
+                    parameters: Vec::new(),
+                    result: Box::new(StaticType::Null),
+                },
+            },
+        ),
+        (
+            "Some".into(),
+            function(
+                StaticType::Dynamic,
+                StaticType::Option(Box::new(StaticType::Dynamic)),
+            ),
+        ),
+        (
+            "None".into(),
+            Symbol {
+                kind: SymbolKind::Constant,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Option(Box::new(StaticType::Dynamic)),
+            },
+        ),
+        (
+            "Ok".into(),
+            function(
+                StaticType::Dynamic,
+                StaticType::Result(Box::new(StaticType::Dynamic), Box::new(StaticType::Dynamic)),
+            ),
+        ),
+        (
+            "Err".into(),
+            function(
+                StaticType::Dynamic,
+                StaticType::Result(Box::new(StaticType::Dynamic), Box::new(StaticType::Dynamic)),
+            ),
+        ),
+    ])
 }
 
 struct Analyzer {
@@ -557,6 +607,96 @@ impl Analyzer {
                     }
                 }
             }
+            ExpressionKind::Match { value, arms } => {
+                let subject_type = self.expression(value);
+                let mut result_type = StaticType::Dynamic;
+                let mut variants = HashSet::new();
+                let mut has_wildcard = false;
+                for arm in arms {
+                    self.scopes.push(HashMap::new());
+                    match &arm.pattern.kind {
+                        PatternKind::Wildcard => has_wildcard = true,
+                        PatternKind::Literal(literal) => {
+                            let pattern_type = literal_type(literal);
+                            if !subject_type.accepts(&pattern_type) {
+                                self.type_error(
+                                    format!(
+                                        "pattern type {} cannot match {}",
+                                        pattern_type.display_name(),
+                                        subject_type.display_name()
+                                    ),
+                                    arm.pattern.span,
+                                );
+                            }
+                        }
+                        PatternKind::Variant { name, binding } => {
+                            variants.insert(name.name.clone());
+                            let payload = self.variant_payload(&subject_type, name);
+                            match (binding, payload) {
+                                (Some(binding), Some(Some(value_type))) => self.declare(
+                                    binding,
+                                    Symbol {
+                                        kind: SymbolKind::Constant,
+                                        mutable: false,
+                                        arity: None,
+                                        definition: Some(binding.span),
+                                        value_type,
+                                    },
+                                ),
+                                (Some(binding), _) => self.type_error(
+                                    format!("variant '{}' has no payload", name.name),
+                                    binding.span,
+                                ),
+                                (None, Some(Some(_))) => self.type_error(
+                                    format!("variant '{}' requires a binding", name.name),
+                                    name.span,
+                                ),
+                                (None, Some(None)) => {}
+                                (_, None) => self.type_error(
+                                    format!(
+                                        "variant '{}' cannot match {}",
+                                        name.name,
+                                        subject_type.display_name()
+                                    ),
+                                    name.span,
+                                ),
+                            }
+                        }
+                    }
+                    let arm_type = self.expression(&arm.value);
+                    result_type = result_type.merge(&arm_type);
+                    self.scopes.pop();
+                }
+                if !has_wildcard && !self.match_is_exhaustive(&subject_type, &variants) {
+                    self.errors.push(SemanticError {
+                        kind: SemanticErrorKind::NonExhaustiveMatch,
+                        message: "match expression is not exhaustive".into(),
+                        span: expression.span,
+                    });
+                }
+                result_type
+            }
+            ExpressionKind::Try(value) => {
+                let value_type = self.expression(value);
+                match &value_type {
+                    StaticType::Option(inner) => {
+                        let expected = StaticType::Option(Box::new(StaticType::Dynamic));
+                        self.require_try_return_type(&expected, expression.span);
+                        (**inner).clone()
+                    }
+                    StaticType::Result(ok, error) => {
+                        let expected =
+                            StaticType::Result(Box::new(StaticType::Dynamic), error.clone());
+                        self.require_try_return_type(&expected, expression.span);
+                        (**ok).clone()
+                    }
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    _ => {
+                        self.type_error("operator '?' requires Option or Result", expression.span);
+                        StaticType::Dynamic
+                    }
+                }
+            }
         }
     }
 
@@ -607,6 +747,50 @@ impl Analyzer {
                     StaticType::Number
                 }
             }
+        }
+    }
+
+    fn variant_payload(
+        &self,
+        subject: &StaticType,
+        name: &Identifier,
+    ) -> Option<Option<StaticType>> {
+        match (subject, name.as_str()) {
+            (StaticType::Option(value), "Some") => Some(Some((**value).clone())),
+            (StaticType::Option(_), "None") => Some(None),
+            (StaticType::Result(value, _), "Ok") => Some(Some((**value).clone())),
+            (StaticType::Result(_, error), "Err") => Some(Some((**error).clone())),
+            (StaticType::Dynamic, "Some" | "Ok" | "Err") => Some(Some(StaticType::Dynamic)),
+            (StaticType::Dynamic, "None") => Some(None),
+            _ => None,
+        }
+    }
+
+    fn match_is_exhaustive(&self, subject: &StaticType, variants: &HashSet<String>) -> bool {
+        match subject {
+            StaticType::Option(_) => variants.contains("Some") && variants.contains("None"),
+            StaticType::Result(_, _) => variants.contains("Ok") && variants.contains("Err"),
+            _ => false,
+        }
+    }
+
+    fn require_try_return_type(&mut self, propagated: &StaticType, span: Span) {
+        let Some(expected) = self.current_return_type.clone() else {
+            self.type_error(
+                "operator '?' requires a function with an Option or Result return type",
+                span,
+            );
+            return;
+        };
+        if !expected.accepts(propagated) {
+            self.type_error(
+                format!(
+                    "operator '?' cannot propagate {} from a function returning {}",
+                    propagated.display_name(),
+                    expected.display_name()
+                ),
+                span,
+            );
         }
     }
 
@@ -671,7 +855,9 @@ impl Analyzer {
             });
             return Some(StaticType::Dynamic);
         };
-        if annotation.name.as_str() != "list" && !annotation.arguments.is_empty() {
+        if !matches!(annotation.name.as_str(), "list" | "Option" | "Result")
+            && !annotation.arguments.is_empty()
+        {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::UnknownType,
                 message: format!(
@@ -716,6 +902,14 @@ impl StaticType {
         if let (Self::List(expected), Self::List(actual)) = (self, actual) {
             return expected.accepts(actual);
         }
+        if let (Self::Option(expected), Self::Option(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
+        if let (Self::Result(expected_ok, expected_error), Self::Result(actual_ok, actual_error)) =
+            (self, actual)
+        {
+            return expected_ok.accepts(actual_ok) && expected_error.accepts(actual_error);
+        }
         self == &Self::Dynamic
             || actual == &Self::Dynamic
             || self == actual
@@ -733,6 +927,10 @@ impl StaticType {
             Self::String => "string".into(),
             Self::List(element) => format!("list<{}>", element.display_name()),
             Self::Struct(name) => name.clone(),
+            Self::Option(value) => format!("Option<{}>", value.display_name()),
+            Self::Result(value, error) => {
+                format!("Result<{}, {}>", value.display_name(), error.display_name())
+            }
             Self::Function { parameters, result } => format!(
                 "fn({}) -> {}",
                 parameters
@@ -775,6 +973,15 @@ fn static_type_from_annotation(
             static_type_from_annotation(&annotation.arguments[0], struct_names)
                 .map(|element| StaticType::List(Box::new(element)))
         }
+        "Option" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0], struct_names)
+                .map(|value| StaticType::Option(Box::new(value)))
+        }
+        "Result" if annotation.arguments.len() == 2 => {
+            let value = static_type_from_annotation(&annotation.arguments[0], struct_names)?;
+            let error = static_type_from_annotation(&annotation.arguments[1], struct_names)?;
+            Some(StaticType::Result(Box::new(value), Box::new(error)))
+        }
         "fn" => Some(StaticType::Function {
             parameters: Vec::new(),
             result: Box::new(StaticType::Dynamic),
@@ -783,6 +990,16 @@ fn static_type_from_annotation(
             Some(StaticType::Struct(name.into()))
         }
         _ => None,
+    }
+}
+
+fn literal_type(literal: &Literal) -> StaticType {
+    match literal {
+        Literal::Null => StaticType::Null,
+        Literal::Bool(_) => StaticType::Bool,
+        Literal::Integer(_) => StaticType::Int,
+        Literal::Float(_) => StaticType::Float,
+        Literal::String(_) => StaticType::String,
     }
 }
 
@@ -898,6 +1115,27 @@ mod tests {
             errors
                 .iter()
                 .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn checks_option_result_match_and_propagation() {
+        let source = "fn read(value: Option<int>) -> Option<int> { let inner = value?; return Some(match inner { 0 => 1, _ => inner }) } fn work(value: Result<int, string>) -> Result<int, string> { return Ok(value? + 1) }";
+        assert!(errors(source).is_empty());
+
+        let errors = errors(
+            "fn bad(value: Option<int>) -> int { return value? } match Some(1) { Some(value) => value }",
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == SemanticErrorKind::NonExhaustiveMatch)
         );
     }
 }

@@ -130,3 +130,18 @@ fn parses_struct_fields_defaults_and_member_assignment() {
         ExpressionKind::MemberAssign { .. }
     ));
 }
+
+#[test]
+fn parses_match_patterns_and_try_operator() {
+    let parsed = parse(
+        "fn unwrap(value: Option<int>) -> Option<int> { let inner = value?; return Some(match inner { 0 => 1, _ => inner }) }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Function { body, .. } = &parsed.program.statements[0].kind else {
+        panic!("expected function")
+    };
+    let StatementKind::Variable { initializer, .. } = &body[0].kind else {
+        panic!("expected binding")
+    };
+    assert!(matches!(initializer.kind, ExpressionKind::Try(_)));
+}

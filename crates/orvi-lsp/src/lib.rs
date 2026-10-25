@@ -395,7 +395,16 @@ fn classify_token(
         TokenKind::Identifier
             if matches!(
                 text,
-                "any" | "bool" | "float" | "fn" | "int" | "list" | "number" | "string"
+                "Option"
+                    | "Result"
+                    | "any"
+                    | "bool"
+                    | "float"
+                    | "fn"
+                    | "int"
+                    | "list"
+                    | "number"
+                    | "string"
             ) =>
         {
             (8, 0)
@@ -416,6 +425,7 @@ fn classify_token(
         | TokenKind::Const
         | TokenKind::Fn
         | TokenKind::Struct
+        | TokenKind::Match
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::While
@@ -470,6 +480,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ),
         ("fn", CompletionItemKind::KEYWORD, "function declaration"),
         ("struct", CompletionItemKind::KEYWORD, "struct declaration"),
+        (
+            "match",
+            CompletionItemKind::KEYWORD,
+            "pattern matching expression",
+        ),
         ("if", CompletionItemKind::KEYWORD, "conditional branch"),
         ("else", CompletionItemKind::KEYWORD, "alternative branch"),
         ("while", CompletionItemKind::KEYWORD, "loop"),
@@ -497,6 +512,28 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("bool", CompletionItemKind::TYPE_PARAMETER, "boolean type"),
         ("any", CompletionItemKind::TYPE_PARAMETER, "dynamic type"),
         ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
+        ("Option", CompletionItemKind::ENUM, "optional value type"),
+        ("Result", CompletionItemKind::ENUM, "success or error type"),
+        (
+            "Some",
+            CompletionItemKind::CONSTRUCTOR,
+            "present Option value",
+        ),
+        (
+            "None",
+            CompletionItemKind::ENUM_MEMBER,
+            "missing Option value",
+        ),
+        (
+            "Ok",
+            CompletionItemKind::CONSTRUCTOR,
+            "successful Result value",
+        ),
+        (
+            "Err",
+            CompletionItemKind::CONSTRUCTOR,
+            "failed Result value",
+        ),
     ]
     .into_iter()
     .map(|(label, kind, detail)| CompletionItem {
@@ -549,6 +586,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "const" => "`const` declares an immutable variable.",
         "fn" => "`fn` declares a function.",
         "struct" => "`struct` declares a stable set of typed fields.",
+        "match" => "`match` selects an expression using exhaustive patterns.",
         "if" => "`if` executes a branch when its condition is `true`.",
         "else" => "`else` provides an alternative branch.",
         "while" => "`while` repeats a block while its condition is `true`.",
@@ -556,6 +594,10 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "true" | "false" => "Built-in boolean value.",
         "null" => "Built-in null value.",
         "print" => "`print(...)` writes its arguments to standard output.",
+        "Some" => "`Some(value)` creates a present `Option` value.",
+        "None" => "`None` is an `Option` without a value.",
+        "Ok" => "`Ok(value)` creates a successful `Result`.",
+        "Err" => "`Err(error)` creates a failed `Result`.",
         _ => {
             let (_, symbol) = symbol_at(source, position)?;
             let kind = match symbol.kind {
