@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-The project is at an early but runnable stage. It includes a reusable lexer and parser, semantic checks, a tree-walk interpreter, `run` and `check` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition, syntax and semantic highlighting, live diagnostics, initial completion, hover help, go-to-definition, references, and rename. The language remains incomplete and does not yet include modules, static types, async I/O, packages, or a standard library beyond `print`.
+Version 0.2.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a tree-walk interpreter, `run`, `check`, and `fmt` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, completion, hover help, go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include modules, whole-program type inference, async I/O, packages, or a standard library beyond `print`.
 
 ## Goals
 
@@ -38,7 +38,7 @@ cargo run --bin orviscript -- fmt path/to/program.orvi
 cargo run --bin orviscript -- fmt --check path/to/program.orvi
 ```
 
-The current language subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, numbers, strings, booleans, `null`, mutable reference lists with indexing, typed structs with fields and defaults, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, and struct field types. A tracing collector reclaims unreachable reference-list, struct, and closure-environment cycles.
+The 0.2.0 language subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, numbers, strings, booleans, `null`, mutable reference lists with indexing, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, struct field, and interface types. A tracing collector reclaims unreachable reference-list, struct, and closure-environment cycles.
 
 The VS Code extension lives in `editors/vscode`. It provides document formatting through the same formatter used by the CLI. Build the language server, then launch a development window with the extension enabled:
 

@@ -31,6 +31,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Check example formatting
+        run: cargo run --bin orviscript -- fmt --check examples/v0_2.orvi
+
+      - name: Run 0.2 example
+        run: cargo run --bin orviscript -- run examples/v0_2.orvi
+
       - name: Validate VS Code extension
         run: npm --prefix editors/vscode run check
 

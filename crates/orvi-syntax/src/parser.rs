@@ -87,6 +87,9 @@ impl Parser<'_> {
         if self.consume(TokenKind::Struct) {
             return self.struct_declaration();
         }
+        if self.consume(TokenKind::Interface) {
+            return self.interface_declaration();
+        }
         self.statement()
     }
 
@@ -187,6 +190,32 @@ impl Parser<'_> {
         Ok(Statement {
             span: start.cover(end),
             kind: StatementKind::Struct { name, fields },
+        })
+    }
+
+    fn interface_declaration(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let name = self.expect_identifier("expected interface name")?;
+        self.expect(TokenKind::LeftBrace, "expected '{' after interface name")?;
+        let mut fields = Vec::new();
+        while !self.at(TokenKind::RightBrace) && !self.at(TokenKind::EndOfFile) {
+            let field_name = self.expect_identifier("expected field name")?;
+            self.expect(TokenKind::Colon, "expected ':' after field name")?;
+            let type_annotation = self.type_annotation()?;
+            self.consume(TokenKind::Semicolon);
+            fields.push(StructField {
+                span: field_name.span.cover(type_annotation.span),
+                name: field_name,
+                type_annotation,
+                default: None,
+            });
+        }
+        let end = self
+            .expect(TokenKind::RightBrace, "expected '}' after interface fields")?
+            .span;
+        Ok(Statement {
+            span: start.cover(end),
+            kind: StatementKind::Interface { name, fields },
         })
     }
 
@@ -733,6 +762,7 @@ impl Parser<'_> {
                     | TokenKind::Const
                     | TokenKind::Fn
                     | TokenKind::Struct
+                    | TokenKind::Interface
                     | TokenKind::If
                     | TokenKind::While
                     | TokenKind::Return

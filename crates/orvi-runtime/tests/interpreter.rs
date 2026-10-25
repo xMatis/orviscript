@@ -186,3 +186,21 @@ fn runs_cleanup_when_try_propagates() {
     let source = "fn work(value: Option<int>) -> Option<int> { defer print(\"cleanup\"); let inner = value?; return Some(inner) } print(work(None))";
     assert_eq!(run(source).expect("program runs"), ["cleanup", "None"]);
 }
+
+#[test]
+fn uses_structs_through_structural_interfaces() {
+    let source = "interface Named { name: string } struct Job { name: string; retries: int = 3 } fn label(value: Named) -> string { return value.name } print(label(Job(\"release\")))";
+    assert_eq!(run(source).expect("program runs"), ["release"]);
+
+    let error = run(
+        "interface Named { name: string } struct Job { title: string } let value: Named = Job(\"release\")",
+    )
+    .expect_err("incompatible struct fails");
+    assert_eq!(error, "expected Named, received Job");
+
+    let source = "struct Job { name: string } interface Named { name: string } let value: Named = Job(\"release\"); print(value.name)";
+    assert_eq!(
+        run(source).expect("declaration order does not change compatibility"),
+        ["release"]
+    );
+}

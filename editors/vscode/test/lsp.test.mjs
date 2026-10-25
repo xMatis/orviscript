@@ -46,6 +46,7 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const initialized = await waitFor((message) => message.id === 1);
     assert.equal(initialized.result.serverInfo.name, "orvi-lsp");
+    assert.equal(initialized.result.serverInfo.version, "0.2.0");
     assert.equal(initialized.result.capabilities.textDocumentSync, 1);
 
     send({ jsonrpc: "2.0", method: "initialized", params: {} });

@@ -418,7 +418,11 @@ fn classify_token(
         {
             (8, 0)
         }
-        TokenKind::Identifier if previous == Some(TokenKind::Struct) => (8, DECLARATION),
+        TokenKind::Identifier
+            if matches!(previous, Some(TokenKind::Struct | TokenKind::Interface)) =>
+        {
+            (8, DECLARATION)
+        }
         TokenKind::Identifier if previous == Some(TokenKind::Dot) => (9, 0),
         TokenKind::Identifier if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) => {
             (8, 0)
@@ -434,6 +438,7 @@ fn classify_token(
         | TokenKind::Const
         | TokenKind::Fn
         | TokenKind::Struct
+        | TokenKind::Interface
         | TokenKind::Match
         | TokenKind::Using
         | TokenKind::Defer
@@ -491,6 +496,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ),
         ("fn", CompletionItemKind::KEYWORD, "function declaration"),
         ("struct", CompletionItemKind::KEYWORD, "struct declaration"),
+        (
+            "interface",
+            CompletionItemKind::KEYWORD,
+            "structural interface declaration",
+        ),
         (
             "match",
             CompletionItemKind::KEYWORD,
@@ -575,6 +585,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
                 let kind = match symbol.kind {
                     orvi_sema::SymbolKind::Function => CompletionItemKind::FUNCTION,
                     orvi_sema::SymbolKind::Struct => CompletionItemKind::STRUCT,
+                    orvi_sema::SymbolKind::Interface => CompletionItemKind::INTERFACE,
                     orvi_sema::SymbolKind::Variable
                     | orvi_sema::SymbolKind::Constant
                     | orvi_sema::SymbolKind::Parameter => CompletionItemKind::VARIABLE,
@@ -603,6 +614,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "const" => "`const` declares an immutable variable.",
         "fn" => "`fn` declares a function.",
         "struct" => "`struct` declares a stable set of typed fields.",
+        "interface" => "`interface` declares a structural field contract.",
         "match" => "`match` selects an expression using exhaustive patterns.",
         "using" => "`using name = value => cleanup` registers scoped cleanup.",
         "defer" => "`defer expression` runs the expression when the scope exits.",
@@ -624,6 +636,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
                 orvi_sema::SymbolKind::Constant => "const",
                 orvi_sema::SymbolKind::Function => "fn",
                 orvi_sema::SymbolKind::Struct => "struct",
+                orvi_sema::SymbolKind::Interface => "interface",
                 orvi_sema::SymbolKind::Parameter => "parameter",
             };
             let type_name = symbol.type_name.unwrap_or_else(|| "any".into());
@@ -790,6 +803,7 @@ mod tests {
             item.label == "print" && item.kind == Some(CompletionItemKind::FUNCTION)
         }));
         assert!(items.iter().any(|item| item.label == "struct"));
+        assert!(items.iter().any(|item| item.label == "interface"));
     }
 
     #[test]

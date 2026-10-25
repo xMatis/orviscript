@@ -12,6 +12,7 @@ pub enum TokenKind {
     Const,
     Fn,
     Struct,
+    Interface,
     If,
     Else,
     While,

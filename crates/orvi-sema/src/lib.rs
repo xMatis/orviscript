@@ -32,6 +32,7 @@ pub enum SymbolKind {
     Function,
     Parameter,
     Struct,
+    Interface,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +77,7 @@ enum StaticType {
     String,
     List(Box<StaticType>),
     Struct(String),
+    Interface(String),
     Option(Box<StaticType>),
     Result(Box<StaticType>, Box<StaticType>),
     Function {
@@ -97,6 +99,14 @@ pub fn analyze_program(program: &Program) -> Analysis {
             _ => None,
         })
         .collect();
+    let interface_names = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::Interface { name, .. } => Some(name.name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut analyzer = Analyzer {
         scopes: vec![builtin_symbols()],
         errors: Vec::new(),
@@ -105,6 +115,8 @@ pub fn analyze_program(program: &Program) -> Analysis {
         current_return_type: None,
         struct_names,
         structs: HashMap::new(),
+        interface_names,
+        interfaces: HashMap::new(),
     };
     analyzer.statements(&program.statements, false);
     Analysis {
@@ -180,12 +192,50 @@ struct Analyzer {
     current_return_type: Option<StaticType>,
     struct_names: HashSet<String>,
     structs: HashMap<String, HashMap<String, StaticType>>,
+    interface_names: HashSet<String>,
+    interfaces: HashMap<String, HashMap<String, StaticType>>,
 }
 
 impl Analyzer {
     fn statements(&mut self, statements: &[Statement], create_scope: bool) {
         if create_scope {
             self.scopes.push(HashMap::new());
+        }
+
+        for statement in statements {
+            if let StatementKind::Interface { name, fields } = &statement.kind {
+                self.interface_names.insert(name.name.clone());
+                let mut field_types = HashMap::new();
+                for field in fields {
+                    let field_type = self
+                        .annotation_type(Some(&field.type_annotation))
+                        .unwrap_or(StaticType::Dynamic);
+                    if field_types
+                        .insert(field.name.name.clone(), field_type)
+                        .is_some()
+                    {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::DuplicateName,
+                            message: format!(
+                                "field '{}' is already declared in interface '{}'",
+                                field.name.name, name.name
+                            ),
+                            span: field.name.span,
+                        });
+                    }
+                }
+                self.interfaces.insert(name.name.clone(), field_types);
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Interface,
+                        mutable: false,
+                        arity: None,
+                        definition: Some(name.span),
+                        value_type: StaticType::Interface(name.name.clone()),
+                    },
+                );
+            }
         }
 
         for statement in statements {
@@ -338,6 +388,7 @@ impl Analyzer {
                     }
                 }
             }
+            StatementKind::Interface { .. } => {}
             StatementKind::Block(statements) => self.statements(statements, true),
             StatementKind::If {
                 condition,
@@ -409,7 +460,13 @@ impl Analyzer {
             let value_type = parameter
                 .type_annotation
                 .as_ref()
-                .and_then(|annotation| static_type_from_annotation(annotation, &self.struct_names))
+                .and_then(|annotation| {
+                    static_type_from_annotation(
+                        annotation,
+                        &self.struct_names,
+                        &self.interface_names,
+                    )
+                })
                 .unwrap_or(StaticType::Dynamic);
             self.declare(
                 &parameter.name,
@@ -423,8 +480,9 @@ impl Analyzer {
             );
         }
         let previous_return_type = self.current_return_type.clone();
-        self.current_return_type = return_type
-            .and_then(|annotation| static_type_from_annotation(annotation, &self.struct_names));
+        self.current_return_type = return_type.and_then(|annotation| {
+            static_type_from_annotation(annotation, &self.struct_names, &self.interface_names)
+        });
         self.function_depth += 1;
         self.statements(body, false);
         self.function_depth -= 1;
@@ -506,17 +564,19 @@ impl Analyzer {
                 let object_type = self.expression(object);
                 let value_type = self.expression(value);
                 match object_type {
-                    StaticType::Struct(name) => {
-                        if let Some(field_type) = self
+                    StaticType::Struct(name) | StaticType::Interface(name) => {
+                        let fields = self
                             .structs
                             .get(&name)
+                            .or_else(|| self.interfaces.get(&name));
+                        if let Some(field_type) = fields
                             .and_then(|fields| fields.get(field.as_str()))
                             .cloned()
                         {
                             self.require_assignable(&field_type, &value_type, value.span);
                         } else {
                             self.type_error(
-                                format!("struct '{name}' has no field '{}'", field.name),
+                                format!("type '{name}' has no field '{}'", field.name),
                                 field.span,
                             );
                         }
@@ -605,17 +665,19 @@ impl Analyzer {
             ExpressionKind::Member { object, field } => {
                 let object_type = self.expression(object);
                 match object_type {
-                    StaticType::Struct(name) => {
-                        if let Some(field_type) = self
+                    StaticType::Struct(name) | StaticType::Interface(name) => {
+                        let fields = self
                             .structs
                             .get(&name)
+                            .or_else(|| self.interfaces.get(&name));
+                        if let Some(field_type) = fields
                             .and_then(|fields| fields.get(field.as_str()))
                             .cloned()
                         {
                             field_type
                         } else {
                             self.type_error(
-                                format!("struct '{name}' has no field '{}'", field.name),
+                                format!("type '{name}' has no field '{}'", field.name),
                                 field.span,
                             );
                             StaticType::Dynamic
@@ -803,7 +865,7 @@ impl Analyzer {
             );
             return;
         };
-        if !expected.accepts(propagated) {
+        if !self.is_assignable(&expected, propagated) {
             self.type_error(
                 format!(
                     "operator '?' cannot propagate {} from a function returning {}",
@@ -868,7 +930,9 @@ impl Analyzer {
 
     fn annotation_type(&mut self, annotation: Option<&TypeAnnotation>) -> Option<StaticType> {
         let annotation = annotation?;
-        let Some(value_type) = static_type_from_annotation(annotation, &self.struct_names) else {
+        let Some(value_type) =
+            static_type_from_annotation(annotation, &self.struct_names, &self.interface_names)
+        else {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::UnknownType,
                 message: format!("unknown type '{}'", annotation.name.name),
@@ -892,7 +956,7 @@ impl Analyzer {
     }
 
     fn require_assignable(&mut self, expected: &StaticType, actual: &StaticType, span: Span) {
-        if !expected.accepts(actual) {
+        if !self.is_assignable(expected, actual) {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::TypeMismatch,
                 message: format!(
@@ -902,6 +966,50 @@ impl Analyzer {
                 ),
                 span,
             });
+        }
+    }
+
+    fn is_assignable(&self, expected: &StaticType, actual: &StaticType) -> bool {
+        match (expected, actual) {
+            (StaticType::List(expected), StaticType::List(actual))
+            | (StaticType::Option(expected), StaticType::Option(actual)) => {
+                self.is_assignable(expected, actual)
+            }
+            (
+                StaticType::Result(expected_value, expected_error),
+                StaticType::Result(actual_value, actual_error),
+            ) => {
+                self.is_assignable(expected_value, actual_value)
+                    && self.is_assignable(expected_error, actual_error)
+            }
+            (StaticType::Interface(interface), StaticType::Struct(structure)) => self
+                .interfaces
+                .get(interface)
+                .zip(self.structs.get(structure))
+                .is_some_and(|(required, available)| {
+                    required.iter().all(|(name, expected)| {
+                        available
+                            .get(name)
+                            .is_some_and(|actual| self.is_assignable(expected, actual))
+                    })
+                }),
+            (StaticType::Interface(expected), StaticType::Interface(actual)) => {
+                if expected == actual {
+                    true
+                } else {
+                    self.interfaces
+                        .get(expected)
+                        .zip(self.interfaces.get(actual))
+                        .is_some_and(|(required, available)| {
+                            required.iter().all(|(name, expected)| {
+                                available
+                                    .get(name)
+                                    .is_some_and(|actual| self.is_assignable(expected, actual))
+                            })
+                        })
+                }
+            }
+            _ => expected.accepts(actual),
         }
     }
 
@@ -948,6 +1056,7 @@ impl StaticType {
             Self::String => "string".into(),
             Self::List(element) => format!("list<{}>", element.display_name()),
             Self::Struct(name) => name.clone(),
+            Self::Interface(name) => name.clone(),
             Self::Option(value) => format!("Option<{}>", value.display_name()),
             Self::Result(value, error) => {
                 format!("Result<{}, {}>", value.display_name(), error.display_name())
@@ -981,6 +1090,7 @@ impl StaticType {
 fn static_type_from_annotation(
     annotation: &TypeAnnotation,
     struct_names: &HashSet<String>,
+    interface_names: &HashSet<String>,
 ) -> Option<StaticType> {
     match annotation.name.as_str() {
         "any" => Some(StaticType::Dynamic),
@@ -991,16 +1101,24 @@ fn static_type_from_annotation(
         "number" => Some(StaticType::Number),
         "string" => Some(StaticType::String),
         "list" if annotation.arguments.len() == 1 => {
-            static_type_from_annotation(&annotation.arguments[0], struct_names)
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
                 .map(|element| StaticType::List(Box::new(element)))
         }
         "Option" if annotation.arguments.len() == 1 => {
-            static_type_from_annotation(&annotation.arguments[0], struct_names)
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
                 .map(|value| StaticType::Option(Box::new(value)))
         }
         "Result" if annotation.arguments.len() == 2 => {
-            let value = static_type_from_annotation(&annotation.arguments[0], struct_names)?;
-            let error = static_type_from_annotation(&annotation.arguments[1], struct_names)?;
+            let value = static_type_from_annotation(
+                &annotation.arguments[0],
+                struct_names,
+                interface_names,
+            )?;
+            let error = static_type_from_annotation(
+                &annotation.arguments[1],
+                struct_names,
+                interface_names,
+            )?;
             Some(StaticType::Result(Box::new(value), Box::new(error)))
         }
         "fn" => Some(StaticType::Function {
@@ -1009,6 +1127,9 @@ fn static_type_from_annotation(
         }),
         name if struct_names.contains(name) && annotation.arguments.is_empty() => {
             Some(StaticType::Struct(name.into()))
+        }
+        name if interface_names.contains(name) && annotation.arguments.is_empty() => {
+            Some(StaticType::Interface(name.into()))
         }
         _ => None,
     }
@@ -1164,5 +1285,17 @@ mod tests {
     fn analyzes_deferred_and_using_cleanup_in_scope() {
         let source = "fn work(value: Option<int>) -> Option<int> { defer print(\"done\"); using handle = \"db\" => print(\"close\", handle); let inner = value?; return Some(inner) }";
         assert!(errors(source).is_empty());
+    }
+
+    #[test]
+    fn checks_structural_interface_contracts_and_fields() {
+        let source = "interface Named { name: string } struct Job { name: string; retries: int = 3 } fn label(value: Named) -> string { return value.name } print(label(Job(\"release\")))";
+        assert!(errors(source).is_empty());
+
+        let errors = errors(
+            "interface Named { name: string } struct Job { title: string } let value: Named = Job(\"release\")",
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, SemanticErrorKind::TypeMismatch);
     }
 }

@@ -41,6 +41,10 @@ struct Formatter {
     parentheses: usize,
     brackets: usize,
     previous: Option<TokenKind>,
+    in_type: bool,
+    type_depth: usize,
+    pending_match: bool,
+    match_scopes: Vec<(usize, usize, usize)>,
 }
 
 impl Default for Formatter {
@@ -54,6 +58,10 @@ impl Default for Formatter {
             parentheses: 0,
             brackets: 0,
             previous: None,
+            in_type: false,
+            type_depth: 0,
+            pending_match: false,
+            match_scopes: Vec::new(),
         }
     }
 }
@@ -81,6 +89,13 @@ impl Formatter {
         }
 
         if kind == TokenKind::RightBrace {
+            if self
+                .match_scopes
+                .last()
+                .is_some_and(|(indent, _, _)| *indent == self.indent)
+            {
+                self.match_scopes.pop();
+            }
             self.indent = self.indent.saturating_sub(1);
             if self.previous != Some(TokenKind::LeftBrace) {
                 self.newline();
@@ -97,8 +112,15 @@ impl Formatter {
             self.newline();
         }
 
+        if self.in_type
+            && self.type_depth == 0
+            && !matches!(kind, TokenKind::Identifier | TokenKind::Less)
+        {
+            self.in_type = false;
+        }
+        let needs_space = self.needs_space(kind);
         self.write_indent();
-        if self.needs_space(kind) {
+        if needs_space {
             self.output.push(' ');
         }
 
@@ -106,6 +128,11 @@ impl Formatter {
             TokenKind::LeftBrace => {
                 self.output.push('{');
                 self.indent += 1;
+                if self.pending_match {
+                    self.match_scopes
+                        .push((self.indent, self.parentheses, self.brackets));
+                    self.pending_match = false;
+                }
                 self.newline();
             }
             TokenKind::RightBrace => self.output.push('}'),
@@ -115,7 +142,12 @@ impl Formatter {
             }
             TokenKind::Comma => {
                 self.output.push(',');
-                self.pending_space = true;
+                if self.match_scopes.last() == Some(&(self.indent, self.parentheses, self.brackets))
+                {
+                    self.newline();
+                } else {
+                    self.pending_space = true;
+                }
             }
             TokenKind::LeftParenthesis => {
                 self.output.push('(');
@@ -137,20 +169,31 @@ impl Formatter {
             TokenKind::Colon => {
                 self.output.push(':');
                 self.pending_space = true;
+                self.in_type = true;
             }
             _ => self.output.push_str(text),
         }
 
+        if kind == TokenKind::Match {
+            self.pending_match = true;
+        }
+        if kind == TokenKind::Arrow {
+            self.in_type = true;
+        } else if kind == TokenKind::Less && self.in_type {
+            self.type_depth += 1;
+        } else if kind == TokenKind::Greater && self.type_depth > 0 {
+            self.type_depth -= 1;
+        }
         if kind == TokenKind::RightBrace {
             self.pending_newline = true;
-        } else if kind == TokenKind::Else || is_operator(kind) {
+        } else if kind == TokenKind::Else || self.is_spaced_operator(kind) {
             self.pending_space = true;
         }
         self.previous = Some(kind);
         if !matches!(kind, TokenKind::Comma | TokenKind::Colon) {
             self.pending_newline = false;
         }
-        if !is_operator(kind)
+        if !self.is_spaced_operator(kind)
             && !matches!(kind, TokenKind::Else | TokenKind::Comma | TokenKind::Colon)
         {
             self.pending_space = false;
@@ -161,6 +204,13 @@ impl Formatter {
         let Some(previous) = self.previous else {
             return false;
         };
+        if kind == TokenKind::Question
+            || (kind == TokenKind::Less && self.in_type)
+            || (kind == TokenKind::Greater && self.type_depth > 0)
+            || (previous == TokenKind::Less && self.type_depth > 0)
+        {
+            return false;
+        }
         if self.line_start
             || matches!(
                 kind,
@@ -180,11 +230,18 @@ impl Formatter {
             return false;
         }
         self.pending_space
-            || is_operator(kind)
-            || is_operator(previous)
+            || self.is_spaced_operator(kind)
+            || self.is_spaced_operator(previous)
             || kind == TokenKind::LeftBrace
             || (is_word(kind) && is_word(previous))
             || (kind == TokenKind::Else && previous == TokenKind::RightBrace)
+    }
+
+    fn is_spaced_operator(&self, kind: TokenKind) -> bool {
+        is_operator(kind)
+            && kind != TokenKind::Question
+            && !(kind == TokenKind::Less && self.in_type)
+            && !(kind == TokenKind::Greater && self.type_depth > 0)
     }
 
     fn write_indent(&mut self) {
@@ -226,6 +283,7 @@ fn is_word(kind: TokenKind) -> bool {
             | TokenKind::Const
             | TokenKind::Fn
             | TokenKind::Struct
+            | TokenKind::Interface
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While
@@ -242,8 +300,7 @@ fn is_word(kind: TokenKind) -> bool {
 fn is_operator(kind: TokenKind) -> bool {
     matches!(
         kind,
-        TokenKind::Question
-            | TokenKind::Plus
+        TokenKind::Plus
             | TokenKind::PlusEqual
             | TokenKind::Minus
             | TokenKind::MinusEqual

@@ -316,6 +316,7 @@ fn keyword_kind(identifier: &str) -> Option<TokenKind> {
         "const" => TokenKind::Const,
         "fn" => TokenKind::Fn,
         "struct" => TokenKind::Struct,
+        "interface" => TokenKind::Interface,
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,

@@ -17,6 +17,7 @@ pub enum Value {
     String(String),
     List(Rc<RefCell<Vec<Value>>>),
     StructType(Rc<StructDefinition>),
+    InterfaceType(Rc<InterfaceDefinition>),
     StructInstance(Rc<RefCell<StructInstance>>),
     Variant {
         tag: VariantTag,
@@ -74,7 +75,14 @@ pub struct UserFunction {
 pub struct StructDefinition {
     name: String,
     fields: Vec<StructField>,
+    interfaces: RefCell<HashSet<String>>,
     closure: Environment,
+}
+
+#[derive(Clone)]
+pub struct InterfaceDefinition {
+    name: String,
+    fields: Vec<StructField>,
 }
 
 pub struct StructInstance {
@@ -163,6 +171,45 @@ impl Environment {
         parent.map_or(Err(AssignError::Undefined), |parent| {
             parent.assign(name, value)
         })
+    }
+
+    fn interface_definitions(&self) -> Vec<Rc<InterfaceDefinition>> {
+        let (mut interfaces, parent) = {
+            let data = self.0.borrow();
+            let interfaces = data
+                .values
+                .values()
+                .filter_map(|binding| match &binding.value {
+                    Value::InterfaceType(definition) => Some(definition.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (interfaces, data.parent.clone())
+        };
+        if let Some(parent) = parent {
+            interfaces.extend(parent.interface_definitions());
+        }
+        interfaces
+    }
+
+    fn register_interface(&self, interface: &InterfaceDefinition) {
+        let parent = {
+            let data = self.0.borrow();
+            for binding in data.values.values() {
+                if let Value::StructType(structure) = &binding.value
+                    && struct_satisfies_interface(&structure.fields, &interface.fields)
+                {
+                    structure
+                        .interfaces
+                        .borrow_mut()
+                        .insert(interface.name.clone());
+                }
+            }
+            data.parent.clone()
+        };
+        if let Some(parent) = parent {
+            parent.register_interface(interface);
+        }
     }
 }
 
@@ -312,14 +359,36 @@ impl Interpreter {
                 Ok(Control::Continue(Value::Null))
             }
             StatementKind::Struct { name, fields } => {
+                let interfaces = self
+                    .environment
+                    .interface_definitions()
+                    .into_iter()
+                    .filter(|interface| struct_satisfies_interface(fields, &interface.fields))
+                    .map(|interface| interface.name.clone())
+                    .collect();
                 let definition = StructDefinition {
                     name: name.name.clone(),
                     fields: fields.clone(),
+                    interfaces: RefCell::new(interfaces),
                     closure: self.environment.clone(),
                 };
                 self.environment.define(
                     name.name.clone(),
                     Value::StructType(Rc::new(definition)),
+                    false,
+                    None,
+                );
+                Ok(Control::Continue(Value::Null))
+            }
+            StatementKind::Interface { name, fields } => {
+                let definition = Rc::new(InterfaceDefinition {
+                    name: name.name.clone(),
+                    fields: fields.clone(),
+                });
+                self.environment.register_interface(&definition);
+                self.environment.define(
+                    name.name.clone(),
+                    Value::InterfaceType(definition),
                     false,
                     None,
                 );
@@ -1108,6 +1177,7 @@ impl Value {
             Self::List(_) => "list".into(),
             Self::Function(_) | Self::NativePrint => "fn".into(),
             Self::StructType(definition) => format!("type {}", definition.name),
+            Self::InterfaceType(definition) => format!("type {}", definition.name),
             Self::StructInstance(instance) => instance.borrow().definition.name.clone(),
             Self::Variant { tag, .. } => match tag {
                 VariantTag::Some | VariantTag::None => "Option".into(),
@@ -1188,11 +1258,31 @@ fn value_matches_type_inner(
                 .is_some_and(|inner| value_matches_type_inner(payload, inner, visited)),
             _ => false,
         },
-        name => matches!(
-            value,
-            Value::StructInstance(instance) if instance.borrow().definition.name == name
-        ),
+        name => matches!(value, Value::StructInstance(instance) if {
+            let instance = instance.borrow();
+            instance.definition.name == name
+                || instance.definition.interfaces.borrow().contains(name)
+        }),
     }
+}
+
+fn struct_satisfies_interface(fields: &[StructField], required: &[StructField]) -> bool {
+    required.iter().all(|required_field| {
+        fields.iter().any(|field| {
+            field.name.name == required_field.name.name
+                && type_annotations_match(&field.type_annotation, &required_field.type_annotation)
+        })
+    })
+}
+
+fn type_annotations_match(left: &TypeAnnotation, right: &TypeAnnotation) -> bool {
+    left.name.name == right.name.name
+        && left.arguments.len() == right.arguments.len()
+        && left
+            .arguments
+            .iter()
+            .zip(&right.arguments)
+            .all(|(left, right)| type_annotations_match(left, right))
 }
 
 fn display_type(type_annotation: &TypeAnnotation) -> String {
@@ -1251,6 +1341,7 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
                     .all(|(a, b)| values_equal_inner(a, b, visited))
         }
         (Value::StructType(a), Value::StructType(b)) => Rc::ptr_eq(a, b),
+        (Value::InterfaceType(a), Value::InterfaceType(b)) => Rc::ptr_eq(a, b),
         (Value::StructInstance(a), Value::StructInstance(b)) => {
             let identity = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
             if !visited.insert(identity) {
@@ -1312,6 +1403,7 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             format!("[{formatted}]")
         }
         Value::StructType(definition) => format!("<struct {}>", definition.name),
+        Value::InterfaceType(definition) => format!("<interface {}>", definition.name),
         Value::StructInstance(instance) => {
             let identity = Rc::as_ptr(instance) as usize;
             if !visited.insert(identity) {

@@ -29,6 +29,7 @@ const grammar = readJson(grammarContribution.path);
 assert(grammar.scopeName === grammarContribution.scopeName, "grammar scope does not match manifest");
 assert(Array.isArray(grammar.patterns) && grammar.patterns.length > 0, "grammar has no patterns");
 const keywordPatterns = grammar.repository.keywords.patterns.map((pattern) => pattern.match).join(" ");
+assert(keywordPatterns.includes("interface"), "grammar must highlight the interface keyword");
 for (const unsupported of ["async", "await", "parallel", "task"]) {
   assert(!keywordPatterns.includes(unsupported), `grammar advertises unsupported keyword '${unsupported}'`);
 }

@@ -158,3 +158,15 @@ fn parses_defer_and_using_cleanup() {
     assert!(matches!(body[0].kind, StatementKind::Defer(_)));
     assert!(matches!(body[1].kind, StatementKind::Using { .. }));
 }
+
+#[test]
+fn parses_structural_interfaces() {
+    let parsed = parse("interface Named { name: string; tags: list<string> }");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Interface { name, fields } = &parsed.program.statements[0].kind else {
+        panic!("expected interface declaration")
+    };
+    assert_eq!(name.name, "Named");
+    assert_eq!(fields.len(), 2);
+    assert!(fields.iter().all(|field| field.default.is_none()));
+}

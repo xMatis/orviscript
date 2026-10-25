@@ -1,0 +1,30 @@
+interface Named {
+    name: string;
+}
+struct Job {
+    name: string;
+    retries: int = 3;
+}
+fn label(value: Named) -> string {
+    return value.name;
+}
+fn increment(value: Option<int>) -> Option<int> {
+    let number = value?;
+    return Some(number + 1);
+}
+fn work(value: Result<int, string>) -> Result<int, string> {
+    using resource = "worker" => print("closed", resource);
+    defer print("finished");
+    let number = value?;
+    return Ok(number + 1);
+}
+let job: Job = Job("release");
+let values: list<int> = [1, 2, 3];
+values[1] = 7;
+print(job.name, job.retries, values);
+print(label(job));
+print(match increment(Some(4)) {
+    Some(number) => number,
+    None => 0,
+});
+print(work(Ok(9)));

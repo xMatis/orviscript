@@ -85,6 +85,10 @@ pub enum StatementKind {
         name: Identifier,
         fields: Vec<StructField>,
     },
+    Interface {
+        name: Identifier,
+        fields: Vec<StructField>,
+    },
     Block(Vec<Statement>),
     If {
         condition: Expression,
