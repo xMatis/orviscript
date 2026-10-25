@@ -7,13 +7,14 @@ use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
-    MessageType, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions,
-    RenameParams, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
-    SemanticTokensResult, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkupContent, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse,
+    Range, ReferenceParams, RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
+    ServerInfo, SymbolKind as LspSymbolKind, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, WorkDoneProgressOptions,
     WorkspaceEdit,
 };
@@ -72,6 +73,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -161,6 +163,18 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(format_document(&source).map(|edit| vec![edit]))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let Some(source) = self.document(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(Some(DocumentSymbolResponse::Nested(document_symbols(
+            &source,
+        ))))
     }
 
     async fn goto_definition(
@@ -508,7 +522,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ),
         ("import", CompletionItemKind::KEYWORD, "named module import"),
         ("from", CompletionItemKind::KEYWORD, "module import source"),
-        ("task", CompletionItemKind::KEYWORD, "task declaration"),
+        (
+            "task",
+            CompletionItemKind::KEYWORD,
+            "task declaration and dependency result module",
+        ),
         (
             "match",
             CompletionItemKind::KEYWORD,
@@ -555,6 +573,72 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("process", CompletionItemKind::MODULE, "process module"),
         ("terminal", CompletionItemKind::MODULE, "terminal module"),
         ("context", CompletionItemKind::VARIABLE, "execution context"),
+        ("parse", CompletionItemKind::FUNCTION, "json.parse(text)"),
+        (
+            "stringify",
+            CompletionItemKind::FUNCTION,
+            "json.stringify(value)",
+        ),
+        (
+            "read_text",
+            CompletionItemKind::FUNCTION,
+            "fs.read_text(path)",
+        ),
+        (
+            "write_text",
+            CompletionItemKind::FUNCTION,
+            "fs.write_text(path, contents)",
+        ),
+        ("exists", CompletionItemKind::FUNCTION, "fs.exists(path)"),
+        (
+            "create_dir_all",
+            CompletionItemKind::FUNCTION,
+            "fs.create_dir_all(path)",
+        ),
+        (
+            "remove_file",
+            CompletionItemKind::FUNCTION,
+            "fs.remove_file(path)",
+        ),
+        ("join", CompletionItemKind::FUNCTION, "path.join(parts)"),
+        ("parent", CompletionItemKind::FUNCTION, "path.parent(path)"),
+        (
+            "file_name",
+            CompletionItemKind::FUNCTION,
+            "path.file_name(path)",
+        ),
+        (
+            "is_absolute",
+            CompletionItemKind::FUNCTION,
+            "path.is_absolute(path)",
+        ),
+        ("get", CompletionItemKind::FUNCTION, "env.get(name)"),
+        (
+            "current_dir",
+            CompletionItemKind::FUNCTION,
+            "env.current_dir()",
+        ),
+        (
+            "run",
+            CompletionItemKind::FUNCTION,
+            "process.run(program, args)",
+        ),
+        (
+            "input",
+            CompletionItemKind::FUNCTION,
+            "terminal.input(prompt)",
+        ),
+        (
+            "confirm",
+            CompletionItemKind::FUNCTION,
+            "terminal.confirm(prompt)",
+        ),
+        (
+            "password",
+            CompletionItemKind::FUNCTION,
+            "terminal.password(prompt)",
+        ),
+        ("result", CompletionItemKind::FUNCTION, "task.result(name)"),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
         (
@@ -651,6 +735,24 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "None" => "`None` is an `Option` without a value.",
         "Ok" => "`Ok(value)` creates a successful `Result`.",
         "Err" => "`Err(error)` creates a failed `Result`.",
+        "read_text" => "`fs.read_text(path)` returns `Result<string, string>`.",
+        "write_text" => "`fs.write_text(path, contents)` returns `Result<null, string>`.",
+        "exists" => "`fs.exists(path)` returns whether the path exists.",
+        "create_dir_all" => "`fs.create_dir_all(path)` creates directories recursively.",
+        "remove_file" => "`fs.remove_file(path)` removes one file.",
+        "join" => "`path.join(parts)` joins a `list<string>` into a path.",
+        "parent" => "`path.parent(path)` returns `Option<string>`.",
+        "file_name" => "`path.file_name(path)` returns `Option<string>`.",
+        "is_absolute" => "`path.is_absolute(path)` returns `bool`.",
+        "get" => "`env.get(name)` returns `Option<string>`.",
+        "current_dir" => "`env.current_dir()` returns `Result<string, string>`.",
+        "run" => "`process.run(program, args)` runs a process without a shell.",
+        "input" => "`terminal.input(prompt)` reads visible terminal input.",
+        "confirm" => "`terminal.confirm(prompt)` reads a yes/no answer.",
+        "password" => "`terminal.password(prompt)` reads hidden terminal input.",
+        "parse" => "`json.parse(text)` returns `Result<any, string>`.",
+        "stringify" => "`json.stringify(value)` returns `Result<string, string>`.",
+        "result" => "`task.result(name)` returns the `Result` of a declared dependency.",
         _ => {
             let (_, symbol) = symbol_at(source, position)?;
             let kind = match symbol.kind {
@@ -680,6 +782,43 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         }),
         range: Some(span_range(source, token.span)),
     })
+}
+
+#[allow(deprecated)]
+fn document_symbols(source: &str) -> Vec<DocumentSymbol> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return Vec::new();
+    }
+    analyze_program(&parsed.program)
+        .symbols
+        .into_iter()
+        .filter(|symbol| symbol.is_definition)
+        .map(|symbol| {
+            let kind = match symbol.kind {
+                orvi_sema::SymbolKind::Function | orvi_sema::SymbolKind::Task => {
+                    LspSymbolKind::FUNCTION
+                }
+                orvi_sema::SymbolKind::Struct => LspSymbolKind::STRUCT,
+                orvi_sema::SymbolKind::Interface => LspSymbolKind::INTERFACE,
+                orvi_sema::SymbolKind::Import
+                | orvi_sema::SymbolKind::Variable
+                | orvi_sema::SymbolKind::Constant
+                | orvi_sema::SymbolKind::Parameter => LspSymbolKind::VARIABLE,
+            };
+            let range = span_range(source, symbol.span);
+            DocumentSymbol {
+                name: symbol.name,
+                detail: symbol.type_name,
+                kind,
+                tags: None,
+                deprecated: None,
+                range,
+                selection_range: range,
+                children: None,
+            }
+        })
+        .collect()
 }
 
 fn diagnostic(source: &str, span: Span, message: String) -> Diagnostic {
@@ -745,8 +884,8 @@ fn offset_at_position(source: &str, position: Position) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_items, diagnostics, format_document, hover_at, is_identifier, semantic_tokens,
-        span_range, symbol_at,
+        completion_items, diagnostics, document_symbols, format_document, hover_at, is_identifier,
+        semantic_tokens, span_range, symbol_at,
     };
     use orvi_syntax::Span;
     use tower_lsp_server::ls_types::{
@@ -828,6 +967,32 @@ mod tests {
         }));
         assert!(items.iter().any(|item| item.label == "struct"));
         assert!(items.iter().any(|item| item.label == "interface"));
+        assert!(items.iter().any(|item| item.label == "task"));
+        assert!(items.iter().any(|item| item.label == "read_text"));
+    }
+
+    #[test]
+    fn reports_task_diagnostics_and_document_symbols() {
+        let source = "task build -> Result<null, string> { return Ok(null) } task deploy -> Result<null, string> { needs: [missing]; return Ok(null) }";
+        let diagnostics = diagnostics(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("undefined task dependency"))
+        );
+        let symbols = document_symbols(source);
+        assert!(symbols.iter().any(|symbol| symbol.name == "build"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "deploy"));
+    }
+
+    #[test]
+    fn explains_standard_api_on_hover() {
+        let source = "fs.read_text(\"file\")";
+        let hover = hover_at(source, Position::new(0, 5)).expect("hover result");
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(contents.value.contains("Result<string, string>"));
     }
 
     #[test]

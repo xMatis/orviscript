@@ -1,6 +1,6 @@
 [package]
 name = "orvi-lsp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Language Server Protocol implementation for OrviScript"
 edition.workspace = true
 license.workspace = true

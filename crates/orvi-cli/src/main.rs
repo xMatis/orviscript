@@ -221,25 +221,26 @@ fn test_file(path: &Path) -> ExitCode {
                 println!("{line}");
             }
             let mut failed = false;
-            for report in execution
-                .tasks
-                .into_iter()
-                .filter(|report| selected.contains(&report.name))
-            {
+            for report in execution.tasks {
+                if report.status == TaskStatus::Pending {
+                    continue;
+                }
+                let is_test = selected.contains(&report.name);
                 let status = match report.status {
                     TaskStatus::Succeeded => "passed",
                     TaskStatus::Failed => {
-                        failed = true;
+                        failed |= is_test;
                         "failed"
                     }
                     TaskStatus::Skipped => {
-                        failed = true;
+                        failed |= is_test;
                         "skipped"
                     }
                     TaskStatus::Pending => "pending",
                     TaskStatus::Running => "running",
                 };
-                println!("test {}: {status}", report.name);
+                let kind = if is_test { "test" } else { "dependency" };
+                println!("{kind} {}: {status}", report.name);
                 if let Some(error) = report.error {
                     eprintln!("  {error}");
                 }

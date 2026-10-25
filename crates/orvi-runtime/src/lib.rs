@@ -375,13 +375,14 @@ pub fn execute_tasks(
     entry_file: PathBuf,
     selected: &[String],
 ) -> Result<TaskExecution, RuntimeError> {
+    let tasks = collect_tasks(program)?;
+    validate_tasks(&tasks, selected)?;
     let mut interpreter = Interpreter::new(context, Some(entry_file));
     let control = interpreter.execute_statements(&program.statements)?;
     if matches!(control, Control::Return(_)) {
         return Err(interpreter.error("return is only valid inside a function", Span::empty(0)));
     }
-    let tasks = collect_tasks(program)?;
-    let reports = interpreter.run_tasks(&tasks, selected)?;
+    let reports = interpreter.run_tasks(&tasks, selected);
     interpreter.run_deferred()?;
     Ok(TaskExecution {
         output: interpreter.output,
@@ -406,6 +407,7 @@ struct Interpreter {
     modules_in_progress: HashSet<PathBuf>,
     task_results: HashMap<String, Value>,
     active_task_needs: Option<HashSet<String>>,
+    suspended_environments: Vec<Environment>,
 }
 
 fn collect_tasks(program: &Program) -> Result<Vec<TaskDefinition>, RuntimeError> {
@@ -474,6 +476,37 @@ fn validate_task_cycles(
         visit(&task.name, definitions, &mut states)?;
     }
     Ok(())
+}
+
+fn validate_tasks(tasks: &[TaskDefinition], selected: &[String]) -> Result<(), RuntimeError> {
+    let definitions = tasks
+        .iter()
+        .map(|task| (task.name.clone(), task.clone()))
+        .collect::<HashMap<_, _>>();
+    for task in tasks {
+        for dependency in &task.needs {
+            if !definitions.contains_key(dependency) {
+                return Err(RuntimeError {
+                    message: format!(
+                        "task '{}' requires undefined task '{dependency}'",
+                        task.name
+                    ),
+                    span: task.span,
+                    propagated: None,
+                });
+            }
+        }
+    }
+    for target in selected {
+        if !definitions.contains_key(target) {
+            return Err(RuntimeError {
+                message: format!("unknown task '{target}'"),
+                span: Span::empty(0),
+                propagated: None,
+            });
+        }
+    }
+    validate_task_cycles(tasks, &definitions)
 }
 
 impl Interpreter {
@@ -550,6 +583,7 @@ impl Interpreter {
             modules_in_progress: HashSet::new(),
             task_results: HashMap::new(),
             active_task_needs: None,
+            suspended_environments: Vec::new(),
         }
     }
     fn execute_statements(&mut self, statements: &[Statement]) -> Result<Control, RuntimeError> {
@@ -569,29 +603,11 @@ impl Interpreter {
         Ok(Control::Continue(value))
     }
 
-    fn run_tasks(
-        &mut self,
-        tasks: &[TaskDefinition],
-        selected: &[String],
-    ) -> Result<Vec<TaskReport>, RuntimeError> {
+    fn run_tasks(&mut self, tasks: &[TaskDefinition], selected: &[String]) -> Vec<TaskReport> {
         let definitions = tasks
             .iter()
             .map(|task| (task.name.clone(), task.clone()))
             .collect::<HashMap<_, _>>();
-        for task in tasks {
-            for dependency in &task.needs {
-                if !definitions.contains_key(dependency) {
-                    return Err(self.error(
-                        format!(
-                            "task '{}' requires undefined task '{dependency}'",
-                            task.name
-                        ),
-                        task.span,
-                    ));
-                }
-            }
-        }
-        validate_task_cycles(tasks, &definitions)?;
         let targets = if selected.is_empty() {
             tasks
                 .iter()
@@ -615,15 +631,12 @@ impl Interpreter {
             })
             .collect::<HashMap<_, _>>();
         for target in targets {
-            if !definitions.contains_key(&target) {
-                return Err(self.error(format!("unknown task '{target}'"), Span::empty(0)));
-            }
             self.run_task(&target, &definitions, &mut reports);
         }
-        Ok(tasks
+        tasks
             .iter()
             .map(|task| reports.remove(&task.name).expect("all tasks have reports"))
-            .collect())
+            .collect()
     }
 
     fn run_task(
@@ -904,10 +917,12 @@ impl Interpreter {
         environment: Environment,
     ) -> Result<Control, RuntimeError> {
         let previous = std::mem::replace(&mut self.environment, environment);
+        self.suspended_environments.push(previous.clone());
         self.deferred.push(Vec::new());
         let result = self.execute_statements(statements);
         let cleanup = self.run_deferred();
         self.deferred.pop();
+        self.suspended_environments.pop();
         self.environment = previous;
         match result {
             Ok(control) => cleanup.map(|()| control),
@@ -1831,6 +1846,9 @@ impl Interpreter {
             &mut marked_lists,
         );
         for environment in self.module_cache.values() {
+            mark_environment(environment, &mut marked_environments, &mut marked_lists);
+        }
+        for environment in &self.suspended_environments {
             mark_environment(environment, &mut marked_environments, &mut marked_lists);
         }
         for value in temporary_roots {

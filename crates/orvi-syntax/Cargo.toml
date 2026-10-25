@@ -1,6 +1,6 @@
 [package]
 name = "orvi-syntax"
-version = "0.2.0"
+version = "0.3.0"
 description = "Syntax analysis for OrviScript"
 edition.workspace = true
 license.workspace = true

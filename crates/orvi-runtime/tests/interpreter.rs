@@ -385,3 +385,28 @@ fn skips_dependents_after_task_failure_and_rejects_cycles() {
     .expect_err("task cycle must fail before execution");
     assert!(error.message.contains("cyclic task dependency"));
 }
+
+#[test]
+fn keeps_task_scope_alive_while_calling_a_function() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let entry = directory.path().join("tasks.orvi");
+    let source = r#"
+        fn helper() -> int { return 1 }
+        task test_scope -> Result<string, string> {
+            let retained = "alive";
+            helper();
+            print(retained);
+            return Ok(retained);
+        }
+    "#;
+    let parsed = parse(source);
+    let execution = execute_tasks(
+        &parsed.program,
+        ExecutionContext::default(),
+        entry,
+        &["test_scope".into()],
+    )
+    .expect("task execution");
+    assert_eq!(execution.output, ["alive"]);
+    assert_eq!(execution.tasks[0].status, TaskStatus::Succeeded);
+}
