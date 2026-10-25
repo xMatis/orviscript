@@ -204,3 +204,38 @@ fn uses_structs_through_structural_interfaces() {
         ["release"]
     );
 }
+
+#[test]
+fn reads_writes_compares_and_collects_maps() {
+    let source = "let data: map<int> = { count: 1, other: 2 }; data[\"count\"] = 3; data.extra = 4; print(data.count); print(data == { other: 2, count: 3, extra: 4 }); print(data)";
+    assert_eq!(
+        run(source).expect("program runs"),
+        ["3", "true", "{ count: 3, other: 2, extra: 4 }"]
+    );
+
+    let source = "{ let cycle = {}; cycle.self = cycle; print(cycle); } print(\"alive\")";
+    let parsed = parse(source);
+    assert!(!parsed.has_errors());
+    let execution = execute(&parsed.program).expect("program runs");
+    assert_eq!(execution.output, ["{ self: <cycle> }", "alive"]);
+    assert!(execution.collected_objects >= 1);
+}
+
+#[test]
+fn parses_and_stringifies_json_without_panics() {
+    let source = "fn count() -> Result<int, string> { let data = json.parse(\"{\\\"count\\\":4}\")?; return Ok(data.count) } print(count()); print(json.stringify({ name: \"orvi\", values: [1, true, null] })); print(json.parse(\"{\"))";
+    assert_eq!(
+        run(source).expect("program runs"),
+        [
+            "Ok(4)",
+            "Ok({\"name\":\"orvi\",\"values\":[1,true,null]})",
+            "Err(EOF while parsing an object at line 1 column 1)",
+        ]
+    );
+
+    let source = "let cycle = {}; cycle.self = cycle; print(json.stringify(cycle))";
+    assert_eq!(
+        run(source).expect("cycle is returned as Err"),
+        ["Err(JSON cannot represent cyclic values)"]
+    );
+}

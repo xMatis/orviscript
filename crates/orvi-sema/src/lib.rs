@@ -76,6 +76,8 @@ enum StaticType {
     Number,
     String,
     List(Box<StaticType>),
+    Map(Box<StaticType>),
+    Module(String),
     Struct(String),
     Interface(String),
     Option(Box<StaticType>),
@@ -180,6 +182,16 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
                 StaticType::Dynamic,
                 StaticType::Result(Box::new(StaticType::Dynamic), Box::new(StaticType::Dynamic)),
             ),
+        ),
+        (
+            "json".into(),
+            Symbol {
+                kind: SymbolKind::Constant,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Module("json".into()),
+            },
         ),
     ])
 }
@@ -507,6 +519,21 @@ impl Analyzer {
                 }
                 StaticType::List(Box::new(element_type))
             }
+            ExpressionKind::Map(entries) => {
+                let mut value_type = StaticType::Dynamic;
+                let mut keys = HashSet::new();
+                for (key, value) in entries {
+                    if !keys.insert(key) {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::DuplicateName,
+                            message: format!("map key '{key}' is duplicated"),
+                            span: value.span,
+                        });
+                    }
+                    value_type = value_type.merge(&self.expression(value));
+                }
+                StaticType::Map(Box::new(value_type))
+            }
             ExpressionKind::Variable(name) => match self.resolve_reference(name) {
                 Some(symbol) => symbol.value_type,
                 None => {
@@ -543,9 +570,14 @@ impl Analyzer {
                 let object_type = self.expression(object);
                 let index_type = self.expression(index);
                 let value_type = self.expression(value);
-                self.require_assignable(&StaticType::Int, &index_type, index.span);
                 match object_type {
                     StaticType::List(element_type) => {
+                        self.require_assignable(&StaticType::Int, &index_type, index.span);
+                        self.require_assignable(&element_type, &value_type, value.span);
+                        value_type
+                    }
+                    StaticType::Map(element_type) => {
+                        self.require_assignable(&StaticType::String, &index_type, index.span);
                         self.require_assignable(&element_type, &value_type, value.span);
                         value_type
                     }
@@ -581,6 +613,14 @@ impl Analyzer {
                             );
                         }
                         value_type
+                    }
+                    StaticType::Map(element_type) => {
+                        self.require_assignable(&element_type, &value_type, value.span);
+                        value_type
+                    }
+                    StaticType::Module(name) => {
+                        self.type_error(format!("module '{name}' is immutable"), field.span);
+                        StaticType::Dynamic
                     }
                     StaticType::Dynamic => StaticType::Dynamic,
                     _ => {
@@ -636,6 +676,19 @@ impl Analyzer {
                     });
                 }
                 if let StaticType::Function { parameters, result } = callee_type {
+                    if matches!(callee.kind, ExpressionKind::Member { .. })
+                        && parameters.len() != arguments.len()
+                    {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::ArgumentCount,
+                            message: format!(
+                                "function expects {} arguments but received {}",
+                                parameters.len(),
+                                arguments.len()
+                            ),
+                            span: expression.span,
+                        });
+                    }
                     for ((expected, actual), argument) in
                         parameters.iter().zip(&argument_types).zip(arguments)
                     {
@@ -652,9 +705,15 @@ impl Analyzer {
             ExpressionKind::Index { object, index } => {
                 let object_type = self.expression(object);
                 let index_type = self.expression(index);
-                self.require_assignable(&StaticType::Int, &index_type, index.span);
                 match object_type {
-                    StaticType::List(element_type) => *element_type,
+                    StaticType::List(element_type) => {
+                        self.require_assignable(&StaticType::Int, &index_type, index.span);
+                        *element_type
+                    }
+                    StaticType::Map(element_type) => {
+                        self.require_assignable(&StaticType::String, &index_type, index.span);
+                        *element_type
+                    }
                     StaticType::Dynamic => StaticType::Dynamic,
                     _ => {
                         self.type_error("value is not indexable", object.span);
@@ -678,6 +737,18 @@ impl Analyzer {
                         } else {
                             self.type_error(
                                 format!("type '{name}' has no field '{}'", field.name),
+                                field.span,
+                            );
+                            StaticType::Dynamic
+                        }
+                    }
+                    StaticType::Map(element_type) => *element_type,
+                    StaticType::Module(module) => {
+                        if let Some(value_type) = module_member_type(&module, field.as_str()) {
+                            value_type
+                        } else {
+                            self.type_error(
+                                format!("module '{module}' has no member '{}'", field.name),
                                 field.span,
                             );
                             StaticType::Dynamic
@@ -940,8 +1011,10 @@ impl Analyzer {
             });
             return Some(StaticType::Dynamic);
         };
-        if !matches!(annotation.name.as_str(), "list" | "Option" | "Result")
-            && !annotation.arguments.is_empty()
+        if !matches!(
+            annotation.name.as_str(),
+            "list" | "map" | "Option" | "Result"
+        ) && !annotation.arguments.is_empty()
         {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::UnknownType,
@@ -972,6 +1045,7 @@ impl Analyzer {
     fn is_assignable(&self, expected: &StaticType, actual: &StaticType) -> bool {
         match (expected, actual) {
             (StaticType::List(expected), StaticType::List(actual))
+            | (StaticType::Map(expected), StaticType::Map(actual))
             | (StaticType::Option(expected), StaticType::Option(actual)) => {
                 self.is_assignable(expected, actual)
             }
@@ -1031,6 +1105,9 @@ impl StaticType {
         if let (Self::List(expected), Self::List(actual)) = (self, actual) {
             return expected.accepts(actual);
         }
+        if let (Self::Map(expected), Self::Map(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
         if let (Self::Option(expected), Self::Option(actual)) = (self, actual) {
             return expected.accepts(actual);
         }
@@ -1055,6 +1132,8 @@ impl StaticType {
             Self::Number => "number".into(),
             Self::String => "string".into(),
             Self::List(element) => format!("list<{}>", element.display_name()),
+            Self::Map(element) => format!("map<{}>", element.display_name()),
+            Self::Module(name) => format!("module {name}"),
             Self::Struct(name) => name.clone(),
             Self::Interface(name) => name.clone(),
             Self::Option(value) => format!("Option<{}>", value.display_name()),
@@ -1104,6 +1183,10 @@ fn static_type_from_annotation(
             static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
                 .map(|element| StaticType::List(Box::new(element)))
         }
+        "map" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
+                .map(|value| StaticType::Map(Box::new(value)))
+        }
         "Option" if annotation.arguments.len() == 1 => {
             static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
                 .map(|value| StaticType::Option(Box::new(value)))
@@ -1131,6 +1214,26 @@ fn static_type_from_annotation(
         name if interface_names.contains(name) && annotation.arguments.is_empty() => {
             Some(StaticType::Interface(name.into()))
         }
+        _ => None,
+    }
+}
+
+fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
+    match (module, member) {
+        ("json", "parse") => Some(StaticType::Function {
+            parameters: vec![StaticType::String],
+            result: Box::new(StaticType::Result(
+                Box::new(StaticType::Dynamic),
+                Box::new(StaticType::String),
+            )),
+        }),
+        ("json", "stringify") => Some(StaticType::Function {
+            parameters: vec![StaticType::Dynamic],
+            result: Box::new(StaticType::Result(
+                Box::new(StaticType::String),
+                Box::new(StaticType::String),
+            )),
+        }),
         _ => None,
     }
 }
@@ -1297,5 +1400,35 @@ mod tests {
         );
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::TypeMismatch);
+    }
+
+    #[test]
+    fn checks_map_keys_and_values() {
+        assert!(
+            errors("let values: map<int> = { first: 1 }; values[\"second\"] = 2; values.third = 3")
+                .is_empty()
+        );
+        let errors =
+            errors("let values: map<int> = { first: 1 }; values[0] = 2; values.second = \"wrong\"");
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn checks_json_module_calls() {
+        assert!(
+            errors("fn read() -> Result<any, string> { return json.parse(\"{}\") }").is_empty()
+        );
+        let errors = errors("json.parse(1); json.missing");
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == SemanticErrorKind::TypeMismatch)
+        );
     }
 }

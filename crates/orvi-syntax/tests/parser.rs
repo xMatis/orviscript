@@ -170,3 +170,13 @@ fn parses_structural_interfaces() {
     assert_eq!(fields.len(), 2);
     assert!(fields.iter().all(|field| field.default.is_none()));
 }
+
+#[test]
+fn parses_map_literals_and_string_indices() {
+    let parsed = parse("let data: map<int> = { count: 1, \"other\": 2 }; data[\"count\"] = 3");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Variable { initializer, .. } = &parsed.program.statements[0].kind else {
+        panic!("expected variable declaration")
+    };
+    assert!(matches!(initializer.kind, ExpressionKind::Map(_)));
+}

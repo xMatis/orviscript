@@ -215,6 +215,7 @@ name = "orvi-runtime"
 version = "0.2.0"
 dependencies = [
  "orvi-syntax",
+ "serde_json",
 ]
 
 [[package]]

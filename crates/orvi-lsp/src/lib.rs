@@ -539,6 +539,8 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("bool", CompletionItemKind::TYPE_PARAMETER, "boolean type"),
         ("any", CompletionItemKind::TYPE_PARAMETER, "dynamic type"),
         ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
+        ("map", CompletionItemKind::TYPE_PARAMETER, "map type"),
+        ("json", CompletionItemKind::MODULE, "JSON module"),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
         (

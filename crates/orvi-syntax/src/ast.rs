@@ -119,6 +119,7 @@ pub struct Expression {
 pub enum ExpressionKind {
     Literal(Literal),
     List(Vec<Expression>),
+    Map(Vec<(String, Expression)>),
     Variable(Identifier),
     Assign {
         name: Identifier,

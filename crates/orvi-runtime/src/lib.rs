@@ -8,6 +8,8 @@ use orvi_syntax::{
     Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 
+type MapEntries = Vec<(String, Value)>;
+
 #[derive(Clone)]
 pub enum Value {
     Null,
@@ -16,6 +18,7 @@ pub enum Value {
     Float(f64),
     String(String),
     List(Rc<RefCell<Vec<Value>>>),
+    Map(Rc<RefCell<MapEntries>>),
     StructType(Rc<StructDefinition>),
     InterfaceType(Rc<InterfaceDefinition>),
     StructInstance(Rc<RefCell<StructInstance>>),
@@ -24,6 +27,8 @@ pub enum Value {
         payload: Option<Box<Value>>,
     },
     NativeConstructor(VariantTag),
+    NativeModule(NativeModule),
+    NativeFunction(NativeFunction),
     Function(Rc<UserFunction>),
     NativePrint,
 }
@@ -96,6 +101,17 @@ pub enum VariantTag {
     None,
     Ok,
     Err,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeModule {
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFunction {
+    JsonParse,
+    JsonStringify,
 }
 
 #[derive(Clone)]
@@ -253,12 +269,19 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
         false,
         None,
     );
+    globals.define(
+        "json".into(),
+        Value::NativeModule(NativeModule::Json),
+        false,
+        None,
+    );
     let mut interpreter = Interpreter {
         environment: globals.clone(),
         output: Vec::new(),
         function_depth: 0,
         environments: vec![Rc::downgrade(&globals.0)],
         lists: Vec::new(),
+        maps: Vec::new(),
         objects: Vec::new(),
         collected_objects: 0,
         deferred: vec![Vec::new()],
@@ -296,6 +319,7 @@ struct Interpreter {
     function_depth: usize,
     environments: Vec<Weak<RefCell<EnvironmentData>>>,
     lists: Vec<Weak<RefCell<Vec<Value>>>>,
+    maps: Vec<Weak<RefCell<MapEntries>>>,
     objects: Vec<Weak<RefCell<StructInstance>>>,
     collected_objects: usize,
     deferred: Vec<Vec<Expression>>,
@@ -514,6 +538,15 @@ impl Interpreter {
                 self.lists.push(Rc::downgrade(&values));
                 Ok(Value::List(values))
             }
+            ExpressionKind::Map(entries) => {
+                let mut values = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    values.push((key.clone(), self.evaluate(value)?));
+                }
+                let values = Rc::new(RefCell::new(values));
+                self.maps.push(Rc::downgrade(&values));
+                Ok(Value::Map(values))
+            }
             ExpressionKind::Variable(name) => {
                 self.environment.get(name.as_str()).ok_or_else(|| {
                     self.error(
@@ -548,17 +581,31 @@ impl Interpreter {
                 value,
             } => {
                 let object = self.evaluate(object)?;
-                let index = self.list_index(index)?;
                 let value = self.evaluate(value)?;
-                let Value::List(values) = object else {
-                    return Err(self.error("value is not indexable", expression.span));
-                };
-                let mut values = values.borrow_mut();
-                let Some(slot) = values.get_mut(index) else {
-                    return Err(self.error("list index is out of bounds", expression.span));
-                };
-                *slot = value.clone();
-                Ok(value)
+                match object {
+                    Value::List(values) => {
+                        let index = self.list_index(index)?;
+                        let mut values = values.borrow_mut();
+                        let Some(slot) = values.get_mut(index) else {
+                            return Err(self.error("list index is out of bounds", expression.span));
+                        };
+                        *slot = value.clone();
+                        Ok(value)
+                    }
+                    Value::Map(values) => {
+                        let key = self.map_key(index)?;
+                        let mut values = values.borrow_mut();
+                        if let Some((_, slot)) =
+                            values.iter_mut().find(|(candidate, _)| candidate == &key)
+                        {
+                            *slot = value.clone();
+                        } else {
+                            values.push((key, value.clone()));
+                        }
+                        Ok(value)
+                    }
+                    _ => Err(self.error("value is not indexable", expression.span)),
+                }
             }
             ExpressionKind::MemberAssign {
                 object,
@@ -567,6 +614,18 @@ impl Interpreter {
             } => {
                 let object = self.evaluate(object)?;
                 let value = self.evaluate(value)?;
+                if let Value::Map(values) = object {
+                    let mut values = values.borrow_mut();
+                    if let Some((_, slot)) = values
+                        .iter_mut()
+                        .find(|(candidate, _)| candidate == field.as_str())
+                    {
+                        *slot = value.clone();
+                    } else {
+                        values.push((field.name.clone(), value.clone()));
+                    }
+                    return Ok(value);
+                }
                 let Value::StructInstance(instance) = object else {
                     return Err(self.error("value has no fields", expression.span));
                 };
@@ -625,18 +684,54 @@ impl Interpreter {
             }
             ExpressionKind::Index { object, index } => {
                 let object = self.evaluate(object)?;
-                let index = self.list_index(index)?;
-                let Value::List(values) = object else {
-                    return Err(self.error("value is not indexable", expression.span));
-                };
-                let value =
-                    values.borrow().get(index).cloned().ok_or_else(|| {
-                        self.error("list index is out of bounds", expression.span)
-                    })?;
-                Ok(value)
+                match object {
+                    Value::List(values) => {
+                        let index = self.list_index(index)?;
+                        values.borrow().get(index).cloned().ok_or_else(|| {
+                            self.error("list index is out of bounds", expression.span)
+                        })
+                    }
+                    Value::Map(values) => {
+                        let key = self.map_key(index)?;
+                        values
+                            .borrow()
+                            .iter()
+                            .find(|(candidate, _)| candidate == &key)
+                            .map(|(_, value)| value.clone())
+                            .ok_or_else(|| {
+                                self.error(format!("map has no key '{key}'"), expression.span)
+                            })
+                    }
+                    _ => Err(self.error("value is not indexable", expression.span)),
+                }
             }
             ExpressionKind::Member { object, field } => {
                 let object = self.evaluate(object)?;
+                if let Value::NativeModule(module) = object {
+                    return module
+                        .member(field.as_str())
+                        .map(Value::NativeFunction)
+                        .ok_or_else(|| {
+                            self.error(
+                                format!(
+                                    "module '{}' has no member '{}'",
+                                    module.name(),
+                                    field.name
+                                ),
+                                field.span,
+                            )
+                        });
+                }
+                if let Value::Map(values) = object {
+                    return values
+                        .borrow()
+                        .iter()
+                        .find(|(candidate, _)| candidate == field.as_str())
+                        .map(|(_, value)| value.clone())
+                        .ok_or_else(|| {
+                            self.error(format!("map has no key '{}'", field.name), expression.span)
+                        });
+                }
                 let Value::StructInstance(instance) = object else {
                     return Err(self.error("value has no fields", expression.span));
                 };
@@ -779,6 +874,7 @@ impl Interpreter {
                     payload: arguments.into_iter().next().map(Box::new),
                 })
             }
+            Value::NativeFunction(function) => self.call_native(function, arguments, span),
             Value::Function(function) => {
                 if arguments.len() != function.parameters.len() {
                     return Err(self.error(
@@ -871,6 +967,97 @@ impl Interpreter {
                 Ok(Value::StructInstance(instance))
             }
             _ => Err(self.error("value is not callable", span)),
+        }
+    }
+
+    fn call_native(
+        &mut self,
+        function: NativeFunction,
+        arguments: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if arguments.len() != 1 {
+            return Err(self.error(
+                format!(
+                    "function '{}' expects 1 argument, received {}",
+                    function.name(),
+                    arguments.len()
+                ),
+                span,
+            ));
+        }
+        let value = arguments
+            .into_iter()
+            .next()
+            .expect("checked argument count");
+        match function {
+            NativeFunction::JsonParse => {
+                let Value::String(source) = value else {
+                    return Err(self.error("json.parse expects string", span));
+                };
+                match serde_json::from_str(&source) {
+                    Ok(value) => Ok(Value::Variant {
+                        tag: VariantTag::Ok,
+                        payload: Some(Box::new(self.json_to_value(value))),
+                    }),
+                    Err(error) => Ok(Value::Variant {
+                        tag: VariantTag::Err,
+                        payload: Some(Box::new(Value::String(error.to_string()))),
+                    }),
+                }
+            }
+            NativeFunction::JsonStringify => {
+                match value_to_json(&value, &mut HashSet::new()).and_then(|value| {
+                    serde_json::to_string(&value).map_err(|error| error.to_string())
+                }) {
+                    Ok(json) => Ok(Value::Variant {
+                        tag: VariantTag::Ok,
+                        payload: Some(Box::new(Value::String(json))),
+                    }),
+                    Err(error) => Ok(Value::Variant {
+                        tag: VariantTag::Err,
+                        payload: Some(Box::new(Value::String(error))),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn json_to_value(&mut self, value: serde_json::Value) -> Value {
+        match value {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(value) => Value::Bool(value),
+            serde_json::Value::Number(value) => value.as_i64().map_or_else(
+                || {
+                    Value::Float(
+                        value
+                            .as_f64()
+                            .expect("JSON numbers are representable as f64"),
+                    )
+                },
+                Value::Integer,
+            ),
+            serde_json::Value::String(value) => Value::String(value),
+            serde_json::Value::Array(values) => {
+                let values = Rc::new(RefCell::new(
+                    values
+                        .into_iter()
+                        .map(|value| self.json_to_value(value))
+                        .collect(),
+                ));
+                self.lists.push(Rc::downgrade(&values));
+                Value::List(values)
+            }
+            serde_json::Value::Object(values) => {
+                let values = Rc::new(RefCell::new(
+                    values
+                        .into_iter()
+                        .map(|(key, value)| (key, self.json_to_value(value)))
+                        .collect(),
+                ));
+                self.maps.push(Rc::downgrade(&values));
+                Value::Map(values)
+            }
         }
     }
 
@@ -987,6 +1174,17 @@ impl Interpreter {
             }
             Rc::strong_count(&values) > 1
         });
+        self.maps.retain(|entry| {
+            let Some(values) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&values) as usize;
+            if !marked_lists.contains(&identity) {
+                values.borrow_mut().clear();
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&values) > 1
+        });
         self.objects.retain(|entry| {
             let Some(instance) = entry.upgrade() else {
                 return false;
@@ -1017,6 +1215,12 @@ impl Interpreter {
             Value::Integer(value) => usize::try_from(value)
                 .map_err(|_| self.error("list index must be non-negative", expression.span)),
             _ => Err(self.error("list index must be int", expression.span)),
+        }
+    }
+    fn map_key(&mut self, expression: &Expression) -> Result<String, RuntimeError> {
+        match self.evaluate(expression)? {
+            Value::String(value) => Ok(value),
+            _ => Err(self.error("map index must be string", expression.span)),
         }
     }
     fn require_type(
@@ -1057,6 +1261,31 @@ impl VariantTag {
             Self::None => "None",
             Self::Ok => "Ok",
             Self::Err => "Err",
+        }
+    }
+}
+
+impl NativeModule {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+        }
+    }
+
+    fn member(self, name: &str) -> Option<NativeFunction> {
+        match (self, name) {
+            (Self::Json, "parse") => Some(NativeFunction::JsonParse),
+            (Self::Json, "stringify") => Some(NativeFunction::JsonStringify),
+            _ => None,
+        }
+    }
+}
+
+impl NativeFunction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::JsonParse => "json.parse",
+            Self::JsonStringify => "json.stringify",
         }
     }
 }
@@ -1135,6 +1364,15 @@ fn mark_value(
                 mark_value(value, marked_environments, marked_lists);
             }
         }
+        Value::Map(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !marked_lists.insert(identity) {
+                return;
+            }
+            for (_, value) in values.borrow().iter() {
+                mark_value(value, marked_environments, marked_lists);
+            }
+        }
         Value::StructInstance(instance) => {
             let identity = Rc::as_ptr(instance) as usize;
             if !marked_lists.insert(identity) {
@@ -1175,7 +1413,9 @@ impl Value {
             Self::Float(_) => "float".into(),
             Self::String(_) => "string".into(),
             Self::List(_) => "list".into(),
-            Self::Function(_) | Self::NativePrint => "fn".into(),
+            Self::Map(_) => "map".into(),
+            Self::Function(_) | Self::NativePrint | Self::NativeFunction(_) => "fn".into(),
+            Self::NativeModule(module) => format!("module {}", module.name()),
             Self::StructType(definition) => format!("type {}", definition.name),
             Self::InterfaceType(definition) => format!("type {}", definition.name),
             Self::StructInstance(instance) => instance.borrow().definition.name.clone(),
@@ -1223,9 +1463,30 @@ fn value_matches_type_inner(
             visited.remove(&identity);
             matches
         }
+        "map" => {
+            let Value::Map(values) = value else {
+                return false;
+            };
+            let [element_type] = type_annotation.arguments.as_slice() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return true;
+            }
+            let matches = values
+                .borrow()
+                .iter()
+                .all(|(_, value)| value_matches_type_inner(value, element_type, visited));
+            visited.remove(&identity);
+            matches
+        }
         "fn" => matches!(
             value,
-            Value::Function(_) | Value::NativePrint | Value::NativeConstructor(_)
+            Value::Function(_)
+                | Value::NativePrint
+                | Value::NativeConstructor(_)
+                | Value::NativeFunction(_)
         ),
         "Option" => match value {
             Value::Variant {
@@ -1301,6 +1562,47 @@ fn display_type(type_annotation: &TypeAnnotation) -> String {
     )
 }
 
+fn value_to_json(value: &Value, visited: &mut HashSet<usize>) -> Result<serde_json::Value, String> {
+    match value {
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Bool(value) => Ok(serde_json::Value::Bool(*value)),
+        Value::Integer(value) => Ok(serde_json::Value::Number((*value).into())),
+        Value::Float(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| "JSON cannot represent NaN or infinity".into()),
+        Value::String(value) => Ok(serde_json::Value::String(value.clone())),
+        Value::List(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return Err("JSON cannot represent cyclic values".into());
+            }
+            let result = values
+                .borrow()
+                .iter()
+                .map(|value| value_to_json(value, visited))
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array);
+            visited.remove(&identity);
+            result
+        }
+        Value::Map(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return Err("JSON cannot represent cyclic values".into());
+            }
+            let result = values
+                .borrow()
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), value_to_json(value, visited)?)))
+                .collect::<Result<serde_json::Map<_, _>, String>>()
+                .map(serde_json::Value::Object);
+            visited.remove(&identity);
+            result
+        }
+        _ => Err(format!("JSON cannot represent {}", value.type_name())),
+    }
+}
+
 fn numbers(left: Value, right: Value) -> Option<(f64, f64)> {
     let left = match left {
         Value::Integer(value) => value as f64,
@@ -1340,6 +1642,20 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
                     .zip(b.iter())
                     .all(|(a, b)| values_equal_inner(a, b, visited))
         }
+        (Value::Map(a), Value::Map(b)) => {
+            let identity = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+            if !visited.insert(identity) {
+                return true;
+            }
+            let a = a.borrow();
+            let b = b.borrow();
+            a.len() == b.len()
+                && a.iter().all(|(key, value)| {
+                    b.iter()
+                        .find(|(candidate, _)| candidate == key)
+                        .is_some_and(|(_, other)| values_equal_inner(value, other, visited))
+                })
+        }
         (Value::StructType(a), Value::StructType(b)) => Rc::ptr_eq(a, b),
         (Value::InterfaceType(a), Value::InterfaceType(b)) => Rc::ptr_eq(a, b),
         (Value::StructInstance(a), Value::StructInstance(b)) => {
@@ -1375,6 +1691,8 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
                 }
         }
         (Value::NativeConstructor(a), Value::NativeConstructor(b)) => a == b,
+        (Value::NativeModule(a), Value::NativeModule(b)) => a == b,
+        (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
@@ -1401,6 +1719,20 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
                 .join(", ");
             visited.remove(&identity);
             format!("[{formatted}]")
+        }
+        Value::Map(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return "<cycle>".into();
+            }
+            let formatted = values
+                .borrow()
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", format_value(value, visited)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            visited.remove(&identity);
+            format!("{{ {formatted} }}")
         }
         Value::StructType(definition) => format!("<struct {}>", definition.name),
         Value::InterfaceType(definition) => format!("<interface {}>", definition.name),
@@ -1429,6 +1761,8 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             |value| format!("{}({})", tag.name(), format_value(value, visited)),
         ),
         Value::NativeConstructor(tag) => format!("<native fn {}>", tag.name()),
+        Value::NativeModule(module) => format!("<module {}>", module.name()),
+        Value::NativeFunction(function) => format!("<native fn {}>", function.name()),
         Value::Function(function) => format!("<fn {}>", function.name),
         Value::NativePrint => "<native fn print>".into(),
     }

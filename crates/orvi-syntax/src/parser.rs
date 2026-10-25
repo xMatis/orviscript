@@ -581,6 +581,40 @@ impl Parser<'_> {
                     kind: ExpressionKind::List(values),
                 });
             }
+            TokenKind::LeftBrace => {
+                let mut entries = Vec::new();
+                if !self.at(TokenKind::RightBrace) {
+                    loop {
+                        let key = self.advance();
+                        let key = match key.kind {
+                            TokenKind::Identifier => {
+                                key.text(self.source).unwrap_or_default().to_owned()
+                            }
+                            TokenKind::String => {
+                                unescape_string(key.text(self.source).unwrap_or_default())
+                            }
+                            _ => {
+                                return Err(ParseError {
+                                    message: "expected map key".into(),
+                                    span: key.span,
+                                });
+                            }
+                        };
+                        self.expect(TokenKind::Colon, "expected ':' after map key")?;
+                        entries.push((key, self.expression()?));
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                let end = self
+                    .expect(TokenKind::RightBrace, "expected '}' after map")?
+                    .span;
+                return Ok(Expression {
+                    span: token.span.cover(end),
+                    kind: ExpressionKind::Map(entries),
+                });
+            }
             _ => {
                 return Err(ParseError {
                     message: "expected expression".into(),
