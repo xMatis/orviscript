@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use orvi_syntax::{
     BinaryOperator, Expression, ExpressionKind, Literal, Parameter, Program, Span, Statement,
@@ -50,6 +50,7 @@ impl std::error::Error for RuntimeError {}
 pub struct Execution {
     pub output: Vec<String>,
     pub value: Value,
+    pub collected_objects: usize,
 }
 
 #[derive(Clone)]
@@ -154,9 +155,12 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
     let globals = Environment::root();
     globals.define("print".into(), Value::NativePrint, false, None);
     let mut interpreter = Interpreter {
-        environment: globals,
+        environment: globals.clone(),
         output: Vec::new(),
         function_depth: 0,
+        environments: vec![Rc::downgrade(&globals.0)],
+        lists: Vec::new(),
+        collected_objects: 0,
     };
     let value = match interpreter.execute_statements(&program.statements)? {
         Control::Continue(value) => value,
@@ -167,9 +171,11 @@ pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
             });
         }
     };
+    interpreter.collect_finished(std::slice::from_ref(&value));
     Ok(Execution {
         output: interpreter.output,
         value,
+        collected_objects: interpreter.collected_objects,
     })
 }
 
@@ -177,6 +183,9 @@ struct Interpreter {
     environment: Environment,
     output: Vec<String>,
     function_depth: usize,
+    environments: Vec<Weak<RefCell<EnvironmentData>>>,
+    lists: Vec<Weak<RefCell<Vec<Value>>>>,
+    collected_objects: usize,
 }
 
 impl Interpreter {
@@ -184,8 +193,14 @@ impl Interpreter {
         let mut value = Value::Null;
         for statement in statements {
             match self.execute_statement(statement)? {
-                Control::Continue(next) => value = next,
-                returned @ Control::Return(_) => return Ok(returned),
+                Control::Continue(next) => {
+                    self.collect_garbage(std::slice::from_ref(&next));
+                    value = next;
+                }
+                Control::Return(value) => {
+                    self.collect_garbage(std::slice::from_ref(&value));
+                    return Ok(Control::Return(value));
+                }
             }
         }
         Ok(Control::Continue(value))
@@ -231,7 +246,8 @@ impl Interpreter {
                 Ok(Control::Continue(Value::Null))
             }
             StatementKind::Block(statements) => {
-                self.execute_block(statements, Environment::child(self.environment.clone()))
+                let environment = self.child_environment(self.environment.clone());
+                self.execute_block(statements, environment)
             }
             StatementKind::If {
                 condition,
@@ -301,7 +317,9 @@ impl Interpreter {
                     .iter()
                     .map(|value| self.evaluate(value))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::List(Rc::new(RefCell::new(values))))
+                let values = Rc::new(RefCell::new(values));
+                self.lists.push(Rc::downgrade(&values));
+                Ok(Value::List(values))
             }
             ExpressionKind::Variable(name) => {
                 self.environment.get(name.as_str()).ok_or_else(|| {
@@ -476,7 +494,7 @@ impl Interpreter {
                         span,
                     ));
                 }
-                let environment = Environment::child(function.closure.clone());
+                let environment = self.child_environment(function.closure.clone());
                 for (parameter, value) in function.parameters.iter().zip(arguments) {
                     self.require_type(
                         &value,
@@ -575,6 +593,62 @@ impl Interpreter {
             Err(self.error("condition must be bool", span))
         }
     }
+    fn child_environment(&mut self, parent: Environment) -> Environment {
+        let environment = Environment::child(parent);
+        self.environments.push(Rc::downgrade(&environment.0));
+        environment
+    }
+
+    fn collect_garbage(&mut self, temporary_roots: &[Value]) {
+        let mut marked_environments = HashSet::new();
+        let mut marked_lists = HashSet::new();
+        mark_environment(
+            &self.environment,
+            &mut marked_environments,
+            &mut marked_lists,
+        );
+        for value in temporary_roots {
+            mark_value(value, &mut marked_environments, &mut marked_lists);
+        }
+
+        self.sweep(&marked_environments, &marked_lists);
+    }
+
+    fn collect_finished(&mut self, result_roots: &[Value]) {
+        let mut marked_environments = HashSet::new();
+        let mut marked_lists = HashSet::new();
+        for value in result_roots {
+            mark_value(value, &mut marked_environments, &mut marked_lists);
+        }
+        self.sweep(&marked_environments, &marked_lists);
+    }
+
+    fn sweep(&mut self, marked_environments: &HashSet<usize>, marked_lists: &HashSet<usize>) {
+        self.lists.retain(|entry| {
+            let Some(values) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&values) as usize;
+            if !marked_lists.contains(&identity) {
+                values.borrow_mut().clear();
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&values) > 1
+        });
+        self.environments.retain(|entry| {
+            let Some(environment) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&environment) as usize;
+            if !marked_environments.contains(&identity) {
+                let mut data = environment.borrow_mut();
+                data.values.clear();
+                data.parent = None;
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&environment) > 1
+        });
+    }
     fn list_index(&mut self, expression: &Expression) -> Result<usize, RuntimeError> {
         match self.evaluate(expression)? {
             Value::Integer(value) => usize::try_from(value)
@@ -609,6 +683,55 @@ impl Interpreter {
             message: message.into(),
             span,
         }
+    }
+}
+
+fn mark_environment(
+    environment: &Environment,
+    marked_environments: &mut HashSet<usize>,
+    marked_lists: &mut HashSet<usize>,
+) {
+    let identity = Rc::as_ptr(&environment.0) as usize;
+    if !marked_environments.insert(identity) {
+        return;
+    }
+    let (parent, values) = {
+        let data = environment.0.borrow();
+        (
+            data.parent.clone(),
+            data.values
+                .values()
+                .map(|binding| binding.value.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    if let Some(parent) = parent {
+        mark_environment(&parent, marked_environments, marked_lists);
+    }
+    for value in &values {
+        mark_value(value, marked_environments, marked_lists);
+    }
+}
+
+fn mark_value(
+    value: &Value,
+    marked_environments: &mut HashSet<usize>,
+    marked_lists: &mut HashSet<usize>,
+) {
+    match value {
+        Value::List(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !marked_lists.insert(identity) {
+                return;
+            }
+            for value in values.borrow().iter() {
+                mark_value(value, marked_environments, marked_lists);
+            }
+        }
+        Value::Function(function) => {
+            mark_environment(&function.closure, marked_environments, marked_lists)
+        }
+        _ => {}
     }
 }
 

@@ -120,3 +120,14 @@ fn formats_and_compares_cyclic_lists_safely() {
     let source = "let left = [null]; left[0] = left; let right = [null]; right[0] = right; print(left); print(left == right)";
     assert_eq!(run(source).expect("program runs"), ["[<cycle>]", "true"]);
 }
+
+#[test]
+fn collects_unreachable_list_and_closure_cycles() {
+    let source = "{ let cycle = [null]; cycle[0] = cycle; } { fn recursive() { return recursive } } print(\"alive\")";
+    let parsed = parse(source);
+    assert!(!parsed.has_errors());
+    let execution = execute(&parsed.program).expect("program runs");
+
+    assert_eq!(execution.output, ["alive"]);
+    assert!(execution.collected_objects >= 2);
+}
