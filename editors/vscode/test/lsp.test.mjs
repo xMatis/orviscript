@@ -15,8 +15,9 @@ const executable = path.join(
   process.platform === "win32" ? "orvi-lsp.exe" : "orvi-lsp",
 );
 
-test("language server publishes diagnostics for an open document", { timeout: 5000 }, async () => {
+test("language server publishes diagnostics for an open document", { timeout: 30000 }, async () => {
   const server = childProcess.spawn(executable, [], { stdio: ["pipe", "pipe", "pipe"] });
+  const exited = new Promise((resolve) => server.once("exit", resolve));
   const reader = new MessageReader();
   const received = [];
   let wake;
@@ -73,7 +74,7 @@ test("language server publishes diagnostics for an open document", { timeout: 50
       method: "textDocument/didChange",
       params: {
         textDocument: { uri: "file:///diagnostic.orvi", version: 2 },
-        contentChanges: [{ text: "let answer = 42;" }],
+        contentChanges: [{ text: "let answer = 42; print(answer);" }],
       },
     });
     const corrected = await waitFor(
@@ -81,6 +82,39 @@ test("language server publishes diagnostics for an open document", { timeout: 50
         && message.params.version === 2,
     );
     assert.deepEqual(corrected.params.diagnostics, []);
+
+    send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "textDocument/completion",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 0 },
+      },
+    });
+    const completion = await waitFor((message) => message.id === 2);
+    assert.ok(completion.result.some((item) => item.label === "print"));
+
+    send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "textDocument/hover",
+      params: {
+        textDocument: { uri: "file:///diagnostic.orvi" },
+        position: { line: 0, character: 19 },
+      },
+    });
+    const hover = await waitFor((message) => message.id === 3);
+    assert.match(hover.result.contents.value, /standard output/);
+
+    send({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "textDocument/semanticTokens/full",
+      params: { textDocument: { uri: "file:///diagnostic.orvi" } },
+    });
+    const semanticTokens = await waitFor((message) => message.id === 4);
+    assert.ok(semanticTokens.result.data.length > 0);
 
     send({
       jsonrpc: "2.0",
@@ -93,11 +127,13 @@ test("language server publishes diagnostics for an open document", { timeout: 50
     );
     assert.deepEqual(closed.params.diagnostics, []);
 
-    send({ jsonrpc: "2.0", id: 2, method: "shutdown", params: null });
-    await waitFor((message) => message.id === 2);
+    send({ jsonrpc: "2.0", id: 5, method: "shutdown", params: null });
+    await waitFor((message) => message.id === 5);
     send({ jsonrpc: "2.0", method: "exit", params: null });
-  } finally {
     server.stdin.end();
-    server.kill();
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2000))]);
+  } finally {
+    if (!server.stdin.destroyed) server.stdin.end();
+    if (server.exitCode === null) server.kill();
   }
 });

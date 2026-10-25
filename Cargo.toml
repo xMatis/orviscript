@@ -3,6 +3,7 @@ members = [
     "crates/orvi-cli",
     "crates/orvi-lsp",
     "crates/orvi-runtime",
+    "crates/orvi-sema",
     "crates/orvi-syntax",
 ]
 resolver = "3"

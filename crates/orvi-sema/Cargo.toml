@@ -1,0 +1,14 @@
+[package]
+name = "orvi-sema"
+version = "0.1.0"
+description = "Semantic analysis for OrviScript"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+orvi-syntax = { path = "../orvi-syntax" }

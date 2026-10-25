@@ -66,17 +66,28 @@ class LanguageServerConnection {
       this.output.appendLine(`Language server stopped (code ${code}, signal ${signal ?? "none"})`);
     });
 
-    await this.request("initialize", {
+    const initialization = await this.request("initialize", {
       processId: process.pid,
       clientInfo: { name: "OrviScript VS Code", version: "0.1.0" },
       rootUri: vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? null,
       capabilities: {
         general: { positionEncodings: ["utf-16"] },
-        textDocument: { publishDiagnostics: { versionSupport: true } },
+        textDocument: {
+          completion: { completionItem: {} },
+          hover: { contentFormat: ["markdown", "plaintext"] },
+          publishDiagnostics: { versionSupport: true },
+          semanticTokens: {
+            requests: { full: true },
+            tokenTypes: ["variable", "function", "parameter", "keyword", "string", "number", "comment", "operator"],
+            tokenModifiers: ["declaration", "readonly", "defaultLibrary"],
+            formats: ["relative"],
+          },
+        },
       },
     });
     this.notify("initialized", {});
     this.ready = true;
+    this.registerLanguageFeatures(initialization.capabilities);
 
     for (const document of vscode.workspace.textDocuments) this.open(document);
     this.disposables.push(
@@ -112,6 +123,59 @@ class LanguageServerConnection {
       textDocument: { uri: document.uri.toString() },
     });
     this.diagnostics.delete(document.uri);
+  }
+
+  registerLanguageFeatures(capabilities) {
+    const selector = { language: "orviscript" };
+
+    if (capabilities.completionProvider) {
+      this.disposables.push(vscode.languages.registerCompletionItemProvider(selector, {
+        provideCompletionItems: async (document, position) => {
+          const response = await this.request("textDocument/completion", documentPosition(document, position));
+          const items = Array.isArray(response) ? response : response?.items ?? [];
+          return items.map((item) => {
+            const completion = new vscode.CompletionItem(item.label, completionKind(item.kind));
+            completion.detail = item.detail;
+            completion.documentation = item.documentation?.value ?? item.documentation;
+            completion.insertText = item.insertText;
+            return completion;
+          });
+        },
+      }));
+    }
+
+    if (capabilities.hoverProvider) {
+      this.disposables.push(vscode.languages.registerHoverProvider(selector, {
+        provideHover: async (document, position) => {
+          const response = await this.request("textDocument/hover", documentPosition(document, position));
+          if (!response) return undefined;
+          const value = response.contents?.value ?? response.contents;
+          const range = response.range && new vscode.Range(
+            response.range.start.line,
+            response.range.start.character,
+            response.range.end.line,
+            response.range.end.character,
+          );
+          return new vscode.Hover(new vscode.MarkdownString(value), range);
+        },
+      }));
+    }
+
+    const semantic = capabilities.semanticTokensProvider;
+    if (semantic?.legend) {
+      const legend = new vscode.SemanticTokensLegend(
+        semantic.legend.tokenTypes,
+        semantic.legend.tokenModifiers,
+      );
+      this.disposables.push(vscode.languages.registerDocumentSemanticTokensProvider(selector, {
+        provideDocumentSemanticTokens: async (document) => {
+          const response = await this.request("textDocument/semanticTokens/full", {
+            textDocument: { uri: document.uri.toString() },
+          });
+          return new vscode.SemanticTokens(Uint32Array.from(response?.data ?? []), response?.resultId);
+        },
+      }, legend));
+    }
   }
 
   handleMessage(message) {
@@ -207,6 +271,24 @@ function resolveServer(extensionPath) {
   const executable = process.platform === "win32" ? "orvi-lsp.exe" : "orvi-lsp";
   const repositoryBuild = path.resolve(extensionPath, "..", "..", "target", "debug", executable);
   return fs.existsSync(repositoryBuild) ? repositoryBuild : "orvi-lsp";
+}
+
+function documentPosition(document, position) {
+  return {
+    textDocument: { uri: document.uri.toString() },
+    position: { line: position.line, character: position.character },
+  };
+}
+
+function completionKind(kind) {
+  const kinds = {
+    3: vscode.CompletionItemKind.Function,
+    6: vscode.CompletionItemKind.Variable,
+    12: vscode.CompletionItemKind.Value,
+    14: vscode.CompletionItemKind.Keyword,
+    21: vscode.CompletionItemKind.Constant,
+  };
+  return kinds[kind] ?? vscode.CompletionItemKind.Text;
 }
 
 module.exports = { activate, deactivate };

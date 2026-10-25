@@ -13,5 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 orvi-runtime = { path = "../orvi-runtime" }
+orvi-sema = { path = "../orvi-sema" }
 orvi-syntax = { path = "../orvi-syntax" }
 

@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use orvi_syntax::{Span, parse};
+use orvi_sema::analyze;
+use orvi_syntax::{Span, TokenKind, lex, parse};
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, InitializeResult, InitializedParams, MessageType,
-    Position, Range, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, MarkupContent, MarkupKind, MessageType,
+    Position, Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, WorkDoneProgressOptions,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -37,6 +42,14 @@ impl Backend {
             .publish_diagnostics(uri, diagnostics(source), version)
             .await;
     }
+
+    fn document(&self, uri: &tower_lsp_server::ls_types::Uri) -> Option<String> {
+        self.documents
+            .read()
+            .expect("document store lock poisoned")
+            .get(&uri.to_string())
+            .cloned()
+    }
 }
 
 impl LanguageServer for Backend {
@@ -46,6 +59,9 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                completion_provider: Some(CompletionOptions::default()),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(semantic_tokens_options().into()),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -97,11 +113,39 @@ impl LanguageServer for Backend {
             .remove(&uri.to_string());
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
+
+    async fn completion(&self, _: CompletionParams) -> Result<Option<CompletionResponse>> {
+        Ok(Some(CompletionResponse::Array(completion_items())))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let document = params.text_document_position_params.text_document;
+        let Some(source) = self.document(&document.uri) else {
+            return Ok(None);
+        };
+        Ok(hover_at(
+            &source,
+            params.text_document_position_params.position,
+        ))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let Some(source) = self.document(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: semantic_tokens(&source),
+        })))
+    }
 }
 
 pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
     let parsed = parse(source);
-    parsed
+    let mut diagnostics = parsed
         .lexical_errors
         .iter()
         .map(|error| diagnostic(source, error.span, error.to_string()))
@@ -111,7 +155,234 @@ pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
                 .iter()
                 .map(|error| diagnostic(source, error.span, error.message.clone())),
         )
-        .collect()
+        .collect::<Vec<_>>();
+    if !parsed.has_errors() {
+        diagnostics.extend(
+            analyze(&parsed.program)
+                .into_iter()
+                .map(|error| diagnostic(source, error.span, error.message)),
+        );
+    }
+    diagnostics
+}
+
+fn semantic_tokens_options() -> SemanticTokensOptions {
+    SemanticTokensOptions {
+        work_done_progress_options: WorkDoneProgressOptions::default(),
+        legend: semantic_tokens_legend(),
+        range: Some(false),
+        full: Some(SemanticTokensFullOptions::Bool(true)),
+    }
+}
+
+pub fn semantic_tokens_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::COMMENT,
+            SemanticTokenType::OPERATOR,
+        ],
+        token_modifiers: vec![
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::READONLY,
+            SemanticTokenModifier::DEFAULT_LIBRARY,
+        ],
+    }
+}
+
+pub fn semantic_tokens(source: &str) -> Vec<SemanticToken> {
+    let lexed = lex(source);
+    let significant = lexed
+        .tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !matches!(token.kind, TokenKind::Whitespace | TokenKind::EndOfFile))
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    let mut previous_line = 0;
+    let mut previous_start = 0;
+    let mut in_parameters = false;
+    let mut expects_parameters = false;
+
+    for (position_in_significant, (_, token)) in significant.iter().enumerate() {
+        let previous = position_in_significant
+            .checked_sub(1)
+            .and_then(|index| significant.get(index))
+            .map(|(_, token)| token.kind);
+        let next = significant
+            .get(position_in_significant + 1)
+            .map(|(_, token)| token.kind);
+
+        if token.kind == TokenKind::Fn {
+            expects_parameters = true;
+        } else if expects_parameters && token.kind == TokenKind::LeftParenthesis {
+            in_parameters = true;
+            expects_parameters = false;
+        } else if in_parameters && token.kind == TokenKind::RightParenthesis {
+            in_parameters = false;
+        }
+
+        let text = token.text(source).unwrap_or_default();
+        let classification = classify_token(token.kind, previous, next, in_parameters, text);
+        let Some((token_type, modifiers)) = classification else {
+            continue;
+        };
+        let start = position(source, token.span.start());
+        let end = position(source, token.span.end());
+        if start.line != end.line {
+            continue;
+        }
+        result.push(SemanticToken {
+            delta_line: start.line - previous_line,
+            delta_start: if start.line == previous_line {
+                start.character - previous_start
+            } else {
+                start.character
+            },
+            length: end.character - start.character,
+            token_type,
+            token_modifiers_bitset: modifiers,
+        });
+        previous_line = start.line;
+        previous_start = start.character;
+    }
+    result
+}
+
+fn classify_token(
+    kind: TokenKind,
+    previous: Option<TokenKind>,
+    next: Option<TokenKind>,
+    in_parameters: bool,
+    text: &str,
+) -> Option<(u32, u32)> {
+    const DECLARATION: u32 = 1;
+    const READONLY: u32 = 2;
+    const DEFAULT_LIBRARY: u32 = 4;
+
+    let classification = match kind {
+        TokenKind::Identifier if previous == Some(TokenKind::Fn) => (1, DECLARATION),
+        TokenKind::Identifier if in_parameters => (2, DECLARATION),
+        TokenKind::Identifier if previous == Some(TokenKind::Let) => (0, DECLARATION),
+        TokenKind::Identifier if previous == Some(TokenKind::Const) => (0, DECLARATION | READONLY),
+        TokenKind::Identifier if text == "print" => (1, DEFAULT_LIBRARY),
+        TokenKind::Identifier if next == Some(TokenKind::LeftParenthesis) => (1, 0),
+        TokenKind::Identifier => (0, 0),
+        TokenKind::Let
+        | TokenKind::Const
+        | TokenKind::Fn
+        | TokenKind::If
+        | TokenKind::Else
+        | TokenKind::While
+        | TokenKind::Return
+        | TokenKind::True
+        | TokenKind::False
+        | TokenKind::Null => (3, 0),
+        TokenKind::String => (4, 0),
+        TokenKind::Integer | TokenKind::Float => (5, 0),
+        TokenKind::LineComment => (6, 0),
+        TokenKind::Plus
+        | TokenKind::PlusEqual
+        | TokenKind::Minus
+        | TokenKind::MinusEqual
+        | TokenKind::Arrow
+        | TokenKind::Star
+        | TokenKind::StarEqual
+        | TokenKind::StarStar
+        | TokenKind::Slash
+        | TokenKind::SlashEqual
+        | TokenKind::Percent
+        | TokenKind::Equal
+        | TokenKind::EqualEqual
+        | TokenKind::FatArrow
+        | TokenKind::Bang
+        | TokenKind::BangEqual
+        | TokenKind::Less
+        | TokenKind::LessEqual
+        | TokenKind::Greater
+        | TokenKind::GreaterEqual
+        | TokenKind::AmpersandAmpersand
+        | TokenKind::PipePipe
+        | TokenKind::Question
+        | TokenKind::DotDot
+        | TokenKind::DotDotEqual => (7, 0),
+        _ => return None,
+    };
+    Some(classification)
+}
+
+fn completion_items() -> Vec<CompletionItem> {
+    [
+        (
+            "let",
+            CompletionItemKind::KEYWORD,
+            "mutable variable declaration",
+        ),
+        (
+            "const",
+            CompletionItemKind::KEYWORD,
+            "immutable variable declaration",
+        ),
+        ("fn", CompletionItemKind::KEYWORD, "function declaration"),
+        ("if", CompletionItemKind::KEYWORD, "conditional branch"),
+        ("else", CompletionItemKind::KEYWORD, "alternative branch"),
+        ("while", CompletionItemKind::KEYWORD, "loop"),
+        (
+            "return",
+            CompletionItemKind::KEYWORD,
+            "return from a function",
+        ),
+        ("true", CompletionItemKind::CONSTANT, "boolean value"),
+        ("false", CompletionItemKind::CONSTANT, "boolean value"),
+        ("null", CompletionItemKind::CONSTANT, "null value"),
+        (
+            "print",
+            CompletionItemKind::FUNCTION,
+            "built-in output function",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, kind, detail)| CompletionItem {
+        label: label.into(),
+        kind: Some(kind),
+        detail: Some(detail.into()),
+        ..CompletionItem::default()
+    })
+    .collect()
+}
+
+fn hover_at(source: &str, position: Position) -> Option<Hover> {
+    let offset = offset_at_position(source, position)?;
+    let token = lex(source)
+        .tokens
+        .into_iter()
+        .find(|token| token.span.start() <= offset && offset < token.span.end())?;
+    let text = token.text(source)?;
+    let description = match text {
+        "let" => "`let` declares a mutable variable.",
+        "const" => "`const` declares an immutable variable.",
+        "fn" => "`fn` declares a function.",
+        "if" => "`if` executes a branch when its condition is `true`.",
+        "else" => "`else` provides an alternative branch.",
+        "while" => "`while` repeats a block while its condition is `true`.",
+        "return" => "`return` exits the current function.",
+        "true" | "false" => "Built-in boolean value.",
+        "null" => "Built-in null value.",
+        "print" => "`print(...)` writes its arguments to standard output.",
+        _ => return None,
+    };
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: description.into(),
+        }),
+        range: Some(span_range(source, token.span)),
+    })
 }
 
 fn diagnostic(source: &str, span: Span, message: String) -> Diagnostic {
@@ -150,11 +421,29 @@ fn position(source: &str, offset: usize) -> Position {
     Position::new(line, character)
 }
 
+fn offset_at_position(source: &str, position: Position) -> Option<usize> {
+    let line = source.split_inclusive('\n').nth(position.line as usize)?;
+    let line_start = line.as_ptr() as usize - source.as_ptr() as usize;
+    let mut utf16_units = 0_u32;
+    for (byte_offset, character) in line.char_indices() {
+        if utf16_units == position.character {
+            return Some(line_start + byte_offset);
+        }
+        utf16_units += character.len_utf16() as u32;
+        if utf16_units > position.character {
+            return None;
+        }
+    }
+    (utf16_units == position.character).then_some(line_start + line.len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{diagnostics, span_range};
+    use super::{completion_items, diagnostics, hover_at, semantic_tokens, span_range};
     use orvi_syntax::Span;
-    use tower_lsp_server::ls_types::{DiagnosticSeverity, Position, Range};
+    use tower_lsp_server::ls_types::{
+        CompletionItemKind, DiagnosticSeverity, HoverContents, Position, Range,
+    };
 
     #[test]
     fn reports_parser_errors_from_shared_frontend() {
@@ -172,6 +461,14 @@ mod tests {
     }
 
     #[test]
+    fn reports_semantic_errors_from_shared_analyzer() {
+        let diagnostics = diagnostics("let answer = missing;");
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "undefined name 'missing'");
+    }
+
+    #[test]
     fn converts_utf8_offsets_to_utf16_lsp_positions() {
         let source = "let face = \"😀\";\n@";
         let emoji_start = source.find('😀').expect("emoji offset");
@@ -185,5 +482,43 @@ mod tests {
             Range::new(Position::new(0, 12), Position::new(0, 14))
         );
         assert_eq!(diagnostics(source)[0].range.start, Position::new(1, 0));
+    }
+
+    #[test]
+    fn classifies_semantic_tokens_and_modifiers() {
+        let tokens = semantic_tokens("const limit = 3; fn add(value) { return value + limit; }");
+
+        assert!(tokens.iter().any(|token| token.token_type == 1));
+        assert!(tokens.iter().any(|token| token.token_type == 2));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.token_modifiers_bitset & 1 == 1)
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.token_modifiers_bitset & 2 == 2)
+        );
+    }
+
+    #[test]
+    fn offers_implemented_keywords_and_builtin() {
+        let items = completion_items();
+
+        assert!(items.iter().any(|item| item.label == "let"));
+        assert!(items.iter().any(|item| {
+            item.label == "print" && item.kind == Some(CompletionItemKind::FUNCTION)
+        }));
+        assert!(!items.iter().any(|item| item.label == "struct"));
+    }
+
+    #[test]
+    fn explains_builtin_on_hover() {
+        let hover = hover_at("print(42);", Position::new(0, 2)).expect("hover result");
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(contents.value.contains("standard output"));
     }
 }

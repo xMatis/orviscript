@@ -10,7 +10,7 @@
     "onLanguage:orviscript"
   ],
   "scripts": {
-    "check": "cargo build --manifest-path ../../Cargo.toml --bin orvi-lsp && node --check extension.js && node --check protocol.mjs && node validate.mjs && node --test test/*.test.mjs"
+    "check": "cargo build --manifest-path ../../Cargo.toml --bin orvi-lsp && node --check extension.js && node --check protocol.mjs && node validate.mjs && node --test --test-concurrency=1 test/*.test.mjs"
   },
   "engines": {
     "vscode": "^1.85.0"

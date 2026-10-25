@@ -48,3 +48,12 @@ fn prints_positioned_syntax_diagnostics() {
     assert!(stderr.contains(":1:13: error: unexpected character '@'"));
     assert!(stderr.contains('^'));
 }
+
+#[test]
+fn prints_semantic_diagnostics() {
+    let path = source_file("let value = missing;");
+    let output = run(&["check", path.to_str().expect("UTF-8 temporary path")]);
+    fs::remove_file(path).expect("temporary source can be removed");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error: undefined name 'missing'"));
+}

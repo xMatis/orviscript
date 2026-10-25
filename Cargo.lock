@@ -196,6 +196,7 @@ name = "orvi-cli"
 version = "0.1.0"
 dependencies = [
  "orvi-runtime",
+ "orvi-sema",
  "orvi-syntax",
 ]
 
@@ -203,6 +204,7 @@ dependencies = [
 name = "orvi-lsp"
 version = "0.1.0"
 dependencies = [
+ "orvi-sema",
  "orvi-syntax",
  "tokio",
  "tower-lsp-server",
@@ -210,6 +212,13 @@ dependencies = [
 
 [[package]]
 name = "orvi-runtime"
+version = "0.1.0"
+dependencies = [
+ "orvi-syntax",
+]
+
+[[package]]
+name = "orvi-sema"
 version = "0.1.0"
 dependencies = [
  "orvi-syntax",

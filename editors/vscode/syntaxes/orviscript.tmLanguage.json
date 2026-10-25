@@ -10,7 +10,8 @@
     { "include": "#constants" },
     { "include": "#functionDeclarations" },
     { "include": "#functionCalls" },
-    { "include": "#operators" }
+    { "include": "#operators" },
+    { "include": "#punctuation" }
   ],
   "repository": {
     "comments": {
@@ -40,8 +41,7 @@
     "keywords": {
       "patterns": [
         { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn)\\b" },
-        { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return)\\b" },
-        { "name": "keyword.other.orviscript", "match": "\\b(?:struct|match|async|await|parallel|task|using|defer)\\b" }
+        { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return)\\b" }
       ]
     },
     "constants": {
@@ -51,17 +51,23 @@
     },
     "functionDeclarations": {
       "patterns": [
-        { "name": "entity.name.function.orviscript", "match": "(?<=\\bfn\\s)[A-Za-z_][A-Za-z0-9_]*" }
+        { "name": "entity.name.function.orviscript", "match": "(?<=\\bfn\\s)[\\p{L}_][\\p{L}\\p{N}_]*" }
       ]
     },
     "functionCalls": {
       "patterns": [
-        { "name": "support.function.orviscript", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()" }
+        { "name": "support.function.orviscript", "match": "\\b[\\p{L}_][\\p{L}\\p{N}_]*(?=\\s*\\()" }
       ]
     },
     "operators": {
       "patterns": [
-        { "name": "keyword.operator.orviscript", "match": "(?:==|!=|<=|>=|&&|\\|\\||->|=>|\\+|-|\\*|/|%|=|!|<|>)" }
+        { "name": "keyword.operator.orviscript", "match": "(?:==|!=|<=|>=|&&|\\|\\||\\+|-|\\*|/|%|=|!|<|>)" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.separator.orviscript", "match": "[,;]" },
+        { "name": "punctuation.section.group.orviscript", "match": "[(){}\\[\\]]" }
       ]
     }
   }

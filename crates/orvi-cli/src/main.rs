@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use orvi_runtime::execute;
+use orvi_sema::analyze;
 use orvi_syntax::{Span, line_column, parse};
 
 const HELP: &str = "OrviScript
@@ -14,7 +15,7 @@ Usage: orviscript [OPTIONS]
 
 Commands:
   run <FILE>    Run an OrviScript program
-  check <FILE>  Check an OrviScript program for syntax errors
+  check <FILE>  Check an OrviScript program for syntax and semantic errors
 
 Options:
   -h, --help     Print help
@@ -71,7 +72,10 @@ fn check_file(path: &Path) -> ExitCode {
     let Some((source, parsed)) = load_and_parse(path) else {
         return ExitCode::from(1);
     };
-    if report_syntax_errors(path, &source, &parsed) {
+    let has_syntax_errors = report_syntax_errors(path, &source, &parsed);
+    let has_semantic_errors =
+        !has_syntax_errors && report_semantic_errors(path, &source, &parsed.program);
+    if has_syntax_errors || has_semantic_errors {
         ExitCode::from(1)
     } else {
         println!("Check passed: {}", path.display());
@@ -84,6 +88,9 @@ fn run_file(path: &Path) -> ExitCode {
         return ExitCode::from(1);
     };
     if report_syntax_errors(path, &source, &parsed) {
+        return ExitCode::from(1);
+    }
+    if report_semantic_errors(path, &source, &parsed.program) {
         return ExitCode::from(1);
     }
     match execute(&parsed.program) {
@@ -121,6 +128,14 @@ fn report_syntax_errors(path: &Path, source: &str, parsed: &orvi_syntax::Parsed)
         report_error(path, source, error.span, &error.message);
     }
     parsed.has_errors()
+}
+
+fn report_semantic_errors(path: &Path, source: &str, program: &orvi_syntax::Program) -> bool {
+    let errors = analyze(program);
+    for error in &errors {
+        report_error(path, source, error.span, &error.message);
+    }
+    !errors.is_empty()
 }
 
 fn report_error(path: &Path, source: &str, span: Span, message: &str) {
