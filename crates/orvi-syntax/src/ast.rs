@@ -73,9 +73,15 @@ pub struct Expression {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpressionKind {
     Literal(Literal),
+    List(Vec<Expression>),
     Variable(Identifier),
     Assign {
         name: Identifier,
+        value: Box<Expression>,
+    },
+    IndexAssign {
+        object: Box<Expression>,
+        index: Box<Expression>,
         value: Box<Expression>,
     },
     Unary {
@@ -90,6 +96,10 @@ pub enum ExpressionKind {
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
+    },
+    Index {
+        object: Box<Expression>,
+        index: Box<Expression>,
     },
 }
 

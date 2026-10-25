@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -15,6 +15,7 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     String(String),
+    List(Rc<RefCell<Vec<Value>>>),
     Function(Rc<UserFunction>),
     NativePrint,
 }
@@ -27,15 +28,7 @@ impl fmt::Debug for Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Null => formatter.write_str("null"),
-            Self::Bool(value) => write!(formatter, "{value}"),
-            Self::Integer(value) => write!(formatter, "{value}"),
-            Self::Float(value) => write!(formatter, "{value}"),
-            Self::String(value) => formatter.write_str(value),
-            Self::Function(function) => write!(formatter, "<fn {}>", function.name),
-            Self::NativePrint => formatter.write_str("<native fn print>"),
-        }
+        formatter.write_str(&format_value(self, &mut HashSet::new()))
     }
 }
 
@@ -303,6 +296,13 @@ impl Interpreter {
                 Literal::Float(value) => Value::Float(*value),
                 Literal::String(value) => Value::String(value.clone()),
             }),
+            ExpressionKind::List(values) => {
+                let values = values
+                    .iter()
+                    .map(|value| self.evaluate(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::List(Rc::new(RefCell::new(values))))
+            }
             ExpressionKind::Variable(name) => {
                 self.environment.get(name.as_str()).ok_or_else(|| {
                     self.error(
@@ -329,6 +329,24 @@ impl Interpreter {
                             expression.span,
                         ),
                     })?;
+                Ok(value)
+            }
+            ExpressionKind::IndexAssign {
+                object,
+                index,
+                value,
+            } => {
+                let object = self.evaluate(object)?;
+                let index = self.list_index(index)?;
+                let value = self.evaluate(value)?;
+                let Value::List(values) = object else {
+                    return Err(self.error("value is not indexable", expression.span));
+                };
+                let mut values = values.borrow_mut();
+                let Some(slot) = values.get_mut(index) else {
+                    return Err(self.error("list index is out of bounds", expression.span));
+                };
+                *slot = value.clone();
                 Ok(value)
             }
             ExpressionKind::Unary { operator, operand } => {
@@ -360,6 +378,18 @@ impl Interpreter {
                     .map(|argument| self.evaluate(argument))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.call(callee, arguments, expression.span)
+            }
+            ExpressionKind::Index { object, index } => {
+                let object = self.evaluate(object)?;
+                let index = self.list_index(index)?;
+                let Value::List(values) = object else {
+                    return Err(self.error("value is not indexable", expression.span));
+                };
+                let value =
+                    values.borrow().get(index).cloned().ok_or_else(|| {
+                        self.error("list index is out of bounds", expression.span)
+                    })?;
+                Ok(value)
             }
         }
     }
@@ -545,6 +575,13 @@ impl Interpreter {
             Err(self.error("condition must be bool", span))
         }
     }
+    fn list_index(&mut self, expression: &Expression) -> Result<usize, RuntimeError> {
+        match self.evaluate(expression)? {
+            Value::Integer(value) => usize::try_from(value)
+                .map_err(|_| self.error("list index must be non-negative", expression.span)),
+            _ => Err(self.error("list index must be int", expression.span)),
+        }
+    }
     fn require_type(
         &self,
         value: &Value,
@@ -583,12 +620,21 @@ impl Value {
             Self::Integer(_) => "int",
             Self::Float(_) => "float",
             Self::String(_) => "string",
+            Self::List(_) => "list",
             Self::Function(_) | Self::NativePrint => "fn",
         }
     }
 }
 
 fn value_matches_type(value: &Value, type_annotation: &TypeAnnotation) -> bool {
+    value_matches_type_inner(value, type_annotation, &mut HashSet::new())
+}
+
+fn value_matches_type_inner(
+    value: &Value,
+    type_annotation: &TypeAnnotation,
+    visited: &mut HashSet<usize>,
+) -> bool {
     match type_annotation.name.as_str() {
         "any" => true,
         "null" => matches!(value, Value::Null),
@@ -597,6 +643,24 @@ fn value_matches_type(value: &Value, type_annotation: &TypeAnnotation) -> bool {
         "float" => matches!(value, Value::Float(_)),
         "number" => matches!(value, Value::Integer(_) | Value::Float(_)),
         "string" => matches!(value, Value::String(_)),
+        "list" => {
+            let Value::List(values) = value else {
+                return false;
+            };
+            let [element_type] = type_annotation.arguments.as_slice() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return true;
+            }
+            let matches = values
+                .borrow()
+                .iter()
+                .all(|value| value_matches_type_inner(value, element_type, visited));
+            visited.remove(&identity);
+            matches
+        }
         "fn" => matches!(value, Value::Function(_) | Value::NativePrint),
         _ => false,
     }
@@ -633,6 +697,10 @@ fn numbers(left: Value, right: Value) -> Option<(f64, f64)> {
 }
 
 fn values_equal(left: &Value, right: &Value) -> bool {
+    values_equal_inner(left, right, &mut HashSet::new())
+}
+
+fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize, usize)>) -> bool {
     match (left, right) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -641,8 +709,46 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Integer(a), Value::Float(b)) => *a as f64 == *b,
         (Value::Float(a), Value::Integer(b)) => *a == *b as f64,
         (Value::String(a), Value::String(b)) => a == b,
+        (Value::List(a), Value::List(b)) => {
+            let identity = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+            if !visited.insert(identity) {
+                return true;
+            }
+            let a = a.borrow();
+            let b = b.borrow();
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| values_equal_inner(a, b, visited))
+        }
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
+    }
+}
+
+fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Integer(value) => value.to_string(),
+        Value::Float(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::List(values) => {
+            let identity = Rc::as_ptr(values) as usize;
+            if !visited.insert(identity) {
+                return "<cycle>".into();
+            }
+            let formatted = values
+                .borrow()
+                .iter()
+                .map(|value| format_value(value, visited))
+                .collect::<Vec<_>>()
+                .join(", ");
+            visited.remove(&identity);
+            format!("[{formatted}]")
+        }
+        Value::Function(function) => format!("<fn {}>", function.name),
+        Value::NativePrint => "<native fn print>".into(),
     }
 }

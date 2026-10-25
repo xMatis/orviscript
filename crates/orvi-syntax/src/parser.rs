@@ -250,20 +250,28 @@ impl Parser<'_> {
         let expression = self.or()?;
         if self.consume(TokenKind::Equal) {
             let value = self.assignment()?;
-            if let ExpressionKind::Variable(name) = expression.kind {
-                let span = expression.span.cover(value.span);
-                return Ok(Expression {
+            let span = expression.span.cover(value.span);
+            return match expression.kind {
+                ExpressionKind::Variable(name) => Ok(Expression {
                     span,
                     kind: ExpressionKind::Assign {
                         name,
                         value: Box::new(value),
                     },
-                });
-            }
-            return Err(ParseError {
-                message: "invalid assignment target".into(),
-                span: expression.span,
-            });
+                }),
+                ExpressionKind::Index { object, index } => Ok(Expression {
+                    span,
+                    kind: ExpressionKind::IndexAssign {
+                        object,
+                        index,
+                        value: Box::new(value),
+                    },
+                }),
+                _ => Err(ParseError {
+                    message: "invalid assignment target".into(),
+                    span: expression.span,
+                }),
+            };
         }
         Ok(expression)
     }
@@ -363,26 +371,42 @@ impl Parser<'_> {
 
     fn call(&mut self) -> Result<Expression, ParseError> {
         let mut expression = self.primary()?;
-        while self.consume(TokenKind::LeftParenthesis) {
-            let mut arguments = Vec::new();
-            if !self.at(TokenKind::RightParenthesis) {
-                loop {
-                    arguments.push(self.expression()?);
-                    if !self.consume(TokenKind::Comma) {
-                        break;
+        loop {
+            if self.consume(TokenKind::LeftParenthesis) {
+                let mut arguments = Vec::new();
+                if !self.at(TokenKind::RightParenthesis) {
+                    loop {
+                        arguments.push(self.expression()?);
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
                     }
                 }
+                let end = self
+                    .expect(TokenKind::RightParenthesis, "expected ')' after arguments")?
+                    .span;
+                expression = Expression {
+                    span: expression.span.cover(end),
+                    kind: ExpressionKind::Call {
+                        callee: Box::new(expression),
+                        arguments,
+                    },
+                };
+            } else if self.consume(TokenKind::LeftBracket) {
+                let index = self.expression()?;
+                let end = self
+                    .expect(TokenKind::RightBracket, "expected ']' after index")?
+                    .span;
+                expression = Expression {
+                    span: expression.span.cover(end),
+                    kind: ExpressionKind::Index {
+                        object: Box::new(expression),
+                        index: Box::new(index),
+                    },
+                };
+            } else {
+                break;
             }
-            let end = self
-                .expect(TokenKind::RightParenthesis, "expected ')' after arguments")?
-                .span;
-            expression = Expression {
-                span: expression.span.cover(end),
-                kind: ExpressionKind::Call {
-                    callee: Box::new(expression),
-                    arguments,
-                },
-            };
         }
         Ok(expression)
     }
@@ -415,6 +439,24 @@ impl Parser<'_> {
                 let expression = self.expression()?;
                 self.expect(TokenKind::RightParenthesis, "expected ')' after expression")?;
                 return Ok(expression);
+            }
+            TokenKind::LeftBracket => {
+                let mut values = Vec::new();
+                if !self.at(TokenKind::RightBracket) {
+                    loop {
+                        values.push(self.expression()?);
+                        if !self.consume(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                let end = self
+                    .expect(TokenKind::RightBracket, "expected ']' after list")?
+                    .span;
+                return Ok(Expression {
+                    span: token.span.cover(end),
+                    kind: ExpressionKind::List(values),
+                });
             }
             _ => {
                 return Err(ParseError {

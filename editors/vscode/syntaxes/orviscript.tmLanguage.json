@@ -52,7 +52,7 @@
     },
     "types": {
       "patterns": [
-        { "name": "support.type.builtin.orviscript", "match": "\\b(?:any|bool|float|fn|int|null|number|string)\\b" }
+        { "name": "support.type.builtin.orviscript", "match": "\\b(?:any|bool|float|fn|int|list|null|number|string)\\b" }
       ]
     },
     "functionDeclarations": {

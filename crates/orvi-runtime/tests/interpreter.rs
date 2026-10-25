@@ -89,3 +89,34 @@ fn enforces_parameter_and_return_types() {
         "expected int, received string"
     );
 }
+
+#[test]
+fn reads_writes_and_compares_lists() {
+    let source = "let values: list<int> = [1, 2, 3]; values[1] = 7; print(values[1]); print(values == [1, 7, 3]); print(values)";
+    assert_eq!(
+        run(source).expect("program runs"),
+        ["7", "true", "[1, 7, 3]"]
+    );
+}
+
+#[test]
+fn reports_invalid_list_indices_and_element_types() {
+    assert_eq!(
+        run("let values = [1]; print(values[-1])").expect_err("negative index fails"),
+        "list index must be non-negative"
+    );
+    assert_eq!(
+        run("let values = [1]; print(values[1])").expect_err("large index fails"),
+        "list index is out of bounds"
+    );
+    assert_eq!(
+        run("let values: list<int> = [1, \"wrong\"]").expect_err("element type fails"),
+        "expected list<int>, received list"
+    );
+}
+
+#[test]
+fn formats_and_compares_cyclic_lists_safely() {
+    let source = "let left = [null]; left[0] = left; let right = [null]; right[0] = right; print(left); print(left == right)";
+    assert_eq!(run(source).expect("program runs"), ["[<cycle>]", "true"]);
+}

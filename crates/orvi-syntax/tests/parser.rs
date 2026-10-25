@@ -84,3 +84,27 @@ fn parses_binding_parameter_and_return_types() {
     );
     assert_eq!(return_type.name.name, "string");
 }
+
+#[test]
+fn parses_lists_indexing_and_index_assignment() {
+    let parsed = parse("let values: list<int> = [1, 2]; values[0] = values[1]");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Variable {
+        type_annotation: Some(annotation),
+        initializer,
+        ..
+    } = &parsed.program.statements[0].kind
+    else {
+        panic!("expected typed list declaration")
+    };
+    assert_eq!(annotation.name.name, "list");
+    assert_eq!(annotation.arguments[0].name.name, "int");
+    assert!(matches!(initializer.kind, ExpressionKind::List(_)));
+    let StatementKind::Expression(expression) = &parsed.program.statements[1].kind else {
+        panic!("expected assignment")
+    };
+    assert!(matches!(
+        expression.kind,
+        ExpressionKind::IndexAssign { .. }
+    ));
+}

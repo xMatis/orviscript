@@ -391,6 +391,14 @@ fn classify_token(
     const DEFAULT_LIBRARY: u32 = 4;
 
     let classification = match kind {
+        TokenKind::Identifier
+            if matches!(
+                text,
+                "any" | "bool" | "float" | "fn" | "int" | "list" | "number" | "string"
+            ) =>
+        {
+            (8, 0)
+        }
         TokenKind::Identifier if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) => {
             (8, 0)
         }
@@ -483,6 +491,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("string", CompletionItemKind::TYPE_PARAMETER, "string type"),
         ("bool", CompletionItemKind::TYPE_PARAMETER, "boolean type"),
         ("any", CompletionItemKind::TYPE_PARAMETER, "dynamic type"),
+        ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
     ]
     .into_iter()
     .map(|(label, kind, detail)| CompletionItem {

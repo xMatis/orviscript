@@ -72,6 +72,7 @@ enum StaticType {
     Float,
     Number,
     String,
+    List(Box<StaticType>),
     Function {
         parameters: Vec<StaticType>,
         result: Box<StaticType>,
@@ -290,6 +291,14 @@ impl Analyzer {
                 Literal::Float(_) => StaticType::Float,
                 Literal::String(_) => StaticType::String,
             },
+            ExpressionKind::List(values) => {
+                let mut element_type = StaticType::Dynamic;
+                for value in values {
+                    let next = self.expression(value);
+                    element_type = element_type.merge(&next);
+                }
+                StaticType::List(Box::new(element_type))
+            }
             ExpressionKind::Variable(name) => match self.resolve_reference(name) {
                 Some(symbol) => symbol.value_type,
                 None => {
@@ -315,6 +324,27 @@ impl Analyzer {
                     Some(symbol) => {
                         self.require_assignable(&symbol.value_type, &actual, value.span);
                         symbol.value_type
+                    }
+                }
+            }
+            ExpressionKind::IndexAssign {
+                object,
+                index,
+                value,
+            } => {
+                let object_type = self.expression(object);
+                let index_type = self.expression(index);
+                let value_type = self.expression(value);
+                self.require_assignable(&StaticType::Int, &index_type, index.span);
+                match object_type {
+                    StaticType::List(element_type) => {
+                        self.require_assignable(&element_type, &value_type, value.span);
+                        value_type
+                    }
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    _ => {
+                        self.type_error("value is not indexable", object.span);
+                        StaticType::Dynamic
                     }
                 }
             }
@@ -376,6 +406,19 @@ impl Analyzer {
                         self.type_error("value is not callable", callee.span);
                     }
                     StaticType::Dynamic
+                }
+            }
+            ExpressionKind::Index { object, index } => {
+                let object_type = self.expression(object);
+                let index_type = self.expression(index);
+                self.require_assignable(&StaticType::Int, &index_type, index.span);
+                match object_type {
+                    StaticType::List(element_type) => *element_type,
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    _ => {
+                        self.type_error("value is not indexable", object.span);
+                        StaticType::Dynamic
+                    }
                 }
             }
         }
@@ -492,7 +535,7 @@ impl Analyzer {
             });
             return Some(StaticType::Dynamic);
         };
-        if !annotation.arguments.is_empty() {
+        if annotation.name.as_str() != "list" && !annotation.arguments.is_empty() {
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::UnknownType,
                 message: format!(
@@ -534,6 +577,9 @@ impl StaticType {
     }
 
     fn accepts(&self, actual: &Self) -> bool {
+        if let (Self::List(expected), Self::List(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
         self == &Self::Dynamic
             || actual == &Self::Dynamic
             || self == actual
@@ -549,6 +595,7 @@ impl StaticType {
             Self::Float => "float".into(),
             Self::Number => "number".into(),
             Self::String => "string".into(),
+            Self::List(element) => format!("list<{}>", element.display_name()),
             Self::Function { parameters, result } => format!(
                 "fn({}) -> {}",
                 parameters
@@ -559,6 +606,19 @@ impl StaticType {
                 result.display_name()
             ),
         }
+    }
+
+    fn merge(&self, other: &Self) -> Self {
+        if self == &Self::Dynamic {
+            return other.clone();
+        }
+        if other == &Self::Dynamic || self == other {
+            return self.clone();
+        }
+        if self.is_numeric() && other.is_numeric() {
+            return Self::Number;
+        }
+        Self::Dynamic
     }
 }
 
@@ -571,6 +631,10 @@ fn static_type_from_annotation(annotation: &TypeAnnotation) -> Option<StaticType
         "float" => Some(StaticType::Float),
         "number" => Some(StaticType::Number),
         "string" => Some(StaticType::String),
+        "list" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0])
+                .map(|element| StaticType::List(Box::new(element)))
+        }
         "fn" => Some(StaticType::Function {
             parameters: Vec::new(),
             result: Box::new(StaticType::Dynamic),
@@ -667,5 +731,13 @@ mod tests {
         let errors = errors("let value: missing = 1;");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::UnknownType);
+    }
+
+    #[test]
+    fn checks_list_element_and_index_types() {
+        assert!(errors("let values: list<int> = [1, 2]; values[0] = 3;").is_empty());
+        let errors = errors("let values: list<int> = [1, 2]; values[0] = \"wrong\";");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, SemanticErrorKind::TypeMismatch);
     }
 }
