@@ -197,3 +197,30 @@ fn parses_named_imports() {
     );
     assert_eq!(source, "std:fs");
 }
+
+#[test]
+fn parses_task_dependencies_and_result_access() {
+    let parsed = parse(
+        "task deploy -> Result<string, string> { needs: [build, check]; return task.result(\"build\") }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Task {
+        name,
+        needs,
+        return_type,
+        body,
+    } = &parsed.program.statements[0].kind
+    else {
+        panic!("expected task declaration")
+    };
+    assert_eq!(name.name, "deploy");
+    assert_eq!(
+        needs
+            .iter()
+            .map(|name| name.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build", "check"]
+    );
+    assert_eq!(return_type.name.name, "Result");
+    assert_eq!(body.len(), 1);
+}

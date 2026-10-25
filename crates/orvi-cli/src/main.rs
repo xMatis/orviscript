@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use orvi_runtime::{ExecutionContext, execute_file};
+use orvi_runtime::{ExecutionContext, TaskStatus, execute_file, execute_tasks};
 use orvi_sema::analyze;
 use orvi_syntax::{Program, Span, StatementKind, format_source, line_column, parse};
 
@@ -17,9 +17,17 @@ Usage: orviscript [OPTIONS]
 Commands:
   run <FILE>    Run an OrviScript program
   check <FILE>  Check an OrviScript program for syntax and semantic errors
+  test <FILE>   Run tasks whose names start with test_
   fmt <FILE>    Format an OrviScript program in place
   fmt --check <FILE>
                 Check whether an OrviScript program is formatted
+  task link <ALIAS> <FILE>
+                Link an alias to an OrviScript task file
+  task list     List linked task aliases
+  task run <ALIAS>
+                Run the linked task named by the alias suffix
+  task unlink <ALIAS>
+                Remove a linked task alias
 
 Options:
   -h, --help     Print help
@@ -31,6 +39,11 @@ enum Command {
     Version,
     Run(PathBuf),
     Check(PathBuf),
+    Test(PathBuf),
+    TaskLink { alias: String, path: PathBuf },
+    TaskList,
+    TaskRun(String),
+    TaskUnlink(String),
     Format { path: PathBuf, check: bool },
 }
 
@@ -41,6 +54,20 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [argument] if argument == "-V" || argument == "--version" => Ok(Command::Version),
         [command, path] if command == "run" => Ok(Command::Run(PathBuf::from(path))),
         [command, path] if command == "check" => Ok(Command::Check(PathBuf::from(path))),
+        [command, path] if command == "test" => Ok(Command::Test(PathBuf::from(path))),
+        [command, action] if command == "task" && action == "list" => Ok(Command::TaskList),
+        [command, action, alias] if command == "task" && action == "run" => {
+            Ok(Command::TaskRun(alias.to_string_lossy().into_owned()))
+        }
+        [command, action, alias] if command == "task" && action == "unlink" => {
+            Ok(Command::TaskUnlink(alias.to_string_lossy().into_owned()))
+        }
+        [command, action, alias, path] if command == "task" && action == "link" => {
+            Ok(Command::TaskLink {
+                alias: alias.to_string_lossy().into_owned(),
+                path: PathBuf::from(path),
+            })
+        }
         [command, option] if command == "fmt" && option == "--check" => {
             Err("command 'fmt --check' requires a file".into())
         }
@@ -52,10 +79,14 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
             path: PathBuf::from(path),
             check: true,
         }),
-        [command] if command == "run" || command == "check" || command == "fmt" => Err(format!(
-            "command '{}' requires a file",
-            command.to_string_lossy()
-        )),
+        [command]
+            if command == "run" || command == "check" || command == "test" || command == "fmt" =>
+        {
+            Err(format!(
+                "command '{}' requires a file",
+                command.to_string_lossy()
+            ))
+        }
         [argument] => Err(format!(
             "unexpected argument '{}'",
             argument.to_string_lossy()
@@ -77,6 +108,11 @@ fn main() -> ExitCode {
         }
         Ok(Command::Check(path)) => check_file(&path),
         Ok(Command::Run(path)) => run_file(&path),
+        Ok(Command::Test(path)) => test_file(&path),
+        Ok(Command::TaskLink { alias, path }) => task_link(&alias, &path),
+        Ok(Command::TaskList) => task_list(),
+        Ok(Command::TaskRun(alias)) => task_run(&alias),
+        Ok(Command::TaskUnlink(alias)) => task_unlink(&alias),
         Ok(Command::Format { path, check }) => format_file(&path, check),
         Err(message) => {
             eprintln!("error: {message}\n\nFor usage information, try 'orviscript --help'.");
@@ -133,6 +169,320 @@ fn run_file(path: &Path) -> ExitCode {
         Ok(execution) => {
             for line in execution.output {
                 println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report_error(path, &source, error.span, &error.message);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn test_file(path: &Path) -> ExitCode {
+    let Some((source, parsed)) = load_and_parse(path) else {
+        return ExitCode::from(1);
+    };
+    if report_syntax_errors(path, &source, &parsed)
+        || report_semantic_errors(path, &source, &parsed.program)
+        || report_import_errors(path, &parsed.program)
+    {
+        return ExitCode::from(1);
+    }
+    let selected = parsed
+        .program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::Task { name, .. } if name.name.starts_with("test_") => {
+                Some(name.name.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        eprintln!("{}: error: no tasks with prefix 'test_'", path.display());
+        return ExitCode::from(1);
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let script_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let script_dir = script_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.clone());
+    let context = ExecutionContext {
+        cwd,
+        project_dir: find_project_dir(&script_dir),
+        script_dir,
+    };
+    match execute_tasks(&parsed.program, context, script_path, &selected) {
+        Ok(execution) => {
+            for line in execution.output {
+                println!("{line}");
+            }
+            let mut failed = false;
+            for report in execution
+                .tasks
+                .into_iter()
+                .filter(|report| selected.contains(&report.name))
+            {
+                let status = match report.status {
+                    TaskStatus::Succeeded => "passed",
+                    TaskStatus::Failed => {
+                        failed = true;
+                        "failed"
+                    }
+                    TaskStatus::Skipped => {
+                        failed = true;
+                        "skipped"
+                    }
+                    TaskStatus::Pending => "pending",
+                    TaskStatus::Running => "running",
+                };
+                println!("test {}: {status}", report.name);
+                if let Some(error) = report.error {
+                    eprintln!("  {error}");
+                }
+            }
+            if failed {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            report_error(path, &source, error.span, &error.message);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn registry_path() -> Result<PathBuf, String> {
+    if let Some(directory) = env::var_os("ORVISCRIPT_HOME") {
+        return Ok(PathBuf::from(directory).join("tasks.json"));
+    }
+    #[cfg(windows)]
+    let base = env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    base.map(|base| base.join("orviscript").join("tasks.json"))
+        .ok_or_else(|| "could not determine the OrviScript configuration directory".into())
+}
+
+fn load_registry(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("could not read task registry '{}': {error}", path.display()))?;
+    serde_json::from_str(&source)
+        .map_err(|error| format!("invalid task registry '{}': {error}", path.display()))
+}
+
+fn save_registry(path: &Path, registry: &BTreeMap<String, String>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "task registry path has no parent directory".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create task registry directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+    let source = serde_json::to_string_pretty(registry)
+        .map_err(|error| format!("could not encode task registry: {error}"))?;
+    fs::write(path, format!("{source}\n")).map_err(|error| {
+        format!(
+            "could not write task registry '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn valid_task_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.split('.').all(|part| {
+            !part.is_empty()
+                && part.chars().all(|character| {
+                    character.is_alphanumeric() || character == '_' || character == '-'
+                })
+        })
+}
+
+fn task_link(alias: &str, path: &Path) -> ExitCode {
+    if !valid_task_alias(alias) {
+        eprintln!("error: invalid task alias '{alias}'");
+        return ExitCode::from(1);
+    }
+    let canonical = match path.canonicalize() {
+        Ok(path) if path.extension().and_then(|extension| extension.to_str()) == Some("orvi") => {
+            path
+        }
+        Ok(_) => {
+            eprintln!("error: task file must end with '.orvi'");
+            return ExitCode::from(1);
+        }
+        Err(error) => {
+            eprintln!(
+                "error: could not resolve task file '{}': {error}",
+                path.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let Some((source, parsed)) = load_and_parse(&canonical) else {
+        return ExitCode::from(1);
+    };
+    if report_syntax_errors(&canonical, &source, &parsed)
+        || report_semantic_errors(&canonical, &source, &parsed.program)
+        || report_import_errors(&canonical, &parsed.program)
+    {
+        return ExitCode::from(1);
+    }
+    let task_name = alias.rsplit('.').next().expect("valid alias has a suffix");
+    if !parsed.program.statements.iter().any(|statement| {
+        matches!(&statement.kind, StatementKind::Task { name, .. } if name.name == task_name)
+    }) {
+        eprintln!(
+            "error: '{}' does not declare task '{task_name}'",
+            canonical.display()
+        );
+        return ExitCode::from(1);
+    }
+    let registry_path = match registry_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut registry = match load_registry(&registry_path) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if registry.contains_key(alias) {
+        eprintln!("error: task alias '{alias}' is already linked");
+        return ExitCode::from(1);
+    }
+    registry.insert(alias.into(), canonical.to_string_lossy().into_owned());
+    if let Err(error) = save_registry(&registry_path, &registry) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    println!("Linked {alias} -> {}", canonical.display());
+    ExitCode::SUCCESS
+}
+
+fn task_list() -> ExitCode {
+    let path = match registry_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match load_registry(&path) {
+        Ok(registry) => {
+            for (alias, script) in registry {
+                println!("{alias}\t{script}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn task_unlink(alias: &str) -> ExitCode {
+    let path = match registry_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut registry = match load_registry(&path) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    if registry.remove(alias).is_none() {
+        eprintln!("error: task alias '{alias}' is not linked");
+        return ExitCode::from(1);
+    }
+    if let Err(error) = save_registry(&path, &registry) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    println!("Unlinked {alias}");
+    ExitCode::SUCCESS
+}
+
+fn task_run(alias: &str) -> ExitCode {
+    let path = match registry_path().and_then(|path| load_registry(&path)) {
+        Ok(registry) => match registry.get(alias) {
+            Some(path) => PathBuf::from(path),
+            None => {
+                eprintln!("error: task alias '{alias}' is not linked");
+                return ExitCode::from(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let task_name = alias.rsplit('.').next().unwrap_or(alias).to_owned();
+    run_named_task(&path, &task_name)
+}
+
+fn run_named_task(path: &Path, task_name: &str) -> ExitCode {
+    let Some((source, parsed)) = load_and_parse(path) else {
+        return ExitCode::from(1);
+    };
+    if report_syntax_errors(path, &source, &parsed)
+        || report_semantic_errors(path, &source, &parsed.program)
+        || report_import_errors(path, &parsed.program)
+    {
+        return ExitCode::from(1);
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let script_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let script_dir = script_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.clone());
+    let context = ExecutionContext {
+        cwd,
+        project_dir: find_project_dir(&script_dir),
+        script_dir,
+    };
+    let selected = [task_name.to_owned()];
+    match execute_tasks(&parsed.program, context, script_path, &selected) {
+        Ok(execution) => {
+            for line in execution.output {
+                println!("{line}");
+            }
+            for report in execution.tasks {
+                if report.status == TaskStatus::Pending {
+                    continue;
+                }
+                println!("task {}: {:?}", report.name, report.status);
+                if let Some(error) = report.error {
+                    eprintln!("  {error}");
+                }
+                if report.name == task_name && report.status != TaskStatus::Succeeded {
+                    return ExitCode::from(1);
+                }
             }
             ExitCode::SUCCESS
         }
@@ -369,6 +719,21 @@ mod tests {
         assert_eq!(
             parse_arguments(&[OsString::from("check"), OsString::from("app.orvi")]),
             Ok(Command::Check(PathBuf::from("app.orvi")))
+        );
+    }
+    #[test]
+    fn parses_task_registry_commands() {
+        assert_eq!(
+            parse_arguments(&[OsString::from("task"), OsString::from("list")]),
+            Ok(Command::TaskList)
+        );
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("task"),
+                OsString::from("run"),
+                OsString::from("hosting.deploy"),
+            ]),
+            Ok(Command::TaskRun("hosting.deploy".into()))
         );
     }
     #[test]

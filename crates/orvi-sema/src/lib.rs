@@ -34,6 +34,7 @@ pub enum SymbolKind {
     Struct,
     Interface,
     Import,
+    Task,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,12 +121,77 @@ pub fn analyze_program(program: &Program) -> Analysis {
         structs: HashMap::new(),
         interface_names,
         interfaces: HashMap::new(),
+        task_names: program
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StatementKind::Task { name, .. } => Some(name.name.clone()),
+                _ => None,
+            })
+            .collect(),
+        current_task_needs: None,
     };
     analyzer.statements(&program.statements, false);
+    analyzer.errors.extend(task_cycle_errors(program));
     Analysis {
         errors: analyzer.errors,
         symbols: analyzer.symbols,
     }
+}
+
+fn task_cycle_errors(program: &Program) -> Vec<SemanticError> {
+    fn visit(
+        name: &str,
+        tasks: &HashMap<String, (Vec<String>, Span)>,
+        states: &mut HashMap<String, u8>,
+        errors: &mut Vec<SemanticError>,
+    ) {
+        match states.get(name) {
+            Some(1) => {
+                let span = tasks.get(name).map_or(Span::empty(0), |task| task.1);
+                errors.push(SemanticError {
+                    kind: SemanticErrorKind::TypeMismatch,
+                    message: format!("cyclic task dependency involving '{name}'"),
+                    span,
+                });
+                return;
+            }
+            Some(2) => return,
+            _ => {}
+        }
+        states.insert(name.to_owned(), 1);
+        if let Some((needs, _)) = tasks.get(name) {
+            for dependency in needs {
+                if tasks.contains_key(dependency) {
+                    visit(dependency, tasks, states, errors);
+                }
+            }
+        }
+        states.insert(name.to_owned(), 2);
+    }
+
+    let tasks = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::Task { name, needs, .. } => Some((
+                name.name.clone(),
+                (
+                    needs.iter().map(|need| need.name.clone()).collect(),
+                    name.span,
+                ),
+            )),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut states = HashMap::new();
+    let mut errors = Vec::new();
+    for statement in &program.statements {
+        if let StatementKind::Task { name, .. } = &statement.kind {
+            visit(&name.name, &tasks, &mut states, &mut errors);
+        }
+    }
+    errors
 }
 
 fn builtin_symbols() -> HashMap<String, Symbol> {
@@ -199,6 +265,7 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
         ("env".into(), module_symbol("env")),
         ("process".into(), module_symbol("process")),
         ("terminal".into(), module_symbol("terminal")),
+        ("task".into(), module_symbol("task")),
         (
             "context".into(),
             Symbol {
@@ -232,6 +299,8 @@ struct Analyzer {
     structs: HashMap<String, HashMap<String, StaticType>>,
     interface_names: HashSet<String>,
     interfaces: HashMap<String, HashMap<String, StaticType>>,
+    task_names: HashSet<String>,
+    current_task_needs: Option<HashSet<String>>,
 }
 
 impl Analyzer {
@@ -267,6 +336,21 @@ impl Analyzer {
                         },
                     );
                 }
+            }
+        }
+
+        for statement in statements {
+            if let StatementKind::Task { name, .. } = &statement.kind {
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Task,
+                        mutable: false,
+                        arity: None,
+                        definition: Some(name.span),
+                        value_type: StaticType::Dynamic,
+                    },
+                );
             }
         }
 
@@ -382,7 +466,10 @@ impl Analyzer {
         }
 
         for statement in statements {
-            if !matches!(&statement.kind, StatementKind::Function { .. }) {
+            if !matches!(
+                &statement.kind,
+                StatementKind::Function { .. } | StatementKind::Task { .. }
+            ) {
                 self.statement(statement);
             }
         }
@@ -396,6 +483,44 @@ impl Analyzer {
             } = &statement.kind
             {
                 self.function(parameters, return_type.as_ref(), body);
+            }
+        }
+
+        for statement in statements {
+            if let StatementKind::Task {
+                needs,
+                return_type,
+                body,
+                ..
+            } = &statement.kind
+            {
+                let task_return = self.annotation_type(Some(return_type));
+                if !matches!(
+                    task_return,
+                    Some(StaticType::Result(_, _)) | Some(StaticType::Dynamic)
+                ) {
+                    self.type_error("task return type must be Result<T, E>", return_type.span);
+                }
+                let mut dependencies = HashSet::new();
+                for dependency in needs {
+                    if !self.task_names.contains(dependency.as_str()) {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::UndefinedName,
+                            message: format!("undefined task dependency '{}'", dependency.name),
+                            span: dependency.span,
+                        });
+                    }
+                    if !dependencies.insert(dependency.name.clone()) {
+                        self.errors.push(SemanticError {
+                            kind: SemanticErrorKind::DuplicateName,
+                            message: format!("duplicate task dependency '{}'", dependency.name),
+                            span: dependency.span,
+                        });
+                    }
+                }
+                let previous = self.current_task_needs.replace(dependencies);
+                self.function(&[], Some(return_type), body);
+                self.current_task_needs = previous;
             }
         }
 
@@ -458,6 +583,7 @@ impl Analyzer {
             }
             StatementKind::Interface { .. } => {}
             StatementKind::Import { .. } => {}
+            StatementKind::Task { .. } => unreachable!("task bodies are analyzed last"),
             StatementKind::Block(statements) => self.statements(statements, true),
             StatementKind::If {
                 condition,
@@ -711,6 +837,7 @@ impl Analyzer {
                 self.binary_type(*operator, &left_type, &right_type, expression.span)
             }
             ExpressionKind::Call { callee, arguments } => {
+                self.check_task_result_access(callee, arguments, expression.span);
                 let callee_type = self.expression(callee);
                 let argument_types = arguments
                     .iter()
@@ -1048,6 +1175,46 @@ impl Analyzer {
         Some(symbol)
     }
 
+    fn check_task_result_access(
+        &mut self,
+        callee: &Expression,
+        arguments: &[Expression],
+        span: Span,
+    ) {
+        let ExpressionKind::Member { object, field } = &callee.kind else {
+            return;
+        };
+        let ExpressionKind::Variable(module) = &object.kind else {
+            return;
+        };
+        if module.name != "task" || field.name != "result" {
+            return;
+        }
+        let Some(needs) = &self.current_task_needs else {
+            self.type_error("task.result is only valid inside a task", span);
+            return;
+        };
+        let [
+            Expression {
+                kind: ExpressionKind::Literal(Literal::String(name)),
+                ..
+            },
+        ] = arguments
+        else {
+            self.type_error(
+                "task.result requires one string literal dependency name",
+                span,
+            );
+            return;
+        };
+        if !needs.contains(name) {
+            self.type_error(
+                format!("task.result('{name}') is not a declared dependency"),
+                span,
+            );
+        }
+    }
+
     fn undefined(&mut self, name: &Identifier) {
         self.errors.push(SemanticError {
             kind: SemanticErrorKind::UndefinedName,
@@ -1327,6 +1494,10 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             vec![StaticType::String],
             result_type(StaticType::Bool),
         )),
+        ("task", "result") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::Dynamic),
+        )),
         _ => None,
     }
 }
@@ -1363,7 +1534,11 @@ mod tests {
 
     fn errors(source: &str) -> Vec<super::SemanticError> {
         let parsed = parse(source);
-        assert!(!parsed.has_errors(), "test source must parse");
+        assert!(
+            !parsed.has_errors(),
+            "test source must parse: {:?}",
+            parsed.parse_errors
+        );
         analyze(&parsed.program)
     }
 
@@ -1556,5 +1731,36 @@ mod tests {
         let errors = errors("import { missing } from \"std:fs\";");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::UndefinedName);
+    }
+
+    #[test]
+    fn checks_task_results_and_dependencies() {
+        let source = r#"
+            task build -> Result<string, string> { return Ok("dist") }
+            task deploy -> Result<string, string> {
+                needs: [build];
+                return Ok(task.result("build")?);
+            }
+        "#;
+        assert!(errors(source).is_empty());
+
+        let errors =
+            errors("task bad -> int { needs: [missing]; task.result(\"other\"); return 1 }");
+        assert_eq!(errors.len(), 3);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("must be Result"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("undefined task"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("not a declared dependency"))
+        );
     }
 }

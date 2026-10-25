@@ -231,6 +231,7 @@ dependencies = [
  "orvi-runtime",
  "orvi-sema",
  "orvi-syntax",
+ "serde_json",
 ]
 
 [[package]]

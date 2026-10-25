@@ -93,6 +93,10 @@ impl Parser<'_> {
         if self.consume(TokenKind::Import) {
             return self.import_declaration();
         }
+        if self.at_task_declaration() {
+            self.advance();
+            return self.task_declaration();
+        }
         self.statement()
     }
 
@@ -243,6 +247,44 @@ impl Parser<'_> {
             kind: StatementKind::Import {
                 names,
                 source: unescape_string(source.text(self.source).unwrap_or_default()),
+            },
+        })
+    }
+
+    fn task_declaration(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let name = self.expect_identifier("expected task name")?;
+        self.expect(TokenKind::Arrow, "expected '->' after task name")?;
+        let return_type = self.type_annotation()?;
+        self.expect(TokenKind::LeftBrace, "expected '{' before task body")?;
+        let mut needs = Vec::new();
+        if self.at_identifier("needs") {
+            self.advance();
+            self.expect(TokenKind::Colon, "expected ':' after needs")?;
+            self.expect(TokenKind::LeftBracket, "expected '[' after needs:")?;
+            if !self.at(TokenKind::RightBracket) {
+                loop {
+                    needs.push(self.expect_identifier("expected task dependency")?);
+                    if !self.consume(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                TokenKind::RightBracket,
+                "expected ']' after task dependencies",
+            )?;
+            self.consume(TokenKind::Semicolon);
+        }
+        let body = self.block_contents()?;
+        let end = self.previous().span;
+        Ok(Statement {
+            span: start.cover(end),
+            kind: StatementKind::Task {
+                name,
+                needs,
+                return_type,
+                body,
             },
         })
     }
@@ -582,7 +624,7 @@ impl Parser<'_> {
                 })?))
             }
             TokenKind::String => ExpressionKind::Literal(Literal::String(unescape_string(text))),
-            TokenKind::Identifier => ExpressionKind::Variable(Identifier {
+            TokenKind::Identifier | TokenKind::Task => ExpressionKind::Variable(Identifier {
                 name: text.to_owned(),
                 span: token.span,
             }),
@@ -752,8 +794,36 @@ impl Parser<'_> {
         })
     }
 
+    fn at_identifier(&self, expected: &str) -> bool {
+        self.at(TokenKind::Identifier)
+            && self
+                .peek()
+                .text(self.source)
+                .is_some_and(|text| text == expected)
+    }
+
+    fn at_task_declaration(&self) -> bool {
+        self.at(TokenKind::Task)
+            && self.tokens.get(self.current + 1).map(|token| token.kind)
+                == Some(TokenKind::Identifier)
+            && self.tokens.get(self.current + 2).map(|token| token.kind) == Some(TokenKind::Arrow)
+    }
+
     fn type_annotation(&mut self) -> Result<TypeAnnotation, ParseError> {
-        let name = self.expect_identifier("expected type name")?;
+        let token = self.advance();
+        if !matches!(
+            token.kind,
+            TokenKind::Identifier | TokenKind::Null | TokenKind::Fn
+        ) {
+            return Err(ParseError {
+                message: "expected type name".into(),
+                span: token.span,
+            });
+        }
+        let name = Identifier {
+            name: token.text(self.source).unwrap_or_default().to_owned(),
+            span: token.span,
+        };
         let mut arguments = Vec::new();
         let mut end = name.span;
         if self.consume(TokenKind::Less) {

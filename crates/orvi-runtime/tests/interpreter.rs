@@ -1,4 +1,6 @@
-use orvi_runtime::{ExecutionContext, execute, execute_file, execute_with_context};
+use orvi_runtime::{
+    ExecutionContext, TaskStatus, execute, execute_file, execute_tasks, execute_with_context,
+};
 use orvi_syntax::parse;
 
 fn run(source: &str) -> Result<Vec<String>, String> {
@@ -312,4 +314,74 @@ fn imports_local_modules_once_and_standard_module_members() {
     )
     .expect("imports run");
     assert_eq!(execution.output, ["loaded", "42", "40", "true"]);
+}
+
+#[test]
+fn runs_task_dag_once_and_exposes_dependency_results() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let entry = directory.path().join("tasks.orvi");
+    let source = r#"
+        task build -> Result<string, string> {
+            print("build");
+            return Ok("dist");
+        }
+        task deploy -> Result<string, string> {
+            needs: [build];
+            let output = task.result("build")?;
+            print("deploy", output);
+            return Ok(output);
+        }
+    "#;
+    std::fs::write(&entry, source).expect("task source");
+    let parsed = parse(source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let execution = execute_tasks(
+        &parsed.program,
+        ExecutionContext {
+            cwd: directory.path().into(),
+            script_dir: directory.path().into(),
+            project_dir: directory.path().into(),
+        },
+        entry,
+        &["deploy".into()],
+    )
+    .expect("task execution");
+    assert_eq!(execution.output, ["build", "deploy dist"]);
+    assert_eq!(execution.tasks[0].status, TaskStatus::Succeeded);
+    assert_eq!(execution.tasks[1].status, TaskStatus::Succeeded);
+}
+
+#[test]
+fn skips_dependents_after_task_failure_and_rejects_cycles() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let entry = directory.path().join("tasks.orvi");
+    let source = r#"
+        task build -> Result<null, string> { return Err("failed") }
+        task deploy -> Result<null, string> { needs: [build]; print("must not run"); return Ok(null) }
+    "#;
+    let parsed = parse(source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let execution = execute_tasks(
+        &parsed.program,
+        ExecutionContext::default(),
+        entry.clone(),
+        &["deploy".into()],
+    )
+    .expect("failed tasks are reports");
+    assert!(execution.output.is_empty());
+    assert_eq!(execution.tasks[0].status, TaskStatus::Failed);
+    assert_eq!(execution.tasks[1].status, TaskStatus::Skipped);
+
+    let parsed = parse(
+        "task first -> Result<null, string> { needs: [second]; return Ok(null) } task second -> Result<null, string> { needs: [first]; return Ok(null) }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let error = execute_tasks(
+        &parsed.program,
+        ExecutionContext::default(),
+        entry,
+        &["first".into()],
+    )
+    .expect_err("task cycle must fail before execution");
+    assert!(error.message.contains("cyclic task dependency"));
 }

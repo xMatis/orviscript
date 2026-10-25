@@ -15,4 +15,5 @@ path = "src/main.rs"
 orvi-runtime = { path = "../orvi-runtime" }
 orvi-sema = { path = "../orvi-sema" }
 orvi-syntax = { path = "../orvi-syntax" }
+serde_json = "1.0"
 

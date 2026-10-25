@@ -1,0 +1,18 @@
+import {
+    artifact_path
+} from "./config.orvi";
+task build -> Result<string, string> {
+    let directory = path.join([context.project_dir, "dist"]);
+    let output = artifact_path();
+    fs.create_dir_all(directory)?;
+    fs.write_text(output, "built by OrviScript 0.3")?;
+    return Ok(output);
+}
+task test_artifact -> Result<null, string> {
+    needs: [build];
+    let output = task.result("build")?;
+    if ! fs.exists(output) {
+        return Err("artifact was not created");
+    }
+    return Ok(null);
+}

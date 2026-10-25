@@ -70,6 +70,38 @@ pub struct Execution {
     pub collected_objects: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskReport {
+    pub name: String,
+    pub status: TaskStatus,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskExecution {
+    pub output: Vec<String>,
+    pub tasks: Vec<TaskReport>,
+}
+
+#[derive(Clone)]
+struct TaskDefinition {
+    name: String,
+    needs: Vec<String>,
+    return_type: TypeAnnotation,
+    body: Vec<Statement>,
+    span: Span,
+}
+
 #[derive(Clone)]
 pub struct UserFunction {
     name: String,
@@ -114,6 +146,7 @@ pub enum NativeModule {
     Env,
     Process,
     Terminal,
+    Task,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +168,7 @@ pub enum NativeFunction {
     TerminalInput,
     TerminalConfirm,
     TerminalPassword,
+    TaskResult,
 }
 
 #[derive(Clone, Debug)]
@@ -307,81 +341,7 @@ fn execute_internal(
     context: ExecutionContext,
     entry_file: Option<PathBuf>,
 ) -> Result<Execution, RuntimeError> {
-    let globals = Environment::root();
-    globals.define("print".into(), Value::NativePrint, false, None);
-    globals.define(
-        "Some".into(),
-        Value::NativeConstructor(VariantTag::Some),
-        false,
-        None,
-    );
-    globals.define(
-        "None".into(),
-        Value::Variant {
-            tag: VariantTag::None,
-            payload: None,
-        },
-        false,
-        None,
-    );
-    globals.define(
-        "Ok".into(),
-        Value::NativeConstructor(VariantTag::Ok),
-        false,
-        None,
-    );
-    globals.define(
-        "Err".into(),
-        Value::NativeConstructor(VariantTag::Err),
-        false,
-        None,
-    );
-    globals.define(
-        "json".into(),
-        Value::NativeModule(NativeModule::Json),
-        false,
-        None,
-    );
-    for (name, module) in [
-        ("fs", NativeModule::Fs),
-        ("path", NativeModule::Path),
-        ("env", NativeModule::Env),
-        ("process", NativeModule::Process),
-        ("terminal", NativeModule::Terminal),
-    ] {
-        globals.define(name.into(), Value::NativeModule(module), false, None);
-    }
-    let context_value = Value::Map(Rc::new(RefCell::new(vec![
-        (
-            "cwd".into(),
-            Value::String(context.cwd.to_string_lossy().into_owned()),
-        ),
-        (
-            "script_dir".into(),
-            Value::String(context.script_dir.to_string_lossy().into_owned()),
-        ),
-        (
-            "project_dir".into(),
-            Value::String(context.project_dir.to_string_lossy().into_owned()),
-        ),
-    ])));
-    globals.define("context".into(), context_value, false, None);
-    let mut interpreter = Interpreter {
-        environment: globals.clone(),
-        globals: globals.clone(),
-        output: Vec::new(),
-        function_depth: 0,
-        environments: vec![Rc::downgrade(&globals.0)],
-        lists: Vec::new(),
-        maps: Vec::new(),
-        objects: Vec::new(),
-        collected_objects: 0,
-        deferred: vec![Vec::new()],
-        context,
-        current_files: entry_file.into_iter().collect(),
-        module_cache: HashMap::new(),
-        modules_in_progress: HashSet::new(),
-    };
+    let mut interpreter = Interpreter::new(context, entry_file);
     let result = interpreter.execute_statements(&program.statements);
     let cleanup = interpreter.run_deferred();
     let control = match result {
@@ -409,6 +369,26 @@ fn execute_internal(
     })
 }
 
+pub fn execute_tasks(
+    program: &Program,
+    context: ExecutionContext,
+    entry_file: PathBuf,
+    selected: &[String],
+) -> Result<TaskExecution, RuntimeError> {
+    let mut interpreter = Interpreter::new(context, Some(entry_file));
+    let control = interpreter.execute_statements(&program.statements)?;
+    if matches!(control, Control::Return(_)) {
+        return Err(interpreter.error("return is only valid inside a function", Span::empty(0)));
+    }
+    let tasks = collect_tasks(program)?;
+    let reports = interpreter.run_tasks(&tasks, selected)?;
+    interpreter.run_deferred()?;
+    Ok(TaskExecution {
+        output: interpreter.output,
+        tasks: reports,
+    })
+}
+
 struct Interpreter {
     environment: Environment,
     globals: Environment,
@@ -424,9 +404,154 @@ struct Interpreter {
     current_files: Vec<PathBuf>,
     module_cache: HashMap<PathBuf, Environment>,
     modules_in_progress: HashSet<PathBuf>,
+    task_results: HashMap<String, Value>,
+    active_task_needs: Option<HashSet<String>>,
+}
+
+fn collect_tasks(program: &Program) -> Result<Vec<TaskDefinition>, RuntimeError> {
+    let mut tasks = Vec::new();
+    let mut names = HashSet::new();
+    for statement in &program.statements {
+        let StatementKind::Task {
+            name,
+            needs,
+            return_type,
+            body,
+        } = &statement.kind
+        else {
+            continue;
+        };
+        if !names.insert(name.name.clone()) {
+            return Err(RuntimeError {
+                message: format!("task '{}' is already declared", name.name),
+                span: name.span,
+                propagated: None,
+            });
+        }
+        tasks.push(TaskDefinition {
+            name: name.name.clone(),
+            needs: needs.iter().map(|need| need.name.clone()).collect(),
+            return_type: return_type.clone(),
+            body: body.clone(),
+            span: statement.span,
+        });
+    }
+    Ok(tasks)
+}
+
+fn validate_task_cycles(
+    tasks: &[TaskDefinition],
+    definitions: &HashMap<String, TaskDefinition>,
+) -> Result<(), RuntimeError> {
+    fn visit(
+        name: &str,
+        definitions: &HashMap<String, TaskDefinition>,
+        states: &mut HashMap<String, u8>,
+    ) -> Result<(), RuntimeError> {
+        match states.get(name) {
+            Some(1) => {
+                let task = definitions.get(name).expect("task validated");
+                return Err(RuntimeError {
+                    message: format!("cyclic task dependency involving '{name}'"),
+                    span: task.span,
+                    propagated: None,
+                });
+            }
+            Some(2) => return Ok(()),
+            _ => {}
+        }
+        states.insert(name.to_owned(), 1);
+        let task = definitions.get(name).expect("task validated");
+        for dependency in &task.needs {
+            visit(dependency, definitions, states)?;
+        }
+        states.insert(name.to_owned(), 2);
+        Ok(())
+    }
+
+    let mut states = HashMap::new();
+    for task in tasks {
+        visit(&task.name, definitions, &mut states)?;
+    }
+    Ok(())
 }
 
 impl Interpreter {
+    fn new(context: ExecutionContext, entry_file: Option<PathBuf>) -> Self {
+        let globals = Environment::root();
+        globals.define("print".into(), Value::NativePrint, false, None);
+        globals.define(
+            "Some".into(),
+            Value::NativeConstructor(VariantTag::Some),
+            false,
+            None,
+        );
+        globals.define(
+            "None".into(),
+            Value::Variant {
+                tag: VariantTag::None,
+                payload: None,
+            },
+            false,
+            None,
+        );
+        globals.define(
+            "Ok".into(),
+            Value::NativeConstructor(VariantTag::Ok),
+            false,
+            None,
+        );
+        globals.define(
+            "Err".into(),
+            Value::NativeConstructor(VariantTag::Err),
+            false,
+            None,
+        );
+        for (name, module) in [
+            ("json", NativeModule::Json),
+            ("fs", NativeModule::Fs),
+            ("path", NativeModule::Path),
+            ("env", NativeModule::Env),
+            ("process", NativeModule::Process),
+            ("terminal", NativeModule::Terminal),
+            ("task", NativeModule::Task),
+        ] {
+            globals.define(name.into(), Value::NativeModule(module), false, None);
+        }
+        let context_value = Value::Map(Rc::new(RefCell::new(vec![
+            (
+                "cwd".into(),
+                Value::String(context.cwd.to_string_lossy().into_owned()),
+            ),
+            (
+                "script_dir".into(),
+                Value::String(context.script_dir.to_string_lossy().into_owned()),
+            ),
+            (
+                "project_dir".into(),
+                Value::String(context.project_dir.to_string_lossy().into_owned()),
+            ),
+        ])));
+        globals.define("context".into(), context_value, false, None);
+        Self {
+            environment: globals.clone(),
+            globals: globals.clone(),
+            output: Vec::new(),
+            function_depth: 0,
+            environments: vec![Rc::downgrade(&globals.0)],
+            lists: Vec::new(),
+            maps: Vec::new(),
+            objects: Vec::new(),
+            collected_objects: 0,
+            deferred: vec![Vec::new()],
+            context,
+            current_files: entry_file.into_iter().collect(),
+            module_cache: HashMap::new(),
+            modules_in_progress: HashSet::new(),
+            task_results: HashMap::new(),
+            active_task_needs: None,
+        }
+    }
     fn execute_statements(&mut self, statements: &[Statement]) -> Result<Control, RuntimeError> {
         let mut value = Value::Null;
         for statement in statements {
@@ -442,6 +567,148 @@ impl Interpreter {
             }
         }
         Ok(Control::Continue(value))
+    }
+
+    fn run_tasks(
+        &mut self,
+        tasks: &[TaskDefinition],
+        selected: &[String],
+    ) -> Result<Vec<TaskReport>, RuntimeError> {
+        let definitions = tasks
+            .iter()
+            .map(|task| (task.name.clone(), task.clone()))
+            .collect::<HashMap<_, _>>();
+        for task in tasks {
+            for dependency in &task.needs {
+                if !definitions.contains_key(dependency) {
+                    return Err(self.error(
+                        format!(
+                            "task '{}' requires undefined task '{dependency}'",
+                            task.name
+                        ),
+                        task.span,
+                    ));
+                }
+            }
+        }
+        validate_task_cycles(tasks, &definitions)?;
+        let targets = if selected.is_empty() {
+            tasks
+                .iter()
+                .map(|task| task.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            selected.to_vec()
+        };
+        let mut reports = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.name.clone(),
+                    TaskReport {
+                        name: task.name.clone(),
+                        status: TaskStatus::Pending,
+                        result: None,
+                        error: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for target in targets {
+            if !definitions.contains_key(&target) {
+                return Err(self.error(format!("unknown task '{target}'"), Span::empty(0)));
+            }
+            self.run_task(&target, &definitions, &mut reports);
+        }
+        Ok(tasks
+            .iter()
+            .map(|task| reports.remove(&task.name).expect("all tasks have reports"))
+            .collect())
+    }
+
+    fn run_task(
+        &mut self,
+        name: &str,
+        definitions: &HashMap<String, TaskDefinition>,
+        reports: &mut HashMap<String, TaskReport>,
+    ) {
+        if reports
+            .get(name)
+            .is_some_and(|report| report.status != TaskStatus::Pending)
+        {
+            return;
+        }
+        let definition = definitions.get(name).expect("task validated").clone();
+        for dependency in &definition.needs {
+            self.run_task(dependency, definitions, reports);
+            if reports
+                .get(dependency)
+                .is_some_and(|report| report.status != TaskStatus::Succeeded)
+            {
+                let report = reports.get_mut(name).expect("task report exists");
+                report.status = TaskStatus::Skipped;
+                report.error = Some(format!("dependency '{dependency}' did not succeed"));
+                return;
+            }
+        }
+        reports.get_mut(name).expect("task report exists").status = TaskStatus::Running;
+        match self.execute_task(&definition) {
+            Ok(value) => {
+                let succeeded = matches!(
+                    value,
+                    Value::Variant {
+                        tag: VariantTag::Ok,
+                        ..
+                    }
+                );
+                self.task_results.insert(name.to_owned(), value.clone());
+                let report = reports.get_mut(name).expect("task report exists");
+                report.status = if succeeded {
+                    TaskStatus::Succeeded
+                } else {
+                    TaskStatus::Failed
+                };
+                if !succeeded {
+                    report.error = Some(format!("task returned {value}"));
+                }
+                report.result = Some(value);
+            }
+            Err(error) => {
+                let report = reports.get_mut(name).expect("task report exists");
+                report.status = TaskStatus::Failed;
+                report.error = Some(error.message);
+            }
+        }
+    }
+
+    fn execute_task(&mut self, task: &TaskDefinition) -> Result<Value, RuntimeError> {
+        let previous_needs = self
+            .active_task_needs
+            .replace(task.needs.iter().cloned().collect());
+        self.function_depth += 1;
+        let environment = self.child_environment(self.globals.clone());
+        let result = self.execute_block(&task.body, environment);
+        self.function_depth -= 1;
+        self.active_task_needs = previous_needs;
+        let value = match result {
+            Ok(Control::Continue(_)) => Value::Null,
+            Ok(Control::Return(value)) => value,
+            Err(mut error) => match error.propagated.take() {
+                Some(value) => value,
+                None => return Err(error),
+            },
+        };
+        self.require_type(&value, Some(&task.return_type), task.span)?;
+        if !matches!(
+            value,
+            Value::Variant {
+                tag: VariantTag::Ok | VariantTag::Err,
+                ..
+            }
+        ) {
+            return Err(self.error("task must return Result<T, E>", task.span));
+        }
+        Ok(value)
     }
 
     fn execute_statement(&mut self, statement: &Statement) -> Result<Control, RuntimeError> {
@@ -562,6 +829,7 @@ impl Interpreter {
                 }
                 Ok(Control::Continue(Value::Null))
             }
+            StatementKind::Task { .. } => Ok(Control::Continue(Value::Null)),
             StatementKind::Block(statements) => {
                 let environment = self.child_environment(self.environment.clone());
                 self.execute_block(statements, environment)
@@ -1366,6 +1634,21 @@ impl Interpreter {
                     Err(error) => Ok(err_value(error.to_string())),
                 }
             }
+            NativeFunction::TaskResult => {
+                let name = self.string_argument(arguments.next(), function, span)?;
+                let Some(needs) = &self.active_task_needs else {
+                    return Err(self.error("task.result is only valid inside a task", span));
+                };
+                if !needs.contains(&name) {
+                    return Err(self.error(
+                        format!("task.result('{name}') is not a declared dependency"),
+                        span,
+                    ));
+                }
+                self.task_results.get(&name).cloned().ok_or_else(|| {
+                    self.error(format!("task dependency '{name}' has no result"), span)
+                })
+            }
         }
     }
 
@@ -1715,6 +1998,7 @@ impl NativeModule {
             Self::Env => "env",
             Self::Process => "process",
             Self::Terminal => "terminal",
+            Self::Task => "task",
         }
     }
 
@@ -1737,6 +2021,7 @@ impl NativeModule {
             (Self::Terminal, "input") => Some(NativeFunction::TerminalInput),
             (Self::Terminal, "confirm") => Some(NativeFunction::TerminalConfirm),
             (Self::Terminal, "password") => Some(NativeFunction::TerminalPassword),
+            (Self::Task, "result") => Some(NativeFunction::TaskResult),
             _ => None,
         }
     }
@@ -1750,6 +2035,7 @@ fn native_module(name: &str) -> Option<NativeModule> {
         "env" => Some(NativeModule::Env),
         "process" => Some(NativeModule::Process),
         "terminal" => Some(NativeModule::Terminal),
+        "task" => Some(NativeModule::Task),
         _ => None,
     }
 }
@@ -1774,6 +2060,7 @@ impl NativeFunction {
             Self::TerminalInput => "terminal.input",
             Self::TerminalConfirm => "terminal.confirm",
             Self::TerminalPassword => "terminal.password",
+            Self::TaskResult => "task.result",
         }
     }
 

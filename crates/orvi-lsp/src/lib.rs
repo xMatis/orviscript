@@ -427,7 +427,9 @@ fn classify_token(
         TokenKind::Identifier if matches!(previous, Some(TokenKind::Colon | TokenKind::Arrow)) => {
             (8, 0)
         }
-        TokenKind::Identifier if previous == Some(TokenKind::Fn) => (1, DECLARATION),
+        TokenKind::Identifier if matches!(previous, Some(TokenKind::Fn | TokenKind::Task)) => {
+            (1, DECLARATION)
+        }
         TokenKind::Identifier if in_parameters => (2, DECLARATION),
         TokenKind::Identifier if previous == Some(TokenKind::Let) => (0, DECLARATION),
         TokenKind::Identifier if previous == Some(TokenKind::Const) => (0, DECLARATION | READONLY),
@@ -441,6 +443,7 @@ fn classify_token(
         | TokenKind::Interface
         | TokenKind::Import
         | TokenKind::From
+        | TokenKind::Task
         | TokenKind::Match
         | TokenKind::Using
         | TokenKind::Defer
@@ -505,6 +508,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ),
         ("import", CompletionItemKind::KEYWORD, "named module import"),
         ("from", CompletionItemKind::KEYWORD, "module import source"),
+        ("task", CompletionItemKind::KEYWORD, "task declaration"),
         (
             "match",
             CompletionItemKind::KEYWORD,
@@ -595,7 +599,9 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
                     continue;
                 }
                 let kind = match symbol.kind {
-                    orvi_sema::SymbolKind::Function => CompletionItemKind::FUNCTION,
+                    orvi_sema::SymbolKind::Function | orvi_sema::SymbolKind::Task => {
+                        CompletionItemKind::FUNCTION
+                    }
                     orvi_sema::SymbolKind::Struct => CompletionItemKind::STRUCT,
                     orvi_sema::SymbolKind::Interface => CompletionItemKind::INTERFACE,
                     orvi_sema::SymbolKind::Import => CompletionItemKind::VARIABLE,
@@ -630,6 +636,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "interface" => "`interface` declares a structural field contract.",
         "import" => "`import { name } from \"module\"` imports selected names.",
         "from" => "`from` introduces an import source.",
+        "task" => "`task name -> Result<T, E> { ... }` declares an inert workflow task.",
         "match" => "`match` selects an expression using exhaustive patterns.",
         "using" => "`using name = value => cleanup` registers scoped cleanup.",
         "defer" => "`defer expression` runs the expression when the scope exits.",
@@ -653,6 +660,7 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
                 orvi_sema::SymbolKind::Struct => "struct",
                 orvi_sema::SymbolKind::Interface => "interface",
                 orvi_sema::SymbolKind::Import => "import",
+                orvi_sema::SymbolKind::Task => "task",
                 orvi_sema::SymbolKind::Parameter => "parameter",
             };
             let type_name = symbol.type_name.unwrap_or_else(|| "any".into());

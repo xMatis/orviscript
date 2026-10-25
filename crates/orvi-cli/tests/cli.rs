@@ -20,6 +20,14 @@ fn run(arguments: &[&str]) -> std::process::Output {
         .expect("CLI starts")
 }
 
+fn run_with_home(arguments: &[&str], home: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_orviscript"))
+        .args(arguments)
+        .env("ORVISCRIPT_HOME", home)
+        .output()
+        .expect("CLI starts")
+}
+
 #[test]
 fn runs_a_program_from_disk() {
     let path = source_file("print(6 * 7)");
@@ -111,4 +119,64 @@ fn checks_import_exports_and_cycles() {
 
     fs::remove_file(first).unwrap();
     fs::remove_file(second).unwrap();
+}
+
+#[test]
+fn runs_test_tasks_and_returns_failure_status() {
+    let passing = source_file(
+        "task setup -> Result<string, string> { return Ok(\"ready\") } task test_cli -> Result<null, string> { needs: [setup]; print(task.result(\"setup\")?); return Ok(null) }",
+    );
+    let output = run(&["test", passing.to_str().unwrap()]);
+    fs::remove_file(passing).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("test test_cli: passed"));
+
+    let failing = source_file("task test_failure -> Result<null, string> { return Err(\"no\") }");
+    let output = run(&["test", failing.to_str().unwrap()]);
+    fs::remove_file(failing).unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("test test_failure: failed"));
+}
+
+#[test]
+fn links_lists_runs_and_unlinks_global_task_aliases() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!("orviscript-registry-{id}"));
+    fs::create_dir_all(&home).unwrap();
+    let script = home.join("release.orvi");
+    fs::write(
+        &script,
+        "task deploy -> Result<null, string> { print(\"deployed\"); return Ok(null) }",
+    )
+    .unwrap();
+    let script_text = script.to_str().unwrap();
+
+    let output = run_with_home(&["task", "link", "hosting.deploy", script_text], &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_with_home(&["task", "list"], &home);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("hosting.deploy"));
+    let output = run_with_home(&["task", "run", "hosting.deploy"], &home);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("deployed"));
+    let output = run_with_home(&["task", "unlink", "hosting.deploy"], &home);
+    assert!(output.status.success());
+    let output = run_with_home(&["task", "list"], &home);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("hosting.deploy"));
+
+    fs::remove_dir_all(home).unwrap();
 }

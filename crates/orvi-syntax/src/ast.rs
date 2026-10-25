@@ -93,6 +93,12 @@ pub enum StatementKind {
         names: Vec<Identifier>,
         source: String,
     },
+    Task {
+        name: Identifier,
+        needs: Vec<Identifier>,
+        return_type: TypeAnnotation,
+        body: Vec<Statement>,
+    },
     Block(Vec<Statement>),
     If {
         condition: Expression,

@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-Version 0.2.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a tree-walk interpreter, `run`, `check`, and `fmt` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, completion, hover help, go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include modules, whole-program type inference, async I/O, packages, or a standard library beyond `print`.
+Version 0.2.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a tree-walk interpreter, `run`, `check`, and `fmt` CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, completion, hover help, go-to-definition, references, rename, and formatting. Work toward 0.3.0 on the main branch adds modules, automation APIs and native task workflows. The language remains incomplete and does not yet include whole-program type inference, async I/O or packages.
 
 ## Goals
 
@@ -14,7 +14,7 @@ The planned direction includes:
 - Standalone executable bundling.
 - Experimental native compilation at a later stage.
 
-Except for the basic interpreter described above, these capabilities are goals, not implemented features.
+The repository documents implemented behavior separately from future goals; later roadmap items must not be treated as available features.
 
 ## Roadmap
 
@@ -36,9 +36,12 @@ cargo run --bin orviscript -- --help
 cargo run --bin orviscript -- run examples/hello.orvi
 cargo run --bin orviscript -- fmt path/to/program.orvi
 cargo run --bin orviscript -- fmt --check path/to/program.orvi
+cargo run --bin orviscript -- test examples/v0_3/automation.orvi
+cargo run --bin orviscript -- task link project.test_artifact examples/v0_3/automation.orvi
+cargo run --bin orviscript -- task run project.test_artifact
 ```
 
-The stable 0.2.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, numbers, strings, booleans, `null`, mutable reference lists with indexing, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Development toward 0.3.0 has added typed reference maps, JSON, filesystem, path, environment, process and terminal APIs, plus explicit execution context paths. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, struct field, and interface types. A tracing collector reclaims unreachable collection, struct, and closure-environment cycles.
+The stable 0.2.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, numbers, strings, booleans, `null`, mutable reference lists with indexing, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, arithmetic and comparison operators, `if`/`else`, `while`, functions, closures, `return`, assignment, and `print`. Development toward 0.3.0 has added typed reference maps, JSON, local and standard module imports, filesystem, path, environment, process and terminal APIs, explicit execution context paths, native `task` declarations, a sequential dependency scheduler, a test command and a global task registry. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, task dependency errors and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, struct field, interface and task result types. A tracing collector reclaims unreachable collection, struct, and closure-environment cycles.
 
 The VS Code extension lives in `editors/vscode`. It provides document formatting through the same formatter used by the CLI. Build the language server, then launch a development window with the extension enabled:
 
