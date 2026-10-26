@@ -2,6 +2,7 @@
 members = [
     "crates/orvi-cli",
     "crates/orvi-lsp",
+    "crates/orvi-project",
     "crates/orvi-runtime",
     "crates/orvi-sema",
     "crates/orvi-syntax",

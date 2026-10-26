@@ -1,6 +1,6 @@
 [package]
 name = "orvi-cli"
-version = "0.3.0"
+version = "0.4.0"
 description = "Command-line interface for OrviScript"
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ name = "orviscript"
 path = "src/main.rs"
 
 [dependencies]
+orvi-project = { path = "../orvi-project" }
 orvi-runtime = { path = "../orvi-runtime" }
 orvi-sema = { path = "../orvi-sema" }
 orvi-syntax = { path = "../orvi-syntax" }

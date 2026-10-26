@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import url from "node:url";
@@ -30,8 +32,8 @@ test("language server publishes diagnostics for an open document", { timeout: 60
   const send = (message) => server.stdin.write(encodeMessage(message));
   const waitFor = async (predicate) => {
     while (true) {
-      const message = received.find(predicate);
-      if (message) return message;
+      const index = received.findIndex(predicate);
+      if (index >= 0) return received.splice(index, 1)[0];
       await new Promise((resolve) => { wake = resolve; });
       wake = undefined;
     }
@@ -46,7 +48,7 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const initialized = await waitFor((message) => message.id === 1);
     assert.equal(initialized.result.serverInfo.name, "orvi-lsp");
-    assert.equal(initialized.result.serverInfo.version, "0.3.0");
+    assert.equal(initialized.result.serverInfo.version, "0.4.0");
     assert.equal(initialized.result.capabilities.textDocumentSync, 1);
 
     send({ jsonrpc: "2.0", method: "initialized", params: {} });
@@ -191,6 +193,142 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     const formatting = await waitFor((message) => message.id === 9);
     assert.equal(formatting.result[0].newText, "let answer = 42;\nprint(answer)\n");
 
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), "orviscript-lsp-"));
+    const sourceDirectory = path.join(project, "src");
+    fs.mkdirSync(sourceDirectory);
+    fs.writeFileSync(
+      path.join(project, "orvi.toml"),
+      "[project]\nname = \"lsp-test\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+    );
+    const modulePath = path.join(sourceDirectory, "messages.orvi");
+    const entryPath = path.join(sourceDirectory, "main.orvi");
+    const moduleSource = "export fn greet(name: string) -> string { return name; }";
+    const entrySource = "import { greet } from \"./messages.orvi\"; print(greet(\"Ada\"));";
+    fs.writeFileSync(modulePath, moduleSource);
+    fs.writeFileSync(entryPath, entrySource);
+    const moduleUri = url.pathToFileURL(modulePath).href;
+    const entryUri = url.pathToFileURL(entryPath).href;
+    const importedUse = entrySource.lastIndexOf("greet") + 1;
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: entryUri,
+          languageId: "orviscript",
+          version: 1,
+          text: entrySource,
+        },
+      },
+    });
+    const projectDiagnostics = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.uri === entryUri,
+    );
+    assert.deepEqual(projectDiagnostics.params.diagnostics, []);
+
+    send({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "textDocument/definition",
+      params: {
+        textDocument: { uri: entryUri },
+        position: { line: 0, character: importedUse },
+      },
+    });
+    const projectDefinition = await waitFor((message) => message.id === 10);
+    assert.equal(decodeURIComponent(projectDefinition.result.uri), decodeURIComponent(moduleUri));
+    assert.equal(projectDefinition.result.range.start.character, 10);
+
+    send({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "textDocument/references",
+      params: {
+        textDocument: { uri: entryUri },
+        position: { line: 0, character: importedUse },
+        context: { includeDeclaration: true },
+      },
+    });
+    const projectReferences = await waitFor((message) => message.id === 11);
+    assert.equal(projectReferences.result.length, 3);
+
+    send({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "textDocument/rename",
+      params: {
+        textDocument: { uri: entryUri },
+        position: { line: 0, character: importedUse },
+        newName: "welcome",
+      },
+    });
+    const projectRename = await waitFor((message) => message.id === 12);
+    const moduleChanges = Object.entries(projectRename.result.changes)
+      .find(([uri]) => decodeURIComponent(uri) === decodeURIComponent(moduleUri))?.[1];
+    const entryChanges = Object.entries(projectRename.result.changes)
+      .find(([uri]) => decodeURIComponent(uri) === decodeURIComponent(entryUri))?.[1];
+    assert.equal(moduleChanges.length, 1);
+    assert.equal(entryChanges.length, 2);
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: moduleUri,
+          languageId: "orviscript",
+          version: 1,
+          text: moduleSource,
+        },
+      },
+    });
+    await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && decodeURIComponent(message.params.uri) === decodeURIComponent(moduleUri),
+    );
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri: moduleUri, version: 2 },
+        contentChanges: [{ text: moduleSource.replace("export ", "") }],
+      },
+    });
+    const invalidatedImporter = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && decodeURIComponent(message.params.uri) === decodeURIComponent(entryUri)
+        && message.params.diagnostics.some((item) => /has no export 'greet'/.test(item.message)),
+    );
+    assert.equal(invalidatedImporter.params.diagnostics.length, 1);
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri: moduleUri, version: 3 },
+        contentChanges: [{ text: moduleSource }],
+      },
+    });
+    const restoredImporter = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && decodeURIComponent(message.params.uri) === decodeURIComponent(entryUri)
+        && !Object.hasOwn(message.params, "version"),
+    );
+    assert.deepEqual(restoredImporter.params.diagnostics, []);
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didClose",
+      params: { textDocument: { uri: moduleUri } },
+    });
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didClose",
+      params: { textDocument: { uri: entryUri } },
+    });
+    fs.rmSync(project, { recursive: true, force: true });
+
     send({
       jsonrpc: "2.0",
       method: "textDocument/didClose",
@@ -198,12 +336,13 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const closed = await waitFor(
       (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.uri === "file:///diagnostic.orvi"
         && !Object.hasOwn(message.params, "version"),
     );
     assert.deepEqual(closed.params.diagnostics, []);
 
-    send({ jsonrpc: "2.0", id: 10, method: "shutdown", params: null });
-    await waitFor((message) => message.id === 10);
+    send({ jsonrpc: "2.0", id: 13, method: "shutdown", params: null });
+    await waitFor((message) => message.id === 13);
     send({ jsonrpc: "2.0", method: "exit", params: null });
     server.stdin.end();
     await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2000))]);

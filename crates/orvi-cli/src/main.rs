@@ -5,21 +5,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use orvi_project::Project;
 use orvi_runtime::{ExecutionContext, TaskStatus, execute_file, execute_tasks};
-use orvi_sema::analyze;
+use orvi_sema::analyze_program_with_modules;
 use orvi_syntax::{Program, Span, StatementKind, format_source, line_column, parse};
 
 const HELP: &str = "OrviScript
 
 Usage: orviscript [OPTIONS]
-       orviscript <COMMAND> <FILE>
+       orviscript <COMMAND> [FILE]
 
 Commands:
   init [DIRECTORY]
                 Create a new OrviScript project (defaults to the current directory)
-  run <FILE>    Run an OrviScript program
-  check <FILE>  Check an OrviScript program for syntax and semantic errors
-  test <FILE>   Run tasks whose names start with test_
+  run [FILE]    Run a file or the current project's entry
+  check [FILE]  Check a file or the current project's entry
+  test [FILE]   Run test_ tasks in a file or the current project's entry
   fmt <FILE>    Format an OrviScript program in place
   fmt --check <FILE>
                 Check whether an OrviScript program is formatted
@@ -40,9 +41,9 @@ enum Command {
     Help,
     Version,
     Init(PathBuf),
-    Run(PathBuf),
-    Check(PathBuf),
-    Test(PathBuf),
+    Run(Option<PathBuf>),
+    Check(Option<PathBuf>),
+    Test(Option<PathBuf>),
     TaskLink { alias: String, path: PathBuf },
     TaskList,
     TaskRun(String),
@@ -57,9 +58,12 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [argument] if argument == "-V" || argument == "--version" => Ok(Command::Version),
         [command] if command == "init" => Ok(Command::Init(PathBuf::from("."))),
         [command, path] if command == "init" => Ok(Command::Init(PathBuf::from(path))),
-        [command, path] if command == "run" => Ok(Command::Run(PathBuf::from(path))),
-        [command, path] if command == "check" => Ok(Command::Check(PathBuf::from(path))),
-        [command, path] if command == "test" => Ok(Command::Test(PathBuf::from(path))),
+        [command] if command == "run" => Ok(Command::Run(None)),
+        [command] if command == "check" => Ok(Command::Check(None)),
+        [command] if command == "test" => Ok(Command::Test(None)),
+        [command, path] if command == "run" => Ok(Command::Run(Some(PathBuf::from(path)))),
+        [command, path] if command == "check" => Ok(Command::Check(Some(PathBuf::from(path)))),
+        [command, path] if command == "test" => Ok(Command::Test(Some(PathBuf::from(path)))),
         [command, action] if command == "task" && action == "list" => Ok(Command::TaskList),
         [command, action, alias] if command == "task" && action == "run" => {
             Ok(Command::TaskRun(alias.to_string_lossy().into_owned()))
@@ -84,14 +88,7 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
             path: PathBuf::from(path),
             check: true,
         }),
-        [command]
-            if command == "run" || command == "check" || command == "test" || command == "fmt" =>
-        {
-            Err(format!(
-                "command '{}' requires a file",
-                command.to_string_lossy()
-            ))
-        }
+        [command] if command == "fmt" => Err("command 'fmt' requires a file".into()),
         [argument] => Err(format!(
             "unexpected argument '{}'",
             argument.to_string_lossy()
@@ -112,9 +109,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Init(path)) => init_project(&path),
-        Ok(Command::Check(path)) => check_file(&path),
-        Ok(Command::Run(path)) => run_file(&path),
-        Ok(Command::Test(path)) => test_file(&path),
+        Ok(Command::Check(path)) => with_source_target(path, check_file),
+        Ok(Command::Run(path)) => with_source_target(path, run_file),
+        Ok(Command::Test(path)) => with_source_target(path, test_file),
         Ok(Command::TaskLink { alias, path }) => task_link(&alias, &path),
         Ok(Command::TaskList) => task_list(),
         Ok(Command::TaskRun(alias)) => task_run(&alias),
@@ -125,6 +122,29 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn with_source_target(target: Option<PathBuf>, operation: fn(&Path) -> ExitCode) -> ExitCode {
+    let path = match target {
+        Some(path) => path,
+        None => {
+            let current = match env::current_dir() {
+                Ok(current) => current,
+                Err(error) => {
+                    eprintln!("error: could not determine current directory: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            match Project::discover(&current).and_then(|project| project.existing_entry_path()) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+    };
+    operation(&path)
 }
 
 fn init_project(path: &Path) -> ExitCode {
@@ -678,11 +698,9 @@ fn exported_names(program: &Program) -> HashSet<&str> {
 }
 
 fn find_project_dir(script_dir: &Path) -> PathBuf {
-    script_dir
-        .ancestors()
-        .find(|directory| directory.join("orvi.toml").is_file())
-        .unwrap_or(script_dir)
-        .to_path_buf()
+    Project::discover(script_dir)
+        .map(|project| project.root)
+        .unwrap_or_else(|_| script_dir.to_path_buf())
 }
 
 fn format_file(path: &Path, check: bool) -> ExitCode {
@@ -741,7 +759,30 @@ fn report_syntax_errors(path: &Path, source: &str, parsed: &orvi_syntax::Parsed)
 }
 
 fn report_semantic_errors(path: &Path, source: &str, program: &orvi_syntax::Program) -> bool {
-    let errors = analyze(program);
+    let modules = program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Import {
+                source: import_source,
+                ..
+            } = &statement.kind
+            else {
+                return None;
+            };
+            if import_source.starts_with("std:") {
+                return None;
+            }
+            let module_path = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(import_source);
+            let module_source = fs::read_to_string(module_path).ok()?;
+            let parsed = parse(&module_source);
+            (!parsed.has_errors()).then(|| (import_source.clone(), parsed.program))
+        })
+        .collect();
+    let errors = analyze_program_with_modules(program, &modules).errors;
     for error in &errors {
         report_error(path, source, error.span, &error.message);
     }
@@ -777,7 +818,11 @@ mod tests {
     fn parses_run_command() {
         assert_eq!(
             parse_arguments(&[OsString::from("run"), OsString::from("app.orvi")]),
-            Ok(Command::Run(PathBuf::from("app.orvi")))
+            Ok(Command::Run(Some(PathBuf::from("app.orvi"))))
+        );
+        assert_eq!(
+            parse_arguments(&[OsString::from("run")]),
+            Ok(Command::Run(None))
         );
     }
     #[test]
@@ -795,7 +840,7 @@ mod tests {
     fn parses_check_command() {
         assert_eq!(
             parse_arguments(&[OsString::from("check"), OsString::from("app.orvi")]),
-            Ok(Command::Check(PathBuf::from("app.orvi")))
+            Ok(Command::Check(Some(PathBuf::from("app.orvi"))))
         );
     }
     #[test]
@@ -835,10 +880,10 @@ mod tests {
         );
     }
     #[test]
-    fn rejects_missing_path() {
+    fn rejects_missing_format_path() {
         assert_eq!(
-            parse_arguments(&[OsString::from("run")]),
-            Err("command 'run' requires a file".into())
+            parse_arguments(&[OsString::from("fmt")]),
+            Err("command 'fmt' requires a file".into())
         );
     }
 }

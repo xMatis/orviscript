@@ -1,6 +1,6 @@
 [package]
 name = "orvi-lsp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Language Server Protocol implementation for OrviScript"
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ name = "orvi-lsp"
 path = "src/main.rs"
 
 [dependencies]
+orvi-project = { path = "../orvi-project" }
 orvi-sema = { path = "../orvi-sema" }
 orvi-syntax = { path = "../orvi-syntax" }
 tokio = { version = "1.48.0", features = ["io-std", "macros", "rt-multi-thread"] }

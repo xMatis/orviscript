@@ -96,6 +96,13 @@ pub fn analyze(program: &Program) -> Vec<SemanticError> {
 }
 
 pub fn analyze_program(program: &Program) -> Analysis {
+    analyze_program_with_modules(program, &HashMap::new())
+}
+
+pub fn analyze_program_with_modules(
+    program: &Program,
+    modules: &HashMap<String, Program>,
+) -> Analysis {
     let struct_names = program
         .statements
         .iter()
@@ -131,6 +138,10 @@ pub fn analyze_program(program: &Program) -> Analysis {
             })
             .collect(),
         current_task_needs: None,
+        module_exports: modules
+            .iter()
+            .map(|(source, program)| (source.clone(), exported_symbols(program)))
+            .collect(),
     };
     analyzer.statements(&program.statements, false);
     analyzer.errors.extend(task_cycle_errors(program));
@@ -138,6 +149,130 @@ pub fn analyze_program(program: &Program) -> Analysis {
         errors: analyzer.errors,
         symbols: analyzer.symbols,
     }
+}
+
+fn exported_symbols(program: &Program) -> HashMap<String, Symbol> {
+    let struct_names = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &declaration_statement(statement).kind {
+            StatementKind::Struct { name, .. } => Some(name.name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let interface_names = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &declaration_statement(statement).kind {
+            StatementKind::Interface { name, .. } => Some(name.name.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Export(declaration) = &statement.kind else {
+                return None;
+            };
+            let (name, symbol) = match &declaration.kind {
+                StatementKind::Variable {
+                    name,
+                    mutable,
+                    type_annotation,
+                    ..
+                } => (
+                    name,
+                    Symbol {
+                        kind: if *mutable {
+                            SymbolKind::Variable
+                        } else {
+                            SymbolKind::Constant
+                        },
+                        mutable: *mutable,
+                        arity: None,
+                        definition: None,
+                        value_type: type_annotation
+                            .as_ref()
+                            .and_then(|annotation| {
+                                static_type_from_annotation(
+                                    annotation,
+                                    &struct_names,
+                                    &interface_names,
+                                )
+                            })
+                            .unwrap_or(StaticType::Dynamic),
+                    },
+                ),
+                StatementKind::Function {
+                    name,
+                    parameters,
+                    return_type,
+                    ..
+                } => (
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Function,
+                        mutable: false,
+                        arity: Some(parameters.len()),
+                        definition: None,
+                        value_type: StaticType::Function {
+                            parameters: parameters
+                                .iter()
+                                .map(|parameter| {
+                                    parameter
+                                        .type_annotation
+                                        .as_ref()
+                                        .and_then(|annotation| {
+                                            static_type_from_annotation(
+                                                annotation,
+                                                &struct_names,
+                                                &interface_names,
+                                            )
+                                        })
+                                        .unwrap_or(StaticType::Dynamic)
+                                })
+                                .collect(),
+                            result: Box::new(
+                                return_type
+                                    .as_ref()
+                                    .and_then(|annotation| {
+                                        static_type_from_annotation(
+                                            annotation,
+                                            &struct_names,
+                                            &interface_names,
+                                        )
+                                    })
+                                    .unwrap_or(StaticType::Dynamic),
+                            ),
+                        },
+                    },
+                ),
+                StatementKind::Struct { name, .. } => (
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Struct,
+                        mutable: false,
+                        arity: None,
+                        definition: None,
+                        value_type: StaticType::Struct(name.name.clone()),
+                    },
+                ),
+                StatementKind::Interface { name, .. } => (
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Interface,
+                        mutable: false,
+                        arity: None,
+                        definition: None,
+                        value_type: StaticType::Interface(name.name.clone()),
+                    },
+                ),
+                _ => return None,
+            };
+            Some((name.name.clone(), symbol))
+        })
+        .collect()
 }
 
 fn declaration_statement(statement: &Statement) -> &Statement {
@@ -318,6 +453,7 @@ struct Analyzer {
     interfaces: HashMap<String, HashMap<String, StaticType>>,
     task_names: HashSet<String>,
     current_task_needs: Option<HashSet<String>>,
+    module_exports: HashMap<String, HashMap<String, Symbol>>,
 }
 
 impl Analyzer {
@@ -348,15 +484,25 @@ impl Analyzer {
                             });
                             StaticType::Dynamic
                         })
+                    } else if let Some(exports) = self.module_exports.get(source) {
+                        match exports.get(name.as_str()) {
+                            Some(symbol) => symbol.value_type.clone(),
+                            None => StaticType::Dynamic,
+                        }
                     } else {
                         StaticType::Dynamic
                     };
+                    let arity = self
+                        .module_exports
+                        .get(source)
+                        .and_then(|exports| exports.get(name.as_str()))
+                        .and_then(|symbol| symbol.arity);
                     self.declare(
                         name,
                         Symbol {
                             kind: SymbolKind::Import,
                             mutable: false,
-                            arity: None,
+                            arity,
                             definition: Some(name.span),
                             value_type,
                         },
@@ -1582,8 +1728,9 @@ fn literal_type(literal: &Literal) -> StaticType {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticErrorKind, analyze, analyze_program};
+    use super::{SemanticErrorKind, analyze, analyze_program, analyze_program_with_modules};
     use orvi_syntax::parse;
+    use std::collections::HashMap;
 
     fn errors(source: &str) -> Vec<super::SemanticError> {
         let parsed = parse(source);
@@ -1784,6 +1931,24 @@ mod tests {
         let errors = errors("import { missing } from \"std:fs\";");
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, SemanticErrorKind::UndefinedName);
+    }
+
+    #[test]
+    fn checks_calls_against_imported_function_signatures() {
+        let module = parse("export fn double(value: int) -> int { return value * 2; }");
+        let entry = parse("import { double } from \"./math.orvi\"; let bad = double(\"two\", 2);");
+        let analysis = analyze_program_with_modules(
+            &entry.program,
+            &HashMap::from([("./math.orvi".into(), module.program)]),
+        );
+        assert!(analysis.errors.iter().any(|error| {
+            error.kind == SemanticErrorKind::ArgumentCount
+                && error.message.contains("expects 1 arguments")
+        }));
+        assert!(analysis.errors.iter().any(|error| {
+            error.kind == SemanticErrorKind::TypeMismatch
+                && error.message.contains("expected int, received string")
+        }));
     }
 
     #[test]

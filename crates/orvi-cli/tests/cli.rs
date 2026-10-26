@@ -20,6 +20,14 @@ fn run(arguments: &[&str]) -> std::process::Output {
         .expect("CLI starts")
 }
 
+fn run_in(arguments: &[&str], directory: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_orviscript"))
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .expect("CLI starts")
+}
+
 fn run_with_home(arguments: &[&str], home: &std::path::Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_orviscript"))
         .args(arguments)
@@ -55,6 +63,34 @@ fn initializes_a_project_without_overwriting_it() {
     let second = run(&["init", project_text]);
     assert_eq!(second.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&second.stderr).contains("would overwrite"));
+    fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
+fn runs_and_checks_the_current_project_without_a_file_argument() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!("orviscript-current-project-{id}"));
+    fs::create_dir_all(project.join("src/nested")).unwrap();
+    fs::write(
+        project.join("orvi.toml"),
+        "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/main.orvi"), "print(6 * 7)").unwrap();
+
+    let checked = run_in(&["check"], &project.join("src/nested"));
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let executed = run_in(&["run"], &project);
+    assert!(executed.status.success());
+    assert_eq!(String::from_utf8_lossy(&executed.stdout).trim(), "42");
+
     fs::remove_dir_all(project).unwrap();
 }
 
@@ -158,6 +194,28 @@ fn checks_import_exports_and_cycles() {
 
     fs::remove_file(first).unwrap();
     fs::remove_file(second).unwrap();
+}
+
+#[test]
+fn checks_imported_function_signatures() {
+    let module = source_file("export fn double(value: int) -> int { return value * 2; }");
+    let entry = module.with_file_name(format!(
+        "{}-typed-entry.orvi",
+        module.file_stem().unwrap().to_string_lossy()
+    ));
+    fs::write(
+        &entry,
+        format!(
+            "import {{ double }} from \"./{}\"; double(\"two\");",
+            module.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let output = run(&["check", entry.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected int, received string"));
+    fs::remove_file(module).unwrap();
+    fs::remove_file(entry).unwrap();
 }
 
 #[test]

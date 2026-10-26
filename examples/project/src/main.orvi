@@ -1,0 +1,3 @@
+import { greeting } from "./messages.orvi";
+
+print(greeting("OrviScript project"));

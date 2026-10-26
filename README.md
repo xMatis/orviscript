@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-Version 0.3.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a tree-walk interpreter, explicit module exports, automation APIs, native task workflows, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, completion, hover help, document symbols, go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include whole-program type inference, async I/O or packages.
+Version 0.4.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a tree-walk interpreter, explicit module exports, automation APIs, native task workflows, project manifests, project-aware CLI commands, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, completion, hover help, document symbols, cross-file go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include whole-program type inference, async I/O or packages.
 
 ## Goals
 
@@ -50,7 +50,17 @@ orviscript run hello-orvi/src/main.orvi
 
 `init` creates `orvi.toml`, `src/main.orvi`, and a project `.gitignore`. It refuses to overwrite any of these files if they already exist.
 
-The 0.3.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, distinct `void` and `null` types, numbers, strings, booleans, mutable reference lists and maps, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, explicit exports, local and standard module imports, JSON, filesystem, path, environment, process and terminal APIs, explicit execution context paths, native `task` declarations, a sequential dependency scheduler, a test command and a global task registry. Semantic checks report undefined and duplicate names, immutable assignments, invalid top-level returns, incorrect argument counts, unknown types, non-exhaustive matches, task dependency errors and statically visible type mismatches. The runtime also enforces declared binding, parameter, return, collection, struct field, interface and task result types. A tracing collector reclaims unreachable collection, map, struct and closure-environment cycles.
+Inside a project, the manifest entry is used when the file argument is omitted:
+
+```sh
+orviscript run
+orviscript check
+orviscript test
+```
+
+The commands search the current directory and its parents for `orvi.toml`. Project entries must be relative `.orvi` paths contained in the project. The shared project index also powers cross-file diagnostics, completion, hover, go-to-definition, references, and rename in the VS Code extension.
+
+The 0.4.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, distinct `void` and `null` types, numbers, strings, booleans, mutable reference lists and maps, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, explicit exports, local and standard module imports, JSON, filesystem, path, environment, process and terminal APIs, explicit execution context paths, native `task` declarations, a sequential dependency scheduler, a test command and a global task registry. Project manifests define a contained entry file, and semantic checks carry exported function signatures across local modules. The runtime also enforces declared binding, parameter, return, collection, struct field, interface and task result types. A tracing collector reclaims unreachable collection, map, struct and closure-environment cycles.
 
 The VS Code extension lives in `editors/vscode`. It provides document formatting through the same formatter used by the CLI. Build the language server, then launch a development window with the extension enabled:
 

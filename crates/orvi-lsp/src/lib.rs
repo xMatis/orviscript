@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use orvi_sema::{Analysis, SymbolOccurrence, analyze, analyze_program};
-use orvi_syntax::{Span, TokenKind, format_source, lex, parse};
+use orvi_project::Project;
+use orvi_sema::{Analysis, SymbolOccurrence, analyze_program, analyze_program_with_modules};
+use orvi_syntax::{Program, Span, Statement, StatementKind, TokenKind, format_source, lex, parse};
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
@@ -15,7 +18,7 @@ use tower_lsp_server::ls_types::{
     SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
     SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
     ServerInfo, SymbolKind as LspSymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, WorkDoneProgressOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkDoneProgressOptions,
     WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
@@ -26,6 +29,13 @@ const SERVER_NAME: &str = "orvi-lsp";
 pub struct Backend {
     client: Client,
     documents: RwLock<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectDocument {
+    uri: Uri,
+    path: PathBuf,
+    source: String,
 }
 
 impl Backend {
@@ -42,17 +52,64 @@ impl Backend {
         source: &str,
         version: Option<i32>,
     ) {
+        let project_documents = self.project_documents(&uri);
+        let modules = uri
+            .to_file_path()
+            .map(|path| imported_programs(path.as_ref(), source, &project_documents))
+            .unwrap_or_default();
+        let mut current_diagnostics = diagnostics_with_modules(source, &modules);
+        if let Some(path) = uri.to_file_path() {
+            let documents = self.documents.read().expect("document store lock poisoned");
+            current_diagnostics.extend(import_diagnostics(path.as_ref(), source, &documents));
+        }
         self.client
-            .publish_diagnostics(uri, diagnostics(source), version)
+            .publish_diagnostics(uri, current_diagnostics, version)
             .await;
     }
 
-    fn document(&self, uri: &tower_lsp_server::ls_types::Uri) -> Option<String> {
-        self.documents
+    fn document(&self, uri: &Uri) -> Option<String> {
+        let open = self
+            .documents
             .read()
             .expect("document store lock poisoned")
             .get(&uri.to_string())
-            .cloned()
+            .cloned();
+        open.or_else(|| {
+            uri.to_file_path()
+                .and_then(|path| fs::read_to_string(path.as_ref()).ok())
+        })
+    }
+
+    fn project_documents(&self, uri: &Uri) -> Vec<ProjectDocument> {
+        let documents = self.documents.read().expect("document store lock poisoned");
+        load_project_documents(uri, &documents)
+    }
+
+    async fn republish_other_open_project_documents(&self, changed_uri: &Uri) {
+        let open_uris = self
+            .documents
+            .read()
+            .expect("document store lock poisoned")
+            .keys()
+            .filter_map(|uri| uri.parse::<Uri>().ok())
+            .collect::<Vec<_>>();
+        let changed_path = changed_uri.to_file_path();
+        let documents = self.project_documents(changed_uri);
+        for document in documents {
+            if changed_path
+                .as_ref()
+                .is_some_and(|path| same_path(path.as_ref(), &document.path))
+            {
+                continue;
+            }
+            let Some(open_uri) = open_uris.iter().find(|uri| {
+                uri.to_file_path()
+                    .is_some_and(|path| same_path(path.as_ref(), &document.path))
+            }) else {
+                continue;
+            };
+            self.publish(open_uri.clone(), &document.source, None).await;
+        }
     }
 }
 
@@ -100,7 +157,9 @@ impl LanguageServer for Backend {
             .write()
             .expect("document store lock poisoned")
             .insert(document.uri.to_string(), document.text.clone());
-        self.publish(document.uri, &document.text, Some(document.version))
+        self.publish(document.uri.clone(), &document.text, Some(document.version))
+            .await;
+        self.republish_other_open_project_documents(&document.uri)
             .await;
     }
 
@@ -113,7 +172,9 @@ impl LanguageServer for Backend {
             .write()
             .expect("document store lock poisoned")
             .insert(document.uri.to_string(), change.text.clone());
-        self.publish(document.uri, &change.text, Some(document.version))
+        self.publish(document.uri.clone(), &change.text, Some(document.version))
+            .await;
+        self.republish_other_open_project_documents(&document.uri)
             .await;
     }
 
@@ -129,9 +190,18 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let document = params.text_document_position.text_document;
         let source = self.document(&document.uri);
-        Ok(Some(CompletionResponse::Array(completion_items(
-            source.as_deref(),
-        ))))
+        let mut items = completion_items(source.as_deref());
+        if let Some(source) = source.as_deref()
+            && let Some(path) = document.uri.to_file_path()
+        {
+            items.extend(import_completion_items(
+                path.as_ref(),
+                source,
+                params.text_document_position.position,
+                &self.project_documents(&document.uri),
+            ));
+        }
+        Ok(Some(CompletionResponse::Array(items)))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -139,6 +209,22 @@ impl LanguageServer for Backend {
         let Some(source) = self.document(&document.uri) else {
             return Ok(None);
         };
+        if let Some(path) = document.uri.to_file_path()
+            && let Some((_, selected)) =
+                symbol_at(&source, params.text_document_position_params.position)
+            && let Some(identity) = symbol_identity(path.as_ref(), &source, &selected)
+            && !same_path(path.as_ref(), &identity.0)
+            && let Some(description) =
+                project_symbol_description(&self.project_documents(&document.uri), &identity)
+        {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("```orviscript\n{description}\n```"),
+                }),
+                range: Some(span_range(&source, selected.span)),
+            }));
+        }
         Ok(hover_at(
             &source,
             params.text_document_position_params.position,
@@ -189,6 +275,19 @@ impl LanguageServer for Backend {
         else {
             return Ok(None);
         };
+        if let Some(path) = document.uri.to_file_path()
+            && let Some(identity) = symbol_identity(path.as_ref(), &source, &symbol)
+            && let Some(target) = self
+                .project_documents(&document.uri)
+                .into_iter()
+                .find(|candidate| same_path(&candidate.path, &identity.0))
+            && let Some(span) = exported_definition_span(&target.source, &identity.1)
+        {
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+                target.uri,
+                span_range(&target.source, span),
+            ))));
+        }
         Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
             document.uri,
             span_range(&source, symbol.definition),
@@ -204,15 +303,25 @@ impl LanguageServer for Backend {
         else {
             return Ok(None);
         };
-        let locations = analysis
-            .symbols
-            .iter()
-            .filter(|symbol| {
-                symbol.definition == selected.definition
-                    && (params.context.include_declaration || !symbol.is_definition)
-            })
-            .map(|symbol| Location::new(document.uri.clone(), span_range(&source, symbol.span)))
-            .collect();
+        let locations = if let Some(path) = document.uri.to_file_path()
+            && let Some(identity) = symbol_identity(path.as_ref(), &source, &selected)
+        {
+            project_symbol_locations(
+                &self.project_documents(&document.uri),
+                &identity,
+                params.context.include_declaration,
+            )
+        } else {
+            analysis
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.definition == selected.definition
+                        && (params.context.include_declaration || !symbol.is_definition)
+                })
+                .map(|symbol| Location::new(document.uri.clone(), span_range(&source, symbol.span)))
+                .collect()
+        };
         Ok(Some(locations))
     }
 
@@ -254,6 +363,35 @@ impl LanguageServer for Backend {
                 params.new_name
             )));
         }
+        if let Some(path) = document.uri.to_file_path()
+            && let Some(identity) = symbol_identity(path.as_ref(), &source, &selected)
+        {
+            let project_documents = self.project_documents(&document.uri);
+            if project_documents.iter().any(|document| {
+                let parsed = parse(&document.source);
+                !parsed.has_errors()
+                    && analyze_program(&parsed.program)
+                        .symbols
+                        .iter()
+                        .any(|symbol| symbol.is_definition && symbol.name == params.new_name)
+            }) {
+                return Err(Error::invalid_params(format!(
+                    "name '{}' is already declared in this project",
+                    params.new_name
+                )));
+            }
+            let mut changes = HashMap::new();
+            for location in project_symbol_locations(&project_documents, &identity, true) {
+                changes
+                    .entry(location.uri)
+                    .or_insert_with(Vec::new)
+                    .push(TextEdit::new(location.range, params.new_name.clone()));
+            }
+            return Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..WorkspaceEdit::default()
+            }));
+        }
         let edits = analysis
             .symbols
             .iter()
@@ -265,6 +403,363 @@ impl LanguageServer for Backend {
             ..WorkspaceEdit::default()
         }))
     }
+}
+
+fn load_project_documents(uri: &Uri, overlays: &HashMap<String, String>) -> Vec<ProjectDocument> {
+    let Some(path) = uri.to_file_path().map(|path| path.into_owned()) else {
+        return Vec::new();
+    };
+    let Ok(project) = Project::discover(&path) else {
+        return Vec::new();
+    };
+    let Ok(mut paths) = project.source_files() else {
+        return Vec::new();
+    };
+    if !paths.iter().any(|candidate| same_path(candidate, &path)) {
+        paths.push(path);
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let uri = Uri::from_file_path(&path)?;
+            let source =
+                overlay_source(overlays, &path).or_else(|| fs::read_to_string(&path).ok())?;
+            Some(ProjectDocument { uri, path, source })
+        })
+        .collect()
+}
+
+fn overlay_source(overlays: &HashMap<String, String>, path: &Path) -> Option<String> {
+    overlays.iter().find_map(|(uri, source)| {
+        let uri = uri.parse::<Uri>().ok()?;
+        let overlay_path = uri.to_file_path()?;
+        same_path(overlay_path.as_ref(), path).then(|| source.clone())
+    })
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn symbol_identity(
+    module_path: &Path,
+    source: &str,
+    selected: &SymbolOccurrence,
+) -> Option<(PathBuf, String)> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return None;
+    }
+    for statement in &parsed.program.statements {
+        if let StatementKind::Import {
+            names,
+            source: import_source,
+        } = &statement.kind
+            && !import_source.starts_with("std:")
+            && let Some(name) = names
+                .iter()
+                .find(|name| name.span == selected.definition && name.name == selected.name)
+        {
+            let path = module_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(import_source);
+            return Some((path.canonicalize().unwrap_or(path), name.name.clone()));
+        }
+        let StatementKind::Export(declaration) = &statement.kind else {
+            continue;
+        };
+        if declaration_name(declaration)
+            .is_some_and(|name| name.span == selected.definition && name.name == selected.name)
+        {
+            return Some((
+                module_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| module_path.to_path_buf()),
+                selected.name.clone(),
+            ));
+        }
+    }
+    None
+}
+
+fn declaration_name(statement: &Statement) -> Option<&orvi_syntax::Identifier> {
+    match &statement.kind {
+        StatementKind::Variable { name, .. }
+        | StatementKind::Function { name, .. }
+        | StatementKind::Struct { name, .. }
+        | StatementKind::Interface { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+fn exported_definition_span(source: &str, name: &str) -> Option<Span> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return None;
+    }
+    parsed.program.statements.iter().find_map(|statement| {
+        let StatementKind::Export(declaration) = &statement.kind else {
+            return None;
+        };
+        declaration_name(declaration)
+            .filter(|identifier| identifier.name == name)
+            .map(|identifier| identifier.span)
+    })
+}
+
+fn import_definition_spans(
+    module_path: &Path,
+    program: &Program,
+    identity: &(PathBuf, String),
+) -> Vec<Span> {
+    program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Import { names, source } = &statement.kind else {
+                return None;
+            };
+            if source.starts_with("std:") {
+                return None;
+            }
+            let target = module_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(source);
+            if !same_path(&target, &identity.0) {
+                return None;
+            }
+            Some(
+                names
+                    .iter()
+                    .filter(|name| name.name == identity.1)
+                    .map(|name| name.span)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+fn project_symbol_locations(
+    documents: &[ProjectDocument],
+    identity: &(PathBuf, String),
+    include_declaration: bool,
+) -> Vec<Location> {
+    let mut locations = Vec::new();
+    for document in documents {
+        let parsed = parse(&document.source);
+        if parsed.has_errors() {
+            continue;
+        }
+        let analysis = analyze_program(&parsed.program);
+        let mut definitions = import_definition_spans(&document.path, &parsed.program, identity);
+        if same_path(&document.path, &identity.0)
+            && let Some(span) = exported_definition_span(&document.source, &identity.1)
+        {
+            definitions.push(span);
+        }
+        locations.extend(
+            analysis
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    definitions.contains(&symbol.definition)
+                        && (include_declaration || !symbol.is_definition)
+                })
+                .map(|symbol| {
+                    Location::new(
+                        document.uri.clone(),
+                        span_range(&document.source, symbol.span),
+                    )
+                }),
+        );
+    }
+    locations
+}
+
+fn import_diagnostics(
+    module_path: &Path,
+    source: &str,
+    overlays: &HashMap<String, String>,
+) -> Vec<Diagnostic> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    for statement in &parsed.program.statements {
+        let StatementKind::Import {
+            names,
+            source: import_source,
+        } = &statement.kind
+        else {
+            continue;
+        };
+        if import_source.starts_with("std:") {
+            continue;
+        }
+        if Path::new(import_source)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("orvi")
+        {
+            result.push(diagnostic(
+                source,
+                statement.span,
+                "local module path must end with '.orvi'".into(),
+            ));
+            continue;
+        }
+        let target_path = module_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(import_source);
+        let target_source = overlay_source(overlays, &target_path)
+            .or_else(|| fs::read_to_string(&target_path).ok());
+        let Some(target_source) = target_source else {
+            result.push(diagnostic(
+                source,
+                statement.span,
+                format!("could not resolve module '{}'", target_path.display()),
+            ));
+            continue;
+        };
+        let target = parse(&target_source);
+        if target.has_errors() {
+            result.push(diagnostic(
+                source,
+                statement.span,
+                format!(
+                    "imported module '{}' contains syntax errors",
+                    target_path.display()
+                ),
+            ));
+            continue;
+        }
+        let exports = target
+            .program
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                let StatementKind::Export(declaration) = &statement.kind else {
+                    return None;
+                };
+                declaration_name(declaration).map(|name| name.name.as_str())
+            })
+            .collect::<HashSet<_>>();
+        for name in names {
+            if !exports.contains(name.name.as_str()) {
+                result.push(diagnostic(
+                    source,
+                    name.span,
+                    format!(
+                        "module '{}' has no export '{}'",
+                        target_path.display(),
+                        name.name
+                    ),
+                ));
+            }
+        }
+    }
+    result
+}
+
+fn import_completion_items(
+    module_path: &Path,
+    source: &str,
+    cursor: Position,
+    documents: &[ProjectDocument],
+) -> Vec<CompletionItem> {
+    let Some(offset) = offset_at_position(source, cursor) else {
+        return Vec::new();
+    };
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return Vec::new();
+    }
+    let Some(import_source) = parsed.program.statements.iter().find_map(|statement| {
+        let StatementKind::Import { source, .. } = &statement.kind else {
+            return None;
+        };
+        (statement.span.start() <= offset
+            && offset <= statement.span.end()
+            && !source.starts_with("std:"))
+        .then_some(source)
+    }) else {
+        return Vec::new();
+    };
+    let target_path = module_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(import_source);
+    let Some(target) = documents
+        .iter()
+        .find(|document| same_path(&document.path, &target_path))
+    else {
+        return Vec::new();
+    };
+    let target = parse(&target.source);
+    if target.has_errors() {
+        return Vec::new();
+    }
+    target
+        .program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Export(declaration) = &statement.kind else {
+                return None;
+            };
+            let name = declaration_name(declaration)?;
+            let kind = match &declaration.kind {
+                StatementKind::Function { .. } => CompletionItemKind::FUNCTION,
+                StatementKind::Struct { .. } => CompletionItemKind::STRUCT,
+                StatementKind::Interface { .. } => CompletionItemKind::INTERFACE,
+                StatementKind::Variable { .. } => CompletionItemKind::VARIABLE,
+                _ => return None,
+            };
+            Some(CompletionItem {
+                label: name.name.clone(),
+                kind: Some(kind),
+                detail: Some(format!("export from {import_source}")),
+                ..CompletionItem::default()
+            })
+        })
+        .collect()
+}
+
+fn project_symbol_description(
+    documents: &[ProjectDocument],
+    identity: &(PathBuf, String),
+) -> Option<String> {
+    let target = documents
+        .iter()
+        .find(|document| same_path(&document.path, &identity.0))?;
+    let definition = exported_definition_span(&target.source, &identity.1)?;
+    let parsed = parse(&target.source);
+    let symbol = analyze_program(&parsed.program)
+        .symbols
+        .into_iter()
+        .find(|symbol| symbol.is_definition && symbol.definition == definition)?;
+    let kind = match symbol.kind {
+        orvi_sema::SymbolKind::Variable => "let",
+        orvi_sema::SymbolKind::Constant => "const",
+        orvi_sema::SymbolKind::Function => "fn",
+        orvi_sema::SymbolKind::Struct => "struct",
+        orvi_sema::SymbolKind::Interface => "interface",
+        orvi_sema::SymbolKind::Import => "import",
+        orvi_sema::SymbolKind::Task => "task",
+        orvi_sema::SymbolKind::Parameter => "parameter",
+    };
+    Some(format!(
+        "{kind} {}: {}",
+        symbol.name,
+        symbol.type_name.unwrap_or_else(|| "any".into())
+    ))
 }
 
 fn symbol_at(source: &str, position: Position) -> Option<(Analysis, SymbolOccurrence)> {
@@ -291,6 +786,10 @@ fn is_identifier(name: &str) -> bool {
 }
 
 pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
+    diagnostics_with_modules(source, &HashMap::new())
+}
+
+fn diagnostics_with_modules(source: &str, modules: &HashMap<String, Program>) -> Vec<Diagnostic> {
     let parsed = parse(source);
     let mut diagnostics = parsed
         .lexical_errors
@@ -305,12 +804,50 @@ pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
         .collect::<Vec<_>>();
     if !parsed.has_errors() {
         diagnostics.extend(
-            analyze(&parsed.program)
+            analyze_program_with_modules(&parsed.program, modules)
+                .errors
                 .into_iter()
                 .map(|error| diagnostic(source, error.span, error.message)),
         );
     }
     diagnostics
+}
+
+fn imported_programs(
+    module_path: &Path,
+    source: &str,
+    documents: &[ProjectDocument],
+) -> HashMap<String, Program> {
+    let parsed = parse(source);
+    if parsed.has_errors() {
+        return HashMap::new();
+    }
+    parsed
+        .program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Import {
+                source: import_source,
+                ..
+            } = &statement.kind
+            else {
+                return None;
+            };
+            if import_source.starts_with("std:") {
+                return None;
+            }
+            let target_path = module_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(import_source);
+            let target = documents
+                .iter()
+                .find(|document| same_path(&document.path, &target_path))?;
+            let target = parse(&target.source);
+            (!target.has_errors()).then(|| (import_source.clone(), target.program))
+        })
+        .collect()
 }
 
 fn semantic_tokens_options() -> SemanticTokensOptions {
@@ -897,12 +1434,17 @@ fn offset_at_position(source: &str, position: Position) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_items, diagnostics, document_symbols, format_document, hover_at, is_identifier,
-        semantic_tokens, span_range, symbol_at,
+        completion_items, diagnostics, document_symbols, format_document, hover_at,
+        import_completion_items, import_diagnostics, is_identifier, load_project_documents,
+        position, project_symbol_description, project_symbol_locations, semantic_tokens,
+        span_range, symbol_at, symbol_identity,
     };
     use orvi_syntax::Span;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower_lsp_server::ls_types::{
-        CompletionItemKind, DiagnosticSeverity, HoverContents, Position, Range,
+        CompletionItemKind, DiagnosticSeverity, HoverContents, Position, Range, Uri,
     };
 
     #[test]
@@ -1057,5 +1599,77 @@ mod tests {
         assert!(is_identifier("żółw"));
         assert!(!is_identifier("let"));
         assert!(!is_identifier("two words"));
+    }
+
+    #[test]
+    fn indexes_definitions_and_references_across_project_modules() {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("orvi-lsp-project-{id}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("orvi.toml"),
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+        )
+        .unwrap();
+        let module = "export fn greet(name: string) -> string { return \"Hi \" + name; }";
+        let entry = "import { greet } from \"./greet.orvi\"; print(greet(\"Ada\"));";
+        fs::write(root.join("src/greet.orvi"), module).unwrap();
+        fs::write(root.join("src/main.orvi"), entry).unwrap();
+
+        let entry_uri = Uri::from_file_path(root.join("src/main.orvi")).unwrap();
+        let documents = load_project_documents(&entry_uri, &HashMap::new());
+        assert_eq!(documents.len(), 2);
+        let use_offset = entry.rfind("greet").unwrap() + 1;
+        let (_, selected) = symbol_at(entry, position(entry, use_offset)).unwrap();
+        let identity = symbol_identity(&root.join("src/main.orvi"), entry, &selected).unwrap();
+        assert_eq!(identity.1, "greet");
+        let locations = project_symbol_locations(&documents, &identity, true);
+        assert_eq!(locations.len(), 3);
+        assert_eq!(
+            project_symbol_locations(&documents, &identity, false).len(),
+            1
+        );
+        let completions = import_completion_items(
+            &root.join("src/main.orvi"),
+            entry,
+            Position::new(0, 12),
+            &documents,
+        );
+        assert!(completions.iter().any(|item| item.label == "greet"));
+        assert!(
+            project_symbol_description(&documents, &identity)
+                .unwrap()
+                .contains("fn greet")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_missing_files_and_private_imports() {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("orvi-lsp-imports-{id}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("module.orvi"), "const hidden = 1;").unwrap();
+
+        let source = "import { hidden } from \"./module.orvi\";";
+        let errors = import_diagnostics(&root.join("main.orvi"), source, &HashMap::new());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("has no export 'hidden'"));
+
+        let missing = import_diagnostics(
+            &root.join("main.orvi"),
+            "import { value } from \"./missing.orvi\";",
+            &HashMap::new(),
+        );
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].message.contains("could not resolve module"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
