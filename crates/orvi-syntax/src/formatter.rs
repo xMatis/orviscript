@@ -282,6 +282,8 @@ fn is_word(kind: TokenKind) -> bool {
             | TokenKind::Let
             | TokenKind::Const
             | TokenKind::Fn
+            | TokenKind::Async
+            | TokenKind::Await
             | TokenKind::Struct
             | TokenKind::Interface
             | TokenKind::Import
@@ -340,6 +342,18 @@ mod tests {
         assert_eq!(
             formatted,
             "fn add(a: int, b: int) -> int {\n    // sum\n    return a + b\n}\nlet result = add(1, 2)\n"
+        );
+    }
+
+    #[test]
+    fn formats_async_functions_and_await() {
+        let formatted = format_source(
+            "async fn fetch(url:string)->Result<string,string>{return await http.get_async(url)}",
+        )
+        .expect("async source formats");
+        assert_eq!(
+            formatted,
+            "async fn fetch(url: string) -> Result<string, string> {\n    return await http.get_async(url)\n}\n"
         );
     }
 

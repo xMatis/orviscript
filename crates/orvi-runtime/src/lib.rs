@@ -1,13 +1,14 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_recursion::async_recursion;
 use orvi_project::resolve_import;
 use orvi_syntax::{
     BinaryOperator, Expression, ExpressionKind, Literal, Parameter, PatternKind, Program, Span,
@@ -15,6 +16,8 @@ use orvi_syntax::{
 };
 
 type MapEntries = Vec<(String, Value)>;
+const MAX_ASYNC_TASKS_PER_SCOPE: usize = 10_000;
+const GC_STATEMENT_INTERVAL: usize = 256;
 
 #[derive(Clone)]
 pub enum Value {
@@ -37,6 +40,8 @@ pub enum Value {
     NativeModule(NativeModule),
     NativeFunction(NativeFunction),
     Function(Rc<UserFunction>),
+    Future(Rc<RefCell<FutureValue>>),
+    AsyncTask(Rc<RefCell<AsyncTaskValue>>),
     NativePrint,
 }
 
@@ -113,6 +118,59 @@ pub struct UserFunction {
     return_type: Option<TypeAnnotation>,
     body: Vec<Statement>,
     closure: Environment,
+    is_async: bool,
+}
+
+#[derive(Clone)]
+enum FutureState {
+    Pending {
+        function: Rc<UserFunction>,
+        arguments: Vec<Value>,
+    },
+    Sleeping(Duration),
+    Native(NativeAsyncOperation),
+    Joining(Rc<RefCell<AsyncTaskValue>>),
+    TimingOut {
+        future: Rc<RefCell<FutureValue>>,
+        duration: Duration,
+    },
+    Running,
+    Ready(Result<Value, RuntimeError>),
+}
+
+#[derive(Clone)]
+enum NativeAsyncOperation {
+    FsReadText(PathBuf),
+    FsWriteText {
+        path: PathBuf,
+        contents: String,
+    },
+    ProcessRun {
+        program: String,
+        arguments: Vec<String>,
+        cwd: PathBuf,
+    },
+    HttpRequest {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    },
+}
+
+pub struct FutureValue {
+    state: FutureState,
+}
+
+struct Cancellation {
+    cancelled: Cell<bool>,
+    notify: tokio::sync::Notify,
+}
+
+pub struct AsyncTaskValue {
+    handle: Option<tokio::task::JoinHandle<Result<Value, RuntimeError>>>,
+    result: Option<Result<Value, RuntimeError>>,
+    cancellation: Rc<Cancellation>,
 }
 
 #[derive(Clone)]
@@ -160,7 +218,9 @@ pub enum NativeFunction {
     JsonParse,
     JsonStringify,
     FsReadText,
+    FsReadTextAsync,
     FsWriteText,
+    FsWriteTextAsync,
     FsExists,
     FsCreateDirAll,
     FsRemoveFile,
@@ -171,15 +231,23 @@ pub enum NativeFunction {
     EnvGet,
     EnvCurrentDir,
     ProcessRun,
+    ProcessRunAsync,
     TerminalInput,
     TerminalConfirm,
     TerminalPassword,
     TaskResult,
     HttpGet,
+    HttpGetAsync,
     HttpRequest,
+    HttpRequestAsync,
     TimeUnixMs,
     TimeMonotonicMs,
     TimeSleepMs,
+    TimeSleepAsync,
+    TaskSpawn,
+    TaskJoin,
+    TaskCancel,
+    TaskTimeout,
 }
 
 #[derive(Clone, Debug)]
@@ -352,10 +420,29 @@ fn execute_internal(
     context: ExecutionContext,
     entry_file: Option<PathBuf>,
 ) -> Result<Execution, RuntimeError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("OrviScript async executor");
+    let local = tokio::task::LocalSet::new();
+    local.block_on(
+        &runtime,
+        execute_internal_async(program, context, entry_file),
+    )
+}
+
+async fn execute_internal_async(
+    program: &Program,
+    context: ExecutionContext,
+    entry_file: Option<PathBuf>,
+) -> Result<Execution, RuntimeError> {
     let mut interpreter = Interpreter::new(context, entry_file);
-    let result = interpreter.execute_statements(&program.statements);
-    let cleanup = interpreter.run_deferred();
+    let result = interpreter.execute_statements(&program.statements).await;
+    let tasks = interpreter.finish_current_task_scope().await;
+    let cleanup = interpreter.run_deferred().await;
     let control = result?;
+    tasks?;
     cleanup?;
     let value = match control {
         Control::Continue(value) => value,
@@ -369,7 +456,7 @@ fn execute_internal(
     };
     interpreter.collect_finished(std::slice::from_ref(&value));
     Ok(Execution {
-        output: interpreter.output,
+        output: interpreter.output.borrow().clone(),
         value,
         collected_objects: interpreter.collected_objects,
     })
@@ -381,17 +468,36 @@ pub fn execute_tasks(
     entry_file: PathBuf,
     selected: &[String],
 ) -> Result<TaskExecution, RuntimeError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("OrviScript async executor");
+    let local = tokio::task::LocalSet::new();
+    local.block_on(
+        &runtime,
+        execute_tasks_async(program, context, entry_file, selected),
+    )
+}
+
+async fn execute_tasks_async(
+    program: &Program,
+    context: ExecutionContext,
+    entry_file: PathBuf,
+    selected: &[String],
+) -> Result<TaskExecution, RuntimeError> {
     let tasks = collect_tasks(program)?;
     validate_tasks(&tasks, selected)?;
     let mut interpreter = Interpreter::new(context, Some(entry_file));
-    let control = interpreter.execute_statements(&program.statements)?;
+    let control = interpreter.execute_statements(&program.statements).await?;
     if matches!(control, Control::Return(_)) {
         return Err(interpreter.error("return is only valid inside a function", Span::empty(0)));
     }
-    let reports = interpreter.run_tasks(&tasks, selected);
-    interpreter.run_deferred()?;
+    let reports = interpreter.run_tasks(&tasks, selected).await;
+    interpreter.finish_current_task_scope().await?;
+    interpreter.run_deferred().await?;
     Ok(TaskExecution {
-        output: interpreter.output,
+        output: interpreter.output.borrow().clone(),
         tasks: reports,
     })
 }
@@ -399,13 +505,17 @@ pub fn execute_tasks(
 struct Interpreter {
     environment: Environment,
     globals: Environment,
-    output: Vec<String>,
+    output: Rc<RefCell<Vec<String>>>,
     function_depth: usize,
     environments: Vec<Weak<RefCell<EnvironmentData>>>,
     lists: Vec<Weak<RefCell<Vec<Value>>>>,
     maps: Vec<Weak<RefCell<MapEntries>>>,
     objects: Vec<Weak<RefCell<StructInstance>>>,
+    futures: Vec<Weak<RefCell<FutureValue>>>,
+    active_futures: Vec<Rc<RefCell<FutureValue>>>,
+    async_tasks: Vec<Weak<RefCell<AsyncTaskValue>>>,
     collected_objects: usize,
+    statements_since_gc: usize,
     deferred: Vec<Vec<Expression>>,
     context: ExecutionContext,
     current_files: Vec<PathBuf>,
@@ -415,6 +525,9 @@ struct Interpreter {
     task_results: HashMap<String, Value>,
     active_task_needs: Option<HashSet<String>>,
     suspended_environments: Vec<Environment>,
+    cancellation: Option<Rc<Cancellation>>,
+    task_scopes: Vec<Vec<Rc<RefCell<AsyncTaskValue>>>>,
+    http_client: Rc<RefCell<Option<reqwest::Client>>>,
 }
 
 fn collect_tasks(program: &Program) -> Result<Vec<TaskDefinition>, RuntimeError> {
@@ -597,13 +710,17 @@ impl Interpreter {
         Self {
             environment: globals.clone(),
             globals: globals.clone(),
-            output: Vec::new(),
+            output: Rc::new(RefCell::new(Vec::new())),
             function_depth: 0,
             environments: vec![Rc::downgrade(&globals.0)],
             lists: Vec::new(),
             maps: Vec::new(),
             objects: Vec::new(),
+            futures: Vec::new(),
+            active_futures: Vec::new(),
+            async_tasks: Vec::new(),
             collected_objects: 0,
+            statements_since_gc: 0,
             deferred: vec![Vec::new()],
             context,
             current_files: entry_file.into_iter().collect(),
@@ -613,14 +730,63 @@ impl Interpreter {
             task_results: HashMap::new(),
             active_task_needs: None,
             suspended_environments: Vec::new(),
+            cancellation: None,
+            task_scopes: vec![Vec::new()],
+            http_client: Rc::new(RefCell::new(None)),
         }
     }
-    fn execute_statements(&mut self, statements: &[Statement]) -> Result<Control, RuntimeError> {
+
+    fn fork_for_async_task(&self, cancellation: Rc<Cancellation>) -> Self {
+        Self {
+            environment: self.environment.clone(),
+            globals: self.globals.clone(),
+            output: self.output.clone(),
+            function_depth: 0,
+            environments: Vec::new(),
+            lists: Vec::new(),
+            maps: Vec::new(),
+            objects: Vec::new(),
+            futures: Vec::new(),
+            active_futures: Vec::new(),
+            async_tasks: Vec::new(),
+            collected_objects: 0,
+            statements_since_gc: 0,
+            deferred: vec![Vec::new()],
+            context: self.context.clone(),
+            current_files: self.current_files.clone(),
+            module_cache: self.module_cache.clone(),
+            module_exports: self.module_exports.clone(),
+            modules_in_progress: HashSet::new(),
+            task_results: self.task_results.clone(),
+            active_task_needs: self.active_task_needs.clone(),
+            suspended_environments: Vec::new(),
+            cancellation: Some(cancellation),
+            task_scopes: vec![Vec::new()],
+            http_client: self.http_client.clone(),
+        }
+    }
+
+    fn check_cancelled(&self, span: Span) -> Result<(), RuntimeError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.cancelled.get())
+        {
+            Err(self.error("task was cancelled", span))
+        } else {
+            Ok(())
+        }
+    }
+    async fn execute_statements(
+        &mut self,
+        statements: &[Statement],
+    ) -> Result<Control, RuntimeError> {
         let mut value = Value::Null;
         for statement in statements {
-            match self.execute_statement(statement)? {
+            self.check_cancelled(statement.span)?;
+            match self.execute_statement(statement).await? {
                 Control::Continue(next) => {
-                    self.collect_garbage(std::slice::from_ref(&next));
+                    self.maybe_collect_garbage(std::slice::from_ref(&next));
                     value = next;
                 }
                 Control::Return(value) => {
@@ -632,7 +798,11 @@ impl Interpreter {
         Ok(Control::Continue(value))
     }
 
-    fn run_tasks(&mut self, tasks: &[TaskDefinition], selected: &[String]) -> Vec<TaskReport> {
+    async fn run_tasks(
+        &mut self,
+        tasks: &[TaskDefinition],
+        selected: &[String],
+    ) -> Vec<TaskReport> {
         let definitions = tasks
             .iter()
             .map(|task| (task.name.clone(), task.clone()))
@@ -660,7 +830,7 @@ impl Interpreter {
             })
             .collect::<HashMap<_, _>>();
         for target in targets {
-            self.run_task(&target, &definitions, &mut reports);
+            self.run_task(&target, &definitions, &mut reports).await;
         }
         tasks
             .iter()
@@ -668,7 +838,8 @@ impl Interpreter {
             .collect()
     }
 
-    fn run_task(
+    #[async_recursion(?Send)]
+    async fn run_task(
         &mut self,
         name: &str,
         definitions: &HashMap<String, TaskDefinition>,
@@ -682,7 +853,7 @@ impl Interpreter {
         }
         let definition = definitions.get(name).expect("task validated").clone();
         for dependency in &definition.needs {
-            self.run_task(dependency, definitions, reports);
+            self.run_task(dependency, definitions, reports).await;
             if reports
                 .get(dependency)
                 .is_some_and(|report| report.status != TaskStatus::Succeeded)
@@ -694,7 +865,7 @@ impl Interpreter {
             }
         }
         reports.get_mut(name).expect("task report exists").status = TaskStatus::Running;
-        match self.execute_task(&definition) {
+        match self.execute_task(&definition).await {
             Ok(value) => {
                 let succeeded = matches!(
                     value,
@@ -723,13 +894,13 @@ impl Interpreter {
         }
     }
 
-    fn execute_task(&mut self, task: &TaskDefinition) -> Result<Value, RuntimeError> {
+    async fn execute_task(&mut self, task: &TaskDefinition) -> Result<Value, RuntimeError> {
         let previous_needs = self
             .active_task_needs
             .replace(task.needs.iter().cloned().collect());
         self.function_depth += 1;
         let environment = self.child_environment(self.globals.clone());
-        let result = self.execute_block(&task.body, environment);
+        let result = self.execute_block(&task.body, environment, true).await;
         self.function_depth -= 1;
         self.active_task_needs = previous_needs;
         let value = match result {
@@ -753,7 +924,8 @@ impl Interpreter {
         Ok(value)
     }
 
-    fn execute_statement(&mut self, statement: &Statement) -> Result<Control, RuntimeError> {
+    #[async_recursion(?Send)]
+    async fn execute_statement(&mut self, statement: &Statement) -> Result<Control, RuntimeError> {
         match &statement.kind {
             StatementKind::Variable {
                 name,
@@ -761,7 +933,7 @@ impl Interpreter {
                 type_annotation,
                 initializer,
             } => {
-                let value = self.evaluate(initializer)?;
+                let value = self.evaluate(initializer).await?;
                 self.require_type(&value, type_annotation.as_ref(), initializer.span)?;
                 self.environment.define(
                     name.name.clone(),
@@ -776,6 +948,7 @@ impl Interpreter {
                 parameters,
                 return_type,
                 body,
+                is_async,
             } => {
                 let function = UserFunction {
                     name: name.name.clone(),
@@ -783,6 +956,7 @@ impl Interpreter {
                     return_type: return_type.clone(),
                     body: body.clone(),
                     closure: self.environment.clone(),
+                    is_async: *is_async,
                 };
                 self.environment.define(
                     name.name.clone(),
@@ -854,7 +1028,7 @@ impl Interpreter {
                 }
 
                 let path = self.resolve_module_path(source, statement.span)?;
-                let module = self.load_module(&path, statement.span)?;
+                let module = self.load_module(&path, statement.span).await?;
                 for name in names {
                     if !self
                         .module_exports
@@ -881,33 +1055,33 @@ impl Interpreter {
                 }
                 Ok(Control::Continue(Value::Null))
             }
-            StatementKind::Export(declaration) => self.execute_statement(declaration),
+            StatementKind::Export(declaration) => self.execute_statement(declaration).await,
             StatementKind::Task { .. } => Ok(Control::Continue(Value::Null)),
             StatementKind::Block(statements) => {
                 let environment = self.child_environment(self.environment.clone());
-                self.execute_block(statements, environment)
+                self.execute_block(statements, environment, false).await
             }
             StatementKind::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                let condition_value = self.evaluate(condition)?;
+                let condition_value = self.evaluate(condition).await?;
                 if self.boolean(condition_value, condition.span)? {
-                    self.execute_statement(then_branch)
+                    self.execute_statement(then_branch).await
                 } else if let Some(branch) = else_branch {
-                    self.execute_statement(branch)
+                    self.execute_statement(branch).await
                 } else {
                     Ok(Control::Continue(Value::Null))
                 }
             }
             StatementKind::While { condition, body } => {
                 loop {
-                    let condition_value = self.evaluate(condition)?;
+                    let condition_value = self.evaluate(condition).await?;
                     if !self.boolean(condition_value, condition.span)? {
                         break;
                     }
-                    if let returned @ Control::Return(_) = self.execute_statement(body)? {
+                    if let returned @ Control::Return(_) = self.execute_statement(body).await? {
                         return Ok(returned);
                     }
                 }
@@ -919,9 +1093,11 @@ impl Interpreter {
                         self.error("return is only valid inside a function", statement.span)
                     );
                 }
-                let value = expression
-                    .as_ref()
-                    .map_or(Ok(Value::Void), |expression| self.evaluate(expression))?;
+                let value = if let Some(expression) = expression {
+                    self.evaluate(expression).await?
+                } else {
+                    Value::Void
+                };
                 Ok(Control::Return(value))
             }
             StatementKind::Defer(expression) => {
@@ -936,7 +1112,7 @@ impl Interpreter {
                 initializer,
                 cleanup,
             } => {
-                let value = self.evaluate(initializer)?;
+                let value = self.evaluate(initializer).await?;
                 self.environment
                     .define(name.name.clone(), value.clone(), false, None);
                 self.deferred
@@ -946,26 +1122,38 @@ impl Interpreter {
                 Ok(Control::Continue(value))
             }
             StatementKind::Expression(expression) => {
-                Ok(Control::Continue(self.evaluate(expression)?))
+                Ok(Control::Continue(self.evaluate(expression).await?))
             }
         }
     }
 
-    fn execute_block(
+    async fn execute_block(
         &mut self,
         statements: &[Statement],
         environment: Environment,
+        scoped_tasks: bool,
     ) -> Result<Control, RuntimeError> {
         let previous = std::mem::replace(&mut self.environment, environment);
         self.suspended_environments.push(previous.clone());
         self.deferred.push(Vec::new());
-        let result = self.execute_statements(statements);
-        let cleanup = self.run_deferred();
+        if scoped_tasks {
+            self.task_scopes.push(Vec::new());
+        }
+        let result = self.execute_statements(statements).await;
+        let tasks = if scoped_tasks {
+            self.finish_current_task_scope().await
+        } else {
+            Ok(())
+        };
+        let cleanup = self.run_deferred().await;
+        if scoped_tasks {
+            self.task_scopes.pop();
+        }
         self.deferred.pop();
         self.suspended_environments.pop();
         self.environment = previous;
         match result {
-            Ok(control) => cleanup.map(|()| control),
+            Ok(control) => tasks.and(cleanup).map(|()| control),
             Err(error) => Err(error),
         }
     }
@@ -977,7 +1165,8 @@ impl Interpreter {
         resolve_import(current_file, source).map_err(|error| self.error(error.to_string(), span))
     }
 
-    fn load_module(&mut self, path: &Path, span: Span) -> Result<Environment, RuntimeError> {
+    #[async_recursion(?Send)]
+    async fn load_module(&mut self, path: &Path, span: Span) -> Result<Environment, RuntimeError> {
         if let Some(environment) = self.module_cache.get(path) {
             return Ok(environment.clone());
         }
@@ -988,7 +1177,7 @@ impl Interpreter {
             ));
         }
 
-        let result = (|| {
+        let result = async {
             let source = std::fs::read_to_string(path).map_err(|error| {
                 self.error(
                     format!("could not read module '{}': {error}", path.display()),
@@ -1012,8 +1201,8 @@ impl Interpreter {
             let previous = std::mem::replace(&mut self.environment, environment.clone());
             self.current_files.push(path.to_path_buf());
             self.deferred.push(Vec::new());
-            let execution = self.execute_statements(&parsed.program.statements);
-            let cleanup = self.run_deferred();
+            let execution = self.execute_statements(&parsed.program.statements).await;
+            let cleanup = self.run_deferred().await;
             self.deferred.pop();
             self.current_files.pop();
             self.environment = previous;
@@ -1025,13 +1214,14 @@ impl Interpreter {
                 .insert(path.to_path_buf(), environment.clone());
             self.module_exports.insert(path.to_path_buf(), exports);
             Ok(environment)
-        })();
+        }
+        .await;
 
         self.modules_in_progress.remove(path);
         result
     }
 
-    fn run_deferred(&mut self) -> Result<(), RuntimeError> {
+    async fn run_deferred(&mut self) -> Result<(), RuntimeError> {
         let deferred = std::mem::take(
             self.deferred
                 .last_mut()
@@ -1039,7 +1229,7 @@ impl Interpreter {
         );
         let mut first_error = None;
         for expression in deferred.into_iter().rev() {
-            if let Err(error) = self.evaluate(&expression)
+            if let Err(error) = self.evaluate(&expression).await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1048,7 +1238,8 @@ impl Interpreter {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn evaluate(&mut self, expression: &Expression) -> Result<Value, RuntimeError> {
+    #[async_recursion(?Send)]
+    async fn evaluate(&mut self, expression: &Expression) -> Result<Value, RuntimeError> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => Ok(match literal {
                 Literal::Null => Value::Null,
@@ -1058,10 +1249,11 @@ impl Interpreter {
                 Literal::String(value) => Value::String(value.clone()),
             }),
             ExpressionKind::List(values) => {
-                let values = values
-                    .iter()
-                    .map(|value| self.evaluate(value))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut evaluated = Vec::with_capacity(values.len());
+                for value in values {
+                    evaluated.push(self.evaluate(value).await?);
+                }
+                let values = evaluated;
                 let values = Rc::new(RefCell::new(values));
                 self.lists.push(Rc::downgrade(&values));
                 Ok(Value::List(values))
@@ -1069,7 +1261,7 @@ impl Interpreter {
             ExpressionKind::Map(entries) => {
                 let mut values = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
-                    values.push((key.clone(), self.evaluate(value)?));
+                    values.push((key.clone(), self.evaluate(value).await?));
                 }
                 let values = Rc::new(RefCell::new(values));
                 self.maps.push(Rc::downgrade(&values));
@@ -1084,7 +1276,7 @@ impl Interpreter {
                 })
             }
             ExpressionKind::Assign { name, value } => {
-                let value = self.evaluate(value)?;
+                let value = self.evaluate(value).await?;
                 self.environment
                     .assign(name.as_str(), value.clone())
                     .map_err(|error| match error {
@@ -1108,11 +1300,11 @@ impl Interpreter {
                 index,
                 value,
             } => {
-                let object = self.evaluate(object)?;
-                let value = self.evaluate(value)?;
+                let object = self.evaluate(object).await?;
+                let value = self.evaluate(value).await?;
                 match object {
                     Value::List(values) => {
-                        let index = self.list_index(index)?;
+                        let index = self.list_index(index).await?;
                         let mut values = values.borrow_mut();
                         let Some(slot) = values.get_mut(index) else {
                             return Err(self.error("list index is out of bounds", expression.span));
@@ -1121,7 +1313,7 @@ impl Interpreter {
                         Ok(value)
                     }
                     Value::Map(values) => {
-                        let key = self.map_key(index)?;
+                        let key = self.map_key(index).await?;
                         let mut values = values.borrow_mut();
                         if let Some((_, slot)) =
                             values.iter_mut().find(|(candidate, _)| candidate == &key)
@@ -1140,8 +1332,8 @@ impl Interpreter {
                 field,
                 value,
             } => {
-                let object = self.evaluate(object)?;
-                let value = self.evaluate(value)?;
+                let object = self.evaluate(object).await?;
+                let value = self.evaluate(value).await?;
                 if let Value::Map(values) = object {
                     let mut values = values.borrow_mut();
                     if let Some((_, slot)) = values
@@ -1181,7 +1373,7 @@ impl Interpreter {
                 Ok(value)
             }
             ExpressionKind::Unary { operator, operand } => {
-                let value = self.evaluate(operand)?;
+                let value = self.evaluate(operand).await?;
                 match (operator, value) {
                     (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
                     (UnaryOperator::Negate, Value::Integer(value)) => value
@@ -1201,26 +1393,33 @@ impl Interpreter {
                 left,
                 operator,
                 right,
-            } => self.evaluate_binary(left, *operator, right, expression.span),
+            } => {
+                self.evaluate_binary(left, *operator, right, expression.span)
+                    .await
+            }
             ExpressionKind::Call { callee, arguments } => {
-                let callee = self.evaluate(callee)?;
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| self.evaluate(argument))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.call(callee, arguments, expression.span)
+                let callee = self.evaluate(callee).await?;
+                let mut evaluated = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    evaluated.push(self.evaluate(argument).await?);
+                }
+                self.call(callee, evaluated, expression.span).await
+            }
+            ExpressionKind::Await(value) => {
+                let value = self.evaluate(value).await?;
+                self.await_future(value, expression.span).await
             }
             ExpressionKind::Index { object, index } => {
-                let object = self.evaluate(object)?;
+                let object = self.evaluate(object).await?;
                 match object {
                     Value::List(values) => {
-                        let index = self.list_index(index)?;
+                        let index = self.list_index(index).await?;
                         values.borrow().get(index).cloned().ok_or_else(|| {
                             self.error("list index is out of bounds", expression.span)
                         })
                     }
                     Value::Map(values) => {
-                        let key = self.map_key(index)?;
+                        let key = self.map_key(index).await?;
                         values
                             .borrow()
                             .iter()
@@ -1234,7 +1433,7 @@ impl Interpreter {
                 }
             }
             ExpressionKind::Member { object, field } => {
-                let object = self.evaluate(object)?;
+                let object = self.evaluate(object).await?;
                 if let Value::NativeModule(module) = object {
                     return module
                         .member(field.as_str())
@@ -1275,7 +1474,7 @@ impl Interpreter {
                 })
             }
             ExpressionKind::Match { value, arms } => {
-                let value = self.evaluate(value)?;
+                let value = self.evaluate(value).await?;
                 for arm in arms {
                     let Some(binding_value) = pattern_binding(&arm.pattern.kind, &value) else {
                         continue;
@@ -1292,13 +1491,13 @@ impl Interpreter {
                         environment.define(binding.name.clone(), binding_value, false, None);
                     }
                     let previous = std::mem::replace(&mut self.environment, environment);
-                    let result = self.evaluate(&arm.value);
+                    let result = self.evaluate(&arm.value).await;
                     self.environment = previous;
                     return result;
                 }
                 Err(self.error("match expression has no matching arm", expression.span))
             }
-            ExpressionKind::Try(value) => match self.evaluate(value)? {
+            ExpressionKind::Try(value) => match self.evaluate(value).await? {
                 Value::Variant {
                     tag: VariantTag::Some | VariantTag::Ok,
                     payload: Some(value),
@@ -1316,17 +1515,17 @@ impl Interpreter {
         }
     }
 
-    fn evaluate_binary(
+    async fn evaluate_binary(
         &mut self,
         left: &Expression,
         operator: BinaryOperator,
         right: &Expression,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let left_value = self.evaluate(left)?;
+        let left_value = self.evaluate(left).await?;
         if operator == BinaryOperator::And {
             return if self.boolean(left_value, left.span)? {
-                let right_value = self.evaluate(right)?;
+                let right_value = self.evaluate(right).await?;
                 Ok(Value::Bool(self.boolean(right_value, right.span)?))
             } else {
                 Ok(Value::Bool(false))
@@ -1336,11 +1535,11 @@ impl Interpreter {
             return if self.boolean(left_value, left.span)? {
                 Ok(Value::Bool(true))
             } else {
-                let right_value = self.evaluate(right)?;
+                let right_value = self.evaluate(right).await?;
                 Ok(Value::Bool(self.boolean(right_value, right.span)?))
             };
         }
-        let right_value = self.evaluate(right)?;
+        let right_value = self.evaluate(right).await?;
         match operator {
             BinaryOperator::Add => self.add(left_value, right_value, span),
             BinaryOperator::Subtract => {
@@ -1369,7 +1568,8 @@ impl Interpreter {
         }
     }
 
-    fn call(
+    #[async_recursion(?Send)]
+    async fn call(
         &mut self,
         callee: Value,
         arguments: Vec<Value>,
@@ -1377,7 +1577,7 @@ impl Interpreter {
     ) -> Result<Value, RuntimeError> {
         match callee {
             Value::NativePrint => {
-                self.output.push(
+                self.output.borrow_mut().push(
                     arguments
                         .iter()
                         .map(ToString::to_string)
@@ -1410,7 +1610,7 @@ impl Interpreter {
                     payload: arguments.into_iter().next().map(Box::new),
                 })
             }
-            Value::NativeFunction(function) => self.call_native(function, arguments, span),
+            Value::NativeFunction(function) => self.call_native(function, arguments, span).await,
             Value::Function(function) => {
                 if arguments.len() != function.parameters.len() {
                     return Err(self.error(
@@ -1423,35 +1623,20 @@ impl Interpreter {
                         span,
                     ));
                 }
-                let environment = self.child_environment(function.closure.clone());
-                for (parameter, value) in function.parameters.iter().zip(arguments) {
+                for (parameter, value) in function.parameters.iter().zip(&arguments) {
                     self.require_type(
-                        &value,
+                        value,
                         parameter.type_annotation.as_ref(),
                         parameter.name.span,
                     )?;
-                    environment.define(
-                        parameter.name.name.clone(),
-                        value,
-                        true,
-                        parameter.type_annotation.clone(),
-                    );
                 }
-                self.function_depth += 1;
-                let result = self.execute_block(&function.body, environment);
-                self.function_depth -= 1;
-                let value = match result {
-                    Ok(Control::Continue(_)) => Value::Void,
-                    Ok(Control::Return(value)) => value,
-                    Err(mut error) => {
-                        let Some(value) = error.propagated.take() else {
-                            return Err(error);
-                        };
-                        value
-                    }
-                };
-                self.require_type(&value, function.return_type.as_ref(), span)?;
-                Ok(value)
+                if function.is_async {
+                    return Ok(self.register_future(FutureState::Pending {
+                        function,
+                        arguments,
+                    }));
+                }
+                self.execute_user_function(function, arguments, span).await
             }
             Value::StructType(definition) => {
                 let required = definition
@@ -1472,13 +1657,13 @@ impl Interpreter {
                 }
                 let environment = self.child_environment(definition.closure.clone());
                 let previous = std::mem::replace(&mut self.environment, environment);
-                let values = (|| {
+                let values = async {
                     let mut values = HashMap::new();
                     for (index, field) in definition.fields.iter().enumerate() {
                         let value = if let Some(value) = arguments.get(index) {
                             value.clone()
                         } else if let Some(default) = &field.default {
-                            self.evaluate(default)?
+                            self.evaluate(default).await?
                         } else {
                             return Err(self.error("missing required struct field", field.span));
                         };
@@ -1492,7 +1677,8 @@ impl Interpreter {
                         values.insert(field.name.name.clone(), value);
                     }
                     Ok(values)
-                })();
+                }
+                .await;
                 self.environment = previous;
                 let values = values?;
                 let instance = Rc::new(RefCell::new(StructInstance {
@@ -1506,7 +1692,386 @@ impl Interpreter {
         }
     }
 
-    fn call_native(
+    #[async_recursion(?Send)]
+    async fn execute_user_function(
+        &mut self,
+        function: Rc<UserFunction>,
+        arguments: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let environment = self.child_environment(function.closure.clone());
+        for (parameter, value) in function.parameters.iter().zip(arguments) {
+            environment.define(
+                parameter.name.name.clone(),
+                value,
+                true,
+                parameter.type_annotation.clone(),
+            );
+        }
+        self.function_depth += 1;
+        let result = self.execute_block(&function.body, environment, true).await;
+        self.function_depth -= 1;
+        let value = match result {
+            Ok(Control::Continue(_)) => Value::Void,
+            Ok(Control::Return(value)) => value,
+            Err(mut error) => {
+                let Some(value) = error.propagated.take() else {
+                    return Err(error);
+                };
+                value
+            }
+        };
+        self.require_type(&value, function.return_type.as_ref(), span)?;
+        Ok(value)
+    }
+
+    fn register_future(&mut self, state: FutureState) -> Value {
+        let future = Rc::new(RefCell::new(FutureValue { state }));
+        self.futures.push(Rc::downgrade(&future));
+        Value::Future(future)
+    }
+
+    fn spawn_async_task(
+        &mut self,
+        future: Value,
+        span: Span,
+    ) -> Result<Rc<RefCell<AsyncTaskValue>>, RuntimeError> {
+        let Value::Future(future_value) = &future else {
+            return Err(self.error("task.spawn expects Future<T>", span));
+        };
+        if self
+            .task_scopes
+            .last()
+            .is_some_and(|scope| scope.len() >= MAX_ASYNC_TASKS_PER_SCOPE)
+        {
+            return Err(self.error(
+                format!("async task scope limit of {MAX_ASYNC_TASKS_PER_SCOPE} tasks was exceeded"),
+                span,
+            ));
+        }
+        let cancellation = Rc::new(Cancellation {
+            cancelled: Cell::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        let mut child = self.fork_for_async_task(cancellation.clone());
+        let identity = Rc::as_ptr(future_value) as usize;
+        self.futures.retain(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|candidate| Rc::as_ptr(&candidate) as usize != identity)
+        });
+        child.futures.push(Rc::downgrade(future_value));
+        let handle = tokio::task::spawn_local(async move {
+            let result = child.await_future(future, span).await;
+            let tasks = child.finish_current_task_scope().await;
+            let cleanup = child.run_deferred().await;
+            match result {
+                Ok(value) => {
+                    tasks?;
+                    cleanup?;
+                    Ok(value)
+                }
+                Err(error) => Err(error),
+            }
+        });
+        let task = Rc::new(RefCell::new(AsyncTaskValue {
+            handle: Some(handle),
+            result: None,
+            cancellation,
+        }));
+        self.async_tasks.push(Rc::downgrade(&task));
+        self.task_scopes
+            .last_mut()
+            .expect("interpreter always has a task scope")
+            .push(task.clone());
+        Ok(task)
+    }
+
+    async fn join_async_task(
+        &self,
+        task: Rc<RefCell<AsyncTaskValue>>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let handle = {
+            let mut task = task.borrow_mut();
+            if let Some(result) = &task.result {
+                return result.clone();
+            }
+            task.handle
+                .take()
+                .ok_or_else(|| self.error("task is already being joined", span))?
+        };
+        let result = handle
+            .await
+            .map_err(|error| self.error(format!("async task failed: {error}"), span))?;
+        task.borrow_mut().result = Some(result.clone());
+        result
+    }
+
+    async fn timeout_async_task(
+        &self,
+        task: Rc<RefCell<AsyncTaskValue>>,
+        duration: Duration,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let mut handle = {
+            let mut task = task.borrow_mut();
+            if let Some(result) = &task.result {
+                return result.clone().map(ok_value);
+            }
+            task.handle
+                .take()
+                .ok_or_else(|| self.error("task is already being joined", span))?
+        };
+        match tokio::time::timeout(duration, &mut handle).await {
+            Ok(joined) => {
+                let result = joined
+                    .map_err(|error| self.error(format!("async task failed: {error}"), span))?;
+                task.borrow_mut().result = Some(result.clone());
+                result.map(ok_value)
+            }
+            Err(_) => {
+                let cancellation = task.borrow().cancellation.clone();
+                cancellation.cancelled.set(true);
+                cancellation.notify.notify_waiters();
+                let child_result = handle
+                    .await
+                    .map_err(|error| self.error(format!("async task failed: {error}"), span))?;
+                task.borrow_mut().result = Some(child_result);
+                Ok(err_value("operation timed out"))
+            }
+        }
+    }
+
+    async fn finish_current_task_scope(&self) -> Result<(), RuntimeError> {
+        let tasks = self
+            .task_scopes
+            .last()
+            .expect("interpreter always has a task scope")
+            .clone();
+        let mut first_error = None;
+        for task in tasks {
+            if task.borrow().result.is_some() {
+                continue;
+            }
+            if let Err(error) = self.join_async_task(task, Span::empty(0)).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[async_recursion(?Send)]
+    async fn await_future(&mut self, value: Value, span: Span) -> Result<Value, RuntimeError> {
+        let Value::Future(future) = value else {
+            return Err(self.error("await requires Future<T>", span));
+        };
+        let pending = {
+            let mut future = future.borrow_mut();
+            match &future.state {
+                FutureState::Ready(result) => return result.clone(),
+                FutureState::Running => {
+                    return Err(self.error("future is already being awaited", span));
+                }
+                FutureState::Pending { .. }
+                | FutureState::Sleeping(_)
+                | FutureState::Native(_)
+                | FutureState::Joining(_)
+                | FutureState::TimingOut { .. } => {}
+            }
+            std::mem::replace(&mut future.state, FutureState::Running)
+        };
+        self.active_futures.push(future.clone());
+        let result = match pending {
+            FutureState::Pending {
+                function,
+                arguments,
+            } => self.execute_user_function(function, arguments, span).await,
+            FutureState::Sleeping(duration) => {
+                if let Some(cancellation) = self.cancellation.clone() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(duration) => Ok(ok_value(Value::Void)),
+                        _ = cancellation.notify.notified() => {
+                            Err(self.error("task was cancelled", span))
+                        }
+                    }
+                } else {
+                    tokio::time::sleep(duration).await;
+                    Ok(ok_value(Value::Void))
+                }
+            }
+            FutureState::Native(operation) => self.execute_native_async(operation, span).await,
+            FutureState::Joining(task) => match self.join_async_task(task, span).await {
+                Ok(value) => Ok(ok_value(value)),
+                Err(error) => Ok(err_value(error.message)),
+            },
+            FutureState::TimingOut { future, duration } => {
+                let task = self.spawn_async_task(Value::Future(future), span)?;
+                self.timeout_async_task(task, duration, span).await
+            }
+            FutureState::Running | FutureState::Ready(_) => {
+                unreachable!("future state was checked before replacement")
+            }
+        };
+        self.active_futures.pop();
+        future.borrow_mut().state = FutureState::Ready(result.clone());
+        result
+    }
+
+    async fn execute_native_async(
+        &mut self,
+        operation: NativeAsyncOperation,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(cancellation) = self.cancellation.clone() {
+            tokio::select! {
+                result = self.execute_native_async_inner(operation, span) => result,
+                _ = cancellation.notify.notified() => {
+                    Err(RuntimeError {
+                        message: "task was cancelled".into(),
+                        span,
+                        propagated: None,
+                    })
+                }
+            }
+        } else {
+            self.execute_native_async_inner(operation, span).await
+        }
+    }
+
+    async fn execute_native_async_inner(
+        &mut self,
+        operation: NativeAsyncOperation,
+        _span: Span,
+    ) -> Result<Value, RuntimeError> {
+        match operation {
+            NativeAsyncOperation::FsReadText(path) => Ok(result_value(
+                tokio::fs::read_to_string(path).await.map(Value::String),
+            )),
+            NativeAsyncOperation::FsWriteText { path, contents } => Ok(result_value(
+                tokio::fs::write(path, contents).await.map(|()| Value::Void),
+            )),
+            NativeAsyncOperation::ProcessRun {
+                program,
+                arguments,
+                cwd,
+            } => match tokio::process::Command::new(program)
+                .args(arguments)
+                .current_dir(cwd)
+                .output()
+                .await
+            {
+                Ok(output) => Ok(ok_value(self.map_value(vec![
+                    (
+                        "exit_code".into(),
+                        output
+                            .status
+                            .code()
+                            .map_or(Value::Null, |code| Value::Integer(i64::from(code))),
+                    ),
+                    ("success".into(), Value::Bool(output.status.success())),
+                    (
+                        "stdout".into(),
+                        Value::String(String::from_utf8_lossy(&output.stdout).into_owned()),
+                    ),
+                    (
+                        "stderr".into(),
+                        Value::String(String::from_utf8_lossy(&output.stderr).into_owned()),
+                    ),
+                ]))),
+                Err(error) => Ok(err_value(error.to_string())),
+            },
+            NativeAsyncOperation::HttpRequest {
+                method,
+                url,
+                headers,
+                body,
+            } => {
+                const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Ok(err_value("http URL must use http:// or https://"));
+                }
+                let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+                    Ok(method) => method,
+                    Err(error) => return Ok(err_value(format!("invalid HTTP method: {error}"))),
+                };
+                let existing_client = self.http_client.borrow().clone();
+                let client = if let Some(client) = existing_client {
+                    client
+                } else {
+                    let client = match reqwest::Client::builder()
+                        .connect_timeout(Duration::from_secs(10))
+                        .timeout(Duration::from_secs(30))
+                        .pool_idle_timeout(Duration::from_secs(30))
+                        .build()
+                    {
+                        Ok(client) => client,
+                        Err(error) => return Ok(err_value(error.to_string())),
+                    };
+                    *self.http_client.borrow_mut() = Some(client.clone());
+                    client
+                };
+                let mut request = client.request(method, url);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                if let Some(body) = body {
+                    request = request.body(body);
+                }
+                let mut response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => return Ok(err_value(error.to_string())),
+                };
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+                {
+                    return Ok(err_value("HTTP response exceeds 4 MiB limit"));
+                }
+                let status = response.status().as_u16();
+                let response_headers = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_ascii_lowercase(),
+                            Value::String(value.to_str().unwrap_or_default().into()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let headers = self.map_value(response_headers);
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk = match response.chunk().await {
+                        Ok(chunk) => chunk,
+                        Err(error) => return Ok(err_value(error.to_string())),
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                        return Ok(err_value("HTTP response exceeds 4 MiB limit"));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let body = match String::from_utf8(bytes) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return Ok(err_value(format!("HTTP response is not UTF-8: {error}")));
+                    }
+                };
+                Ok(ok_value(self.map_value(vec![
+                    ("status".into(), Value::Integer(i64::from(status))),
+                    ("headers".into(), headers),
+                    ("body".into(), Value::String(body)),
+                ])))
+            }
+        }
+    }
+
+    async fn call_native(
         &mut self,
         function: NativeFunction,
         arguments: Vec<Value>,
@@ -1562,12 +2127,30 @@ impl Interpreter {
                     std::fs::read_to_string(self.resolve_path(path)).map(Value::String),
                 ))
             }
+            NativeFunction::FsReadTextAsync => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                Ok(
+                    self.register_future(FutureState::Native(NativeAsyncOperation::FsReadText(
+                        self.resolve_path(path),
+                    ))),
+                )
+            }
             NativeFunction::FsWriteText => {
                 let path = self.string_argument(arguments.next(), function, span)?;
                 let contents = self.string_argument(arguments.next(), function, span)?;
                 Ok(result_value(
                     std::fs::write(self.resolve_path(path), contents).map(|()| Value::Void),
                 ))
+            }
+            NativeFunction::FsWriteTextAsync => {
+                let path = self.string_argument(arguments.next(), function, span)?;
+                let contents = self.string_argument(arguments.next(), function, span)?;
+                Ok(
+                    self.register_future(FutureState::Native(NativeAsyncOperation::FsWriteText {
+                        path: self.resolve_path(path),
+                        contents,
+                    })),
+                )
             }
             NativeFunction::FsExists => {
                 let path = self.string_argument(arguments.next(), function, span)?;
@@ -1649,6 +2232,17 @@ impl Interpreter {
                     Err(error) => Ok(err_value(error.to_string())),
                 }
             }
+            NativeFunction::ProcessRunAsync => {
+                let program = self.string_argument(arguments.next(), function, span)?;
+                let arguments = self.string_list_argument(arguments.next(), function, span)?;
+                Ok(
+                    self.register_future(FutureState::Native(NativeAsyncOperation::ProcessRun {
+                        program,
+                        arguments,
+                        cwd: self.context.cwd.clone(),
+                    })),
+                )
+            }
             NativeFunction::TerminalInput | NativeFunction::TerminalConfirm => {
                 let prompt = self.string_argument(arguments.next(), function, span)?;
                 if !io::stdin().is_terminal() {
@@ -1685,14 +2279,57 @@ impl Interpreter {
             }
             NativeFunction::HttpGet => {
                 let url = self.string_argument(arguments.next(), function, span)?;
-                self.http_request("GET", &url, Vec::new(), None, span)
+                self.execute_native_async(
+                    NativeAsyncOperation::HttpRequest {
+                        method: "GET".into(),
+                        url,
+                        headers: Vec::new(),
+                        body: None,
+                    },
+                    span,
+                )
+                .await
+            }
+            NativeFunction::HttpGetAsync => {
+                let url = self.string_argument(arguments.next(), function, span)?;
+                Ok(
+                    self.register_future(FutureState::Native(NativeAsyncOperation::HttpRequest {
+                        method: "GET".into(),
+                        url,
+                        headers: Vec::new(),
+                        body: None,
+                    })),
+                )
             }
             NativeFunction::HttpRequest => {
                 let method = self.string_argument(arguments.next(), function, span)?;
                 let url = self.string_argument(arguments.next(), function, span)?;
                 let headers = self.string_map_argument(arguments.next(), function, span)?;
                 let body = self.string_argument(arguments.next(), function, span)?;
-                self.http_request(&method, &url, headers, Some(body), span)
+                self.execute_native_async(
+                    NativeAsyncOperation::HttpRequest {
+                        method,
+                        url,
+                        headers,
+                        body: Some(body),
+                    },
+                    span,
+                )
+                .await
+            }
+            NativeFunction::HttpRequestAsync => {
+                let method = self.string_argument(arguments.next(), function, span)?;
+                let url = self.string_argument(arguments.next(), function, span)?;
+                let headers = self.string_map_argument(arguments.next(), function, span)?;
+                let body = self.string_argument(arguments.next(), function, span)?;
+                Ok(
+                    self.register_future(FutureState::Native(NativeAsyncOperation::HttpRequest {
+                        method,
+                        url,
+                        headers,
+                        body: Some(body),
+                    })),
+                )
             }
             NativeFunction::TimeUnixMs => {
                 let milliseconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -1722,6 +2359,60 @@ impl Interpreter {
                 }
                 std::thread::sleep(Duration::from_millis(milliseconds as u64));
                 Ok(ok_value(Value::Void))
+            }
+            NativeFunction::TimeSleepAsync => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::Integer(milliseconds) = value else {
+                    return Err(self.error("time.sleep_async expects int", span));
+                };
+                let state = if (0..=86_400_000).contains(&milliseconds) {
+                    FutureState::Sleeping(Duration::from_millis(milliseconds as u64))
+                } else {
+                    FutureState::Ready(Ok(err_value(
+                        "sleep duration must be between 0 and 86400000 ms",
+                    )))
+                };
+                Ok(self.register_future(state))
+            }
+            NativeFunction::TaskSpawn => {
+                let future = arguments.next().expect("checked argument count");
+                self.spawn_async_task(future, span).map(Value::AsyncTask)
+            }
+            NativeFunction::TaskJoin => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::AsyncTask(task) = value else {
+                    return Err(self.error("task.join expects Task<T>", span));
+                };
+                Ok(self.register_future(FutureState::Joining(task)))
+            }
+            NativeFunction::TaskCancel => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::AsyncTask(task) = value else {
+                    return Err(self.error("task.cancel expects Task<T>", span));
+                };
+                let cancellation = task.borrow().cancellation.clone();
+                let changed = !cancellation.cancelled.replace(true);
+                cancellation.notify.notify_waiters();
+                Ok(Value::Bool(changed))
+            }
+            NativeFunction::TaskTimeout => {
+                let future = arguments.next().expect("checked argument count");
+                let milliseconds = arguments.next().expect("checked argument count");
+                let Value::Integer(milliseconds) = milliseconds else {
+                    return Err(self.error("task.timeout expects int milliseconds", span));
+                };
+                if !(0..=86_400_000).contains(&milliseconds) {
+                    return Ok(self.register_future(FutureState::Ready(Ok(err_value(
+                        "timeout must be between 0 and 86400000 ms",
+                    )))));
+                }
+                let Value::Future(future) = future else {
+                    return Err(self.error("task.timeout expects Future<T>", span));
+                };
+                Ok(self.register_future(FutureState::TimingOut {
+                    future,
+                    duration: Duration::from_millis(milliseconds as u64),
+                }))
             }
             NativeFunction::TaskResult => {
                 let name = self.string_argument(arguments.next(), function, span)?;
@@ -1812,70 +2503,6 @@ impl Interpreter {
                 )),
             })
             .collect()
-    }
-
-    fn http_request(
-        &mut self,
-        method: &str,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Option<String>,
-        span: Span,
-    ) -> Result<Value, RuntimeError> {
-        const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Ok(err_value("http URL must use http:// or https://"));
-        }
-        let method = method.to_ascii_uppercase();
-        if !method
-            .chars()
-            .all(|character| character.is_ascii_uppercase() || character == '-')
-        {
-            return Ok(err_value("invalid HTTP method"));
-        }
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(30))
-            .build();
-        let mut request = agent.request(&method, url);
-        for (name, value) in headers {
-            request = request.set(&name, &value);
-        }
-        let response = match body {
-            Some(body) => request.send_string(&body),
-            None => request.call(),
-        };
-        let response = match response {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-            Err(error) => return Ok(err_value(error.to_string())),
-        };
-        let status = response.status();
-        let mut response_headers = Vec::new();
-        for name in response.headers_names() {
-            if let Some(value) = response.header(&name) {
-                response_headers.push((name.to_ascii_lowercase(), Value::String(value.into())));
-            }
-        }
-        let headers = self.map_value(response_headers);
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| self.error(format!("could not read HTTP response: {error}"), span))?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            return Ok(err_value("HTTP response exceeds 4 MiB limit"));
-        }
-        let body = match String::from_utf8(bytes) {
-            Ok(body) => body,
-            Err(error) => return Ok(err_value(format!("HTTP response is not UTF-8: {error}"))),
-        };
-        Ok(ok_value(self.map_value(vec![
-            ("status".into(), Value::Integer(i64::from(status))),
-            ("headers".into(), headers),
-            ("body".into(), Value::String(body)),
-        ])))
     }
 
     fn resolve_path(&self, path: String) -> PathBuf {
@@ -2022,11 +2649,33 @@ impl Interpreter {
         for environment in &self.suspended_environments {
             mark_environment(environment, &mut marked_environments, &mut marked_lists);
         }
+        for task in self.task_scopes.iter().flatten() {
+            mark_value(
+                &Value::AsyncTask(task.clone()),
+                &mut marked_environments,
+                &mut marked_lists,
+            );
+        }
+        for future in &self.active_futures {
+            mark_value(
+                &Value::Future(future.clone()),
+                &mut marked_environments,
+                &mut marked_lists,
+            );
+        }
         for value in temporary_roots {
             mark_value(value, &mut marked_environments, &mut marked_lists);
         }
 
         self.sweep(&marked_environments, &marked_lists);
+    }
+
+    fn maybe_collect_garbage(&mut self, temporary_roots: &[Value]) {
+        self.statements_since_gc += 1;
+        if self.statements_since_gc >= GC_STATEMENT_INTERVAL {
+            self.collect_garbage(temporary_roots);
+            self.statements_since_gc = 0;
+        }
     }
 
     fn collect_finished(&mut self, result_roots: &[Value]) {
@@ -2075,6 +2724,32 @@ impl Interpreter {
             }
             Rc::strong_count(&instance) > 1
         });
+        self.futures.retain(|entry| {
+            let Some(future) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&future) as usize;
+            if !marked_lists.contains(&identity) {
+                future.borrow_mut().state = FutureState::Ready(Err(RuntimeError {
+                    message: "future was collected".into(),
+                    span: Span::empty(0),
+                    propagated: None,
+                }));
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&future) > 1
+        });
+        self.async_tasks.retain(|entry| {
+            let Some(task) = entry.upgrade() else {
+                return false;
+            };
+            let identity = Rc::as_ptr(&task) as usize;
+            if !marked_lists.contains(&identity) {
+                task.borrow_mut().result = None;
+                self.collected_objects += 1;
+            }
+            Rc::strong_count(&task) > 1
+        });
         self.environments.retain(|entry| {
             let Some(environment) = entry.upgrade() else {
                 return false;
@@ -2089,15 +2764,15 @@ impl Interpreter {
             Rc::strong_count(&environment) > 1
         });
     }
-    fn list_index(&mut self, expression: &Expression) -> Result<usize, RuntimeError> {
-        match self.evaluate(expression)? {
+    async fn list_index(&mut self, expression: &Expression) -> Result<usize, RuntimeError> {
+        match self.evaluate(expression).await? {
             Value::Integer(value) => usize::try_from(value)
                 .map_err(|_| self.error("list index must be non-negative", expression.span)),
             _ => Err(self.error("list index must be int", expression.span)),
         }
     }
-    fn map_key(&mut self, expression: &Expression) -> Result<String, RuntimeError> {
-        match self.evaluate(expression)? {
+    async fn map_key(&mut self, expression: &Expression) -> Result<String, RuntimeError> {
+        match self.evaluate(expression).await? {
             Value::String(value) => Ok(value),
             _ => Err(self.error("map index must be string", expression.span)),
         }
@@ -2198,7 +2873,9 @@ impl NativeModule {
             (Self::Json, "parse") => Some(NativeFunction::JsonParse),
             (Self::Json, "stringify") => Some(NativeFunction::JsonStringify),
             (Self::Fs, "read_text") => Some(NativeFunction::FsReadText),
+            (Self::Fs, "read_text_async") => Some(NativeFunction::FsReadTextAsync),
             (Self::Fs, "write_text") => Some(NativeFunction::FsWriteText),
+            (Self::Fs, "write_text_async") => Some(NativeFunction::FsWriteTextAsync),
             (Self::Fs, "exists") => Some(NativeFunction::FsExists),
             (Self::Fs, "create_dir_all") => Some(NativeFunction::FsCreateDirAll),
             (Self::Fs, "remove_file") => Some(NativeFunction::FsRemoveFile),
@@ -2209,15 +2886,23 @@ impl NativeModule {
             (Self::Env, "get") => Some(NativeFunction::EnvGet),
             (Self::Env, "current_dir") => Some(NativeFunction::EnvCurrentDir),
             (Self::Process, "run") => Some(NativeFunction::ProcessRun),
+            (Self::Process, "run_async") => Some(NativeFunction::ProcessRunAsync),
             (Self::Terminal, "input") => Some(NativeFunction::TerminalInput),
             (Self::Terminal, "confirm") => Some(NativeFunction::TerminalConfirm),
             (Self::Terminal, "password") => Some(NativeFunction::TerminalPassword),
             (Self::Task, "result") => Some(NativeFunction::TaskResult),
+            (Self::Task, "spawn") => Some(NativeFunction::TaskSpawn),
+            (Self::Task, "join") => Some(NativeFunction::TaskJoin),
+            (Self::Task, "cancel") => Some(NativeFunction::TaskCancel),
+            (Self::Task, "timeout") => Some(NativeFunction::TaskTimeout),
             (Self::Http, "get") => Some(NativeFunction::HttpGet),
+            (Self::Http, "get_async") => Some(NativeFunction::HttpGetAsync),
             (Self::Http, "request") => Some(NativeFunction::HttpRequest),
+            (Self::Http, "request_async") => Some(NativeFunction::HttpRequestAsync),
             (Self::Time, "unix_ms") => Some(NativeFunction::TimeUnixMs),
             (Self::Time, "monotonic_ms") => Some(NativeFunction::TimeMonotonicMs),
             (Self::Time, "sleep_ms") => Some(NativeFunction::TimeSleepMs),
+            (Self::Time, "sleep_async") => Some(NativeFunction::TimeSleepAsync),
             _ => None,
         }
     }
@@ -2244,7 +2929,9 @@ impl NativeFunction {
             Self::JsonParse => "json.parse",
             Self::JsonStringify => "json.stringify",
             Self::FsReadText => "fs.read_text",
+            Self::FsReadTextAsync => "fs.read_text_async",
             Self::FsWriteText => "fs.write_text",
+            Self::FsWriteTextAsync => "fs.write_text_async",
             Self::FsExists => "fs.exists",
             Self::FsCreateDirAll => "fs.create_dir_all",
             Self::FsRemoveFile => "fs.remove_file",
@@ -2255,22 +2942,34 @@ impl NativeFunction {
             Self::EnvGet => "env.get",
             Self::EnvCurrentDir => "env.current_dir",
             Self::ProcessRun => "process.run",
+            Self::ProcessRunAsync => "process.run_async",
             Self::TerminalInput => "terminal.input",
             Self::TerminalConfirm => "terminal.confirm",
             Self::TerminalPassword => "terminal.password",
             Self::TaskResult => "task.result",
+            Self::TaskSpawn => "task.spawn",
+            Self::TaskJoin => "task.join",
+            Self::TaskCancel => "task.cancel",
+            Self::TaskTimeout => "task.timeout",
             Self::HttpGet => "http.get",
+            Self::HttpGetAsync => "http.get_async",
             Self::HttpRequest => "http.request",
+            Self::HttpRequestAsync => "http.request_async",
             Self::TimeUnixMs => "time.unix_ms",
             Self::TimeMonotonicMs => "time.monotonic_ms",
             Self::TimeSleepMs => "time.sleep_ms",
+            Self::TimeSleepAsync => "time.sleep_async",
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Self::FsWriteText | Self::ProcessRun => 2,
-            Self::HttpRequest => 4,
+            Self::FsWriteText
+            | Self::FsWriteTextAsync
+            | Self::ProcessRun
+            | Self::ProcessRunAsync
+            | Self::TaskTimeout => 2,
+            Self::HttpRequest | Self::HttpRequestAsync => 4,
             Self::EnvCurrentDir | Self::TimeUnixMs | Self::TimeMonotonicMs => 0,
             _ => 1,
         }
@@ -2383,6 +3082,51 @@ fn mark_value(
         Value::Function(function) => {
             mark_environment(&function.closure, marked_environments, marked_lists)
         }
+        Value::Future(future) => {
+            let identity = Rc::as_ptr(future) as usize;
+            if !marked_lists.insert(identity) {
+                return;
+            }
+            match &future.borrow().state {
+                FutureState::Pending {
+                    function,
+                    arguments,
+                } => {
+                    mark_environment(&function.closure, marked_environments, marked_lists);
+                    for value in arguments {
+                        mark_value(value, marked_environments, marked_lists);
+                    }
+                }
+                FutureState::Ready(Ok(value)) => {
+                    mark_value(value, marked_environments, marked_lists)
+                }
+                FutureState::Joining(task) => {
+                    mark_value(
+                        &Value::AsyncTask(task.clone()),
+                        marked_environments,
+                        marked_lists,
+                    );
+                }
+                FutureState::TimingOut { future, .. } => mark_value(
+                    &Value::Future(future.clone()),
+                    marked_environments,
+                    marked_lists,
+                ),
+                FutureState::Sleeping(_)
+                | FutureState::Native(_)
+                | FutureState::Running
+                | FutureState::Ready(Err(_)) => {}
+            }
+        }
+        Value::AsyncTask(task) => {
+            let identity = Rc::as_ptr(task) as usize;
+            if !marked_lists.insert(identity) {
+                return;
+            }
+            if let Some(Ok(value)) = &task.borrow().result {
+                mark_value(value, marked_environments, marked_lists);
+            }
+        }
         Value::Variant {
             payload: Some(value),
             ..
@@ -2403,6 +3147,8 @@ impl Value {
             Self::List(_) => "list".into(),
             Self::Map(_) => "map".into(),
             Self::Function(_) | Self::NativePrint | Self::NativeFunction(_) => "fn".into(),
+            Self::Future(_) => "Future".into(),
+            Self::AsyncTask(_) => "Task".into(),
             Self::NativeModule(module) => format!("module {}", module.name()),
             Self::StructType(definition) => format!("type {}", definition.name),
             Self::InterfaceType(definition) => format!("type {}", definition.name),
@@ -2477,6 +3223,8 @@ fn value_matches_type_inner(
                 | Value::NativeConstructor(_)
                 | Value::NativeFunction(_)
         ),
+        "Future" => matches!(value, Value::Future(_)) && type_annotation.arguments.len() == 1,
+        "Task" => matches!(value, Value::AsyncTask(_)) && type_annotation.arguments.len() == 1,
         "Option" => match value {
             Value::Variant {
                 tag: VariantTag::None,
@@ -2685,6 +3433,8 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
         (Value::NativeModule(a), Value::NativeModule(b)) => a == b,
         (Value::NativeFunction(a), Value::NativeFunction(b)) => a == b,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+        (Value::Future(a), Value::Future(b)) => Rc::ptr_eq(a, b),
+        (Value::AsyncTask(a), Value::AsyncTask(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
     }
@@ -2757,6 +3507,22 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
         Value::NativeModule(module) => format!("<module {}>", module.name()),
         Value::NativeFunction(function) => format!("<native fn {}>", function.name()),
         Value::Function(function) => format!("<fn {}>", function.name),
+        Value::Future(future) => match &future.borrow().state {
+            FutureState::Pending { .. } => "<future pending>".into(),
+            FutureState::Sleeping(_) => "<future sleeping>".into(),
+            FutureState::Native(_) => "<future io>".into(),
+            FutureState::Joining(_) => "<future joining>".into(),
+            FutureState::TimingOut { .. } => "<future timeout>".into(),
+            FutureState::Running => "<future running>".into(),
+            FutureState::Ready(_) => "<future ready>".into(),
+        },
+        Value::AsyncTask(task) => {
+            if task.borrow().result.is_some() {
+                "<task finished>".into()
+            } else {
+                "<task running>".into()
+            }
+        }
         Value::NativePrint => "<native fn print>".into(),
     }
 }

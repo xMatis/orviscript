@@ -1,0 +1,9 @@
+async fn delayed(milliseconds: int) -> Result<void, string> {
+    return await time.sleep_async(milliseconds);
+}
+
+let index = 0;
+while index < 1000 {
+    task.spawn(delayed(10));
+    index = index + 1;
+}

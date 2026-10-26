@@ -32,7 +32,9 @@ const keywordPatterns = grammar.repository.keywords.patterns.map((pattern) => pa
 assert(keywordPatterns.includes("interface"), "grammar must highlight the interface keyword");
 assert(keywordPatterns.includes("task"), "grammar must highlight the task keyword");
 assert(keywordPatterns.includes("export"), "grammar must highlight the export keyword");
-for (const unsupported of ["async", "await", "parallel"]) {
+assert(keywordPatterns.includes("async"), "grammar must highlight the async keyword");
+assert(keywordPatterns.includes("await"), "grammar must highlight the await keyword");
+for (const unsupported of ["parallel"]) {
   assert(!keywordPatterns.includes(unsupported), `grammar advertises unsupported keyword '${unsupported}'`);
 }
 

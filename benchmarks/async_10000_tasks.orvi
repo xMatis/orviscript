@@ -1,0 +1,9 @@
+async fn tiny(value: int) -> int {
+    return value;
+}
+
+let index = 0;
+while index < 10000 {
+    task.spawn(tiny(index));
+    index = index + 1;
+}

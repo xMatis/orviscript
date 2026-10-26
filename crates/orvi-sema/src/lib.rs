@@ -85,6 +85,8 @@ enum StaticType {
     Interface(String),
     Option(Box<StaticType>),
     Result(Box<StaticType>, Box<StaticType>),
+    Future(Box<StaticType>),
+    Task(Box<StaticType>),
     Function {
         parameters: Vec<StaticType>,
         result: Box<StaticType>,
@@ -125,6 +127,8 @@ pub fn analyze_program_with_modules(
         symbols: Vec::new(),
         function_depth: 0,
         current_return_type: None,
+        current_function_async: false,
+        in_cleanup_expression: false,
         struct_names,
         structs: HashMap::new(),
         interface_names,
@@ -206,6 +210,7 @@ fn exported_symbols(program: &Program) -> HashMap<String, Symbol> {
                 ),
                 StatementKind::Function {
                     name,
+                    is_async,
                     parameters,
                     return_type,
                     ..
@@ -233,8 +238,8 @@ fn exported_symbols(program: &Program) -> HashMap<String, Symbol> {
                                         .unwrap_or(StaticType::Dynamic)
                                 })
                                 .collect(),
-                            result: Box::new(
-                                return_type
+                            result: Box::new({
+                                let result = return_type
                                     .as_ref()
                                     .and_then(|annotation| {
                                         static_type_from_annotation(
@@ -243,8 +248,13 @@ fn exported_symbols(program: &Program) -> HashMap<String, Symbol> {
                                             &interface_names,
                                         )
                                     })
-                                    .unwrap_or(StaticType::Dynamic),
-                            ),
+                                    .unwrap_or(StaticType::Dynamic);
+                                if *is_async {
+                                    StaticType::Future(Box::new(result))
+                                } else {
+                                    result
+                                }
+                            }),
                         },
                     },
                 ),
@@ -449,6 +459,8 @@ struct Analyzer {
     symbols: Vec<SymbolOccurrence>,
     function_depth: usize,
     current_return_type: Option<StaticType>,
+    current_function_async: bool,
+    in_cleanup_expression: bool,
     struct_names: HashSet<String>,
     structs: HashMap<String, HashMap<String, StaticType>>,
     interface_names: HashSet<String>,
@@ -612,6 +624,7 @@ impl Analyzer {
             let statement = declaration_statement(statement);
             if let StatementKind::Function {
                 name,
+                is_async,
                 parameters,
                 return_type,
                 ..
@@ -624,9 +637,14 @@ impl Analyzer {
                             .unwrap_or(StaticType::Dynamic)
                     })
                     .collect();
-                let result = self
+                let declared_result = self
                     .annotation_type(return_type.as_ref())
                     .unwrap_or(StaticType::Dynamic);
+                let result = if *is_async {
+                    StaticType::Future(Box::new(declared_result))
+                } else {
+                    declared_result
+                };
                 self.declare(
                     name,
                     Symbol {
@@ -655,13 +673,14 @@ impl Analyzer {
         for statement in statements {
             let statement = declaration_statement(statement);
             if let StatementKind::Function {
+                is_async,
                 parameters,
                 return_type,
                 body,
                 ..
             } = &statement.kind
             {
-                self.function(parameters, return_type.as_ref(), body);
+                self.function(parameters, return_type.as_ref(), body, *is_async);
             }
         }
 
@@ -699,7 +718,7 @@ impl Analyzer {
                     }
                 }
                 let previous = self.current_task_needs.replace(dependencies);
-                self.function(&[], Some(return_type), body);
+                self.function(&[], Some(return_type), body, false);
                 self.current_task_needs = previous;
             }
         }
@@ -799,7 +818,10 @@ impl Analyzer {
                 }
             }
             StatementKind::Defer(expression) => {
+                let previous = self.in_cleanup_expression;
+                self.in_cleanup_expression = true;
                 self.expression(expression);
+                self.in_cleanup_expression = previous;
             }
             StatementKind::Using {
                 name,
@@ -817,7 +839,10 @@ impl Analyzer {
                         value_type,
                     },
                 );
+                let previous = self.in_cleanup_expression;
+                self.in_cleanup_expression = true;
                 self.expression(cleanup);
+                self.in_cleanup_expression = previous;
             }
             StatementKind::Expression(expression) => {
                 self.expression(expression);
@@ -830,6 +855,7 @@ impl Analyzer {
         parameters: &[Parameter],
         return_type: Option<&TypeAnnotation>,
         body: &[Statement],
+        is_async: bool,
     ) {
         self.scopes.push(HashMap::new());
         for parameter in parameters {
@@ -856,13 +882,16 @@ impl Analyzer {
             );
         }
         let previous_return_type = self.current_return_type.clone();
+        let previous_async = self.current_function_async;
         self.current_return_type = return_type.and_then(|annotation| {
             static_type_from_annotation(annotation, &self.struct_names, &self.interface_names)
         });
+        self.current_function_async = is_async;
         self.function_depth += 1;
         self.statements(body, false);
         self.function_depth -= 1;
         self.current_return_type = previous_return_type;
+        self.current_function_async = previous_async;
         self.scopes.pop();
     }
 
@@ -1234,6 +1263,35 @@ impl Analyzer {
                     }
                 }
             }
+            ExpressionKind::Await(value) => {
+                let value_type = self.expression(value);
+                if self.function_depth > 0 && !self.current_function_async {
+                    self.type_error(
+                        "'await' is only valid at module top level or inside an async function",
+                        expression.span,
+                    );
+                }
+                if self.in_cleanup_expression {
+                    self.type_error(
+                        "'await' is not allowed in defer or using cleanup",
+                        expression.span,
+                    );
+                }
+                match value_type {
+                    StaticType::Future(result) => *result,
+                    StaticType::Dynamic => StaticType::Dynamic,
+                    other => {
+                        self.type_error(
+                            format!(
+                                "'await' requires Future<T>, received {}",
+                                other.display_name()
+                            ),
+                            expression.span,
+                        );
+                        StaticType::Dynamic
+                    }
+                }
+            }
         }
     }
 
@@ -1436,7 +1494,7 @@ impl Analyzer {
         };
         if !matches!(
             annotation.name.as_str(),
-            "list" | "map" | "Option" | "Result"
+            "list" | "map" | "Option" | "Result" | "Future" | "Task"
         ) && !annotation.arguments.is_empty()
         {
             self.errors.push(SemanticError {
@@ -1453,10 +1511,17 @@ impl Analyzer {
 
     fn require_assignable(&mut self, expected: &StaticType, actual: &StaticType, span: Span) {
         if !self.is_assignable(expected, actual) {
+            let hint = if matches!(actual, StaticType::Future(_))
+                && !matches!(expected, StaticType::Future(_) | StaticType::Dynamic)
+            {
+                "; did you forget 'await'?"
+            } else {
+                ""
+            };
             self.errors.push(SemanticError {
                 kind: SemanticErrorKind::TypeMismatch,
                 message: format!(
-                    "expected {}, received {}",
+                    "expected {}, received {}{hint}",
                     expected.display_name(),
                     actual.display_name()
                 ),
@@ -1469,7 +1534,9 @@ impl Analyzer {
         match (expected, actual) {
             (StaticType::List(expected), StaticType::List(actual))
             | (StaticType::Map(expected), StaticType::Map(actual))
-            | (StaticType::Option(expected), StaticType::Option(actual)) => {
+            | (StaticType::Option(expected), StaticType::Option(actual))
+            | (StaticType::Future(expected), StaticType::Future(actual))
+            | (StaticType::Task(expected), StaticType::Task(actual)) => {
                 self.is_assignable(expected, actual)
             }
             (
@@ -1539,6 +1606,12 @@ impl StaticType {
         {
             return expected_ok.accepts(actual_ok) && expected_error.accepts(actual_error);
         }
+        if let (Self::Future(expected), Self::Future(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
+        if let (Self::Task(expected), Self::Task(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
         self == &Self::Dynamic
             || actual == &Self::Dynamic
             || self == actual
@@ -1564,6 +1637,8 @@ impl StaticType {
             Self::Result(value, error) => {
                 format!("Result<{}, {}>", value.display_name(), error.display_name())
             }
+            Self::Future(value) => format!("Future<{}>", value.display_name()),
+            Self::Task(value) => format!("Task<{}>", value.display_name()),
             Self::Function { parameters, result } => format!(
                 "fn({}) -> {}",
                 parameters
@@ -1629,6 +1704,14 @@ fn static_type_from_annotation(
             )?;
             Some(StaticType::Result(Box::new(value), Box::new(error)))
         }
+        "Future" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
+                .map(|value| StaticType::Future(Box::new(value)))
+        }
+        "Task" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
+                .map(|value| StaticType::Task(Box::new(value)))
+        }
         "fn" => Some(StaticType::Function {
             parameters: Vec::new(),
             result: Box::new(StaticType::Dynamic),
@@ -1657,9 +1740,17 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             vec![StaticType::String],
             result_type(StaticType::String),
         )),
+        ("fs", "read_text_async") => Some(function_type(
+            vec![StaticType::String],
+            StaticType::Future(Box::new(result_type(StaticType::String))),
+        )),
         ("fs", "write_text") => Some(function_type(
             vec![StaticType::String, StaticType::String],
             result_type(StaticType::Void),
+        )),
+        ("fs", "write_text_async") => Some(function_type(
+            vec![StaticType::String, StaticType::String],
+            StaticType::Future(Box::new(result_type(StaticType::Void))),
         )),
         ("fs", "exists") => Some(function_type(vec![StaticType::String], StaticType::Bool)),
         ("fs", "create_dir_all" | "remove_file") => Some(function_type(
@@ -1687,6 +1778,15 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             ],
             result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
         )),
+        ("process", "run_async") => Some(function_type(
+            vec![
+                StaticType::String,
+                StaticType::List(Box::new(StaticType::String)),
+            ],
+            StaticType::Future(Box::new(result_type(StaticType::Map(Box::new(
+                StaticType::Dynamic,
+            ))))),
+        )),
         ("terminal", "input" | "password") => Some(function_type(
             vec![StaticType::String],
             result_type(StaticType::String),
@@ -1699,9 +1799,34 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             vec![StaticType::String],
             result_type(StaticType::Dynamic),
         )),
+        ("task", "spawn") => Some(function_type(
+            vec![StaticType::Future(Box::new(StaticType::Dynamic))],
+            StaticType::Task(Box::new(StaticType::Dynamic)),
+        )),
+        ("task", "join") => Some(function_type(
+            vec![StaticType::Task(Box::new(StaticType::Dynamic))],
+            StaticType::Future(Box::new(result_type(StaticType::Dynamic))),
+        )),
+        ("task", "cancel") => Some(function_type(
+            vec![StaticType::Task(Box::new(StaticType::Dynamic))],
+            StaticType::Bool,
+        )),
+        ("task", "timeout") => Some(function_type(
+            vec![
+                StaticType::Future(Box::new(StaticType::Dynamic)),
+                StaticType::Int,
+            ],
+            StaticType::Future(Box::new(result_type(StaticType::Dynamic))),
+        )),
         ("http", "get") => Some(function_type(
             vec![StaticType::String],
             result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
+        )),
+        ("http", "get_async") => Some(function_type(
+            vec![StaticType::String],
+            StaticType::Future(Box::new(result_type(StaticType::Map(Box::new(
+                StaticType::Dynamic,
+            ))))),
         )),
         ("http", "request") => Some(function_type(
             vec![
@@ -1712,11 +1837,26 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             ],
             result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
         )),
+        ("http", "request_async") => Some(function_type(
+            vec![
+                StaticType::String,
+                StaticType::String,
+                StaticType::Map(Box::new(StaticType::String)),
+                StaticType::String,
+            ],
+            StaticType::Future(Box::new(result_type(StaticType::Map(Box::new(
+                StaticType::Dynamic,
+            ))))),
+        )),
         ("time", "unix_ms") => Some(function_type(Vec::new(), result_type(StaticType::Int))),
         ("time", "monotonic_ms") => Some(function_type(Vec::new(), StaticType::Int)),
         ("time", "sleep_ms") => Some(function_type(
             vec![StaticType::Int],
             result_type(StaticType::Void),
+        )),
+        ("time", "sleep_async") => Some(function_type(
+            vec![StaticType::Int],
+            StaticType::Future(Box::new(result_type(StaticType::Void))),
         )),
         _ => None,
     }
@@ -1768,6 +1908,66 @@ mod tests {
         assert!(
             errors("fn add(a, b) { return a + b; } let result = add(1, 2); print(result);")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn checks_async_functions_futures_and_await_context() {
+        assert!(
+            errors(
+                "async fn compute() -> int { return 42 } let pending: Future<int> = compute(); let value: int = await pending;",
+            )
+            .is_empty()
+        );
+        assert!(
+            errors(
+                "async fn inner() -> int { return 1 } async fn outer() -> int { return await inner() }",
+            )
+            .is_empty()
+        );
+        assert!(
+            errors(
+                "async fn inner() -> Result<int, string> { return Ok(1) } async fn outer() -> Result<int, string> { let value = (await inner())?; return Ok(value) }",
+            )
+            .is_empty()
+        );
+
+        let invalid = errors(
+            "async fn work() -> int { defer await work(); return await 1 } fn sync() { await work() }",
+        );
+        assert!(
+            invalid
+                .iter()
+                .any(|error| error.message.contains("cleanup"))
+        );
+        assert!(
+            invalid
+                .iter()
+                .any(|error| error.message.contains("requires Future"))
+        );
+        assert!(
+            invalid
+                .iter()
+                .any(|error| error.message.contains("module top level"))
+        );
+
+        let missing_await = errors("async fn work() -> int { return 1 } let value: int = work();");
+        assert!(
+            missing_await
+                .iter()
+                .any(|error| error.message.contains("forget 'await'"))
+        );
+        assert!(
+            errors(
+                "async fn work() -> Result<int, string> { (await time.sleep_async(1))?; return Ok(1) } async fn main() -> Result<int, string> { let handle: Task<Result<int, string>> = task.spawn(work()); task.cancel(handle); return (await task.join(handle))? } await main();",
+            )
+            .is_empty()
+        );
+        assert!(
+            errors(
+                "async fn work() -> int { return 1 } let timed: Result<int, string> = await task.timeout(work(), 1);",
+            )
+            .is_empty()
         );
     }
 

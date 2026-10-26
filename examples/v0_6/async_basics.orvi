@@ -1,0 +1,19 @@
+async fn double(value: int) -> int {
+    print("future started");
+    return value * 2;
+}
+
+async fn checked_value() -> Result<int, string> {
+    return Ok(7);
+}
+
+async fn use_checked_value() -> Result<int, string> {
+    let value = (await checked_value())?;
+    return Ok(value);
+}
+
+let pending: Future<int> = double(21);
+print("future created");
+print(await pending);
+print(await pending);
+print(await use_checked_value());

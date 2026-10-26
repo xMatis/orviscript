@@ -238,3 +238,39 @@ fn parses_task_dependencies_and_result_access() {
     assert_eq!(return_type.name.name, "Result");
     assert_eq!(body.len(), 1);
 }
+
+#[test]
+fn parses_async_functions_await_and_future_types() {
+    let parsed = parse(
+        "export async fn fetch(url: string) -> Result<string, string> { let response: map<any> = (await http.get_async(url))?; return Ok(response.body) } let pending: Future<int> = fetch(\"https://example.com\")",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::Export(declaration) = &parsed.program.statements[0].kind else {
+        panic!("expected exported async function")
+    };
+    let StatementKind::Function {
+        is_async,
+        body,
+        return_type,
+        ..
+    } = &declaration.kind
+    else {
+        panic!("expected async function")
+    };
+    assert!(*is_async);
+    assert_eq!(return_type.as_ref().unwrap().name.name, "Result");
+    let StatementKind::Variable { initializer, .. } = &body[0].kind else {
+        panic!("expected awaited binding")
+    };
+    let ExpressionKind::Try(awaited) = &initializer.kind else {
+        panic!("expected try after await")
+    };
+    assert!(matches!(awaited.kind, ExpressionKind::Await(_)));
+    let StatementKind::Variable {
+        type_annotation, ..
+    } = &parsed.program.statements[1].kind
+    else {
+        panic!("expected future binding")
+    };
+    assert_eq!(type_annotation.as_ref().unwrap().name.name, "Future");
+}

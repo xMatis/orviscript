@@ -44,6 +44,221 @@ fn evaluates_variables_and_arithmetic() {
 }
 
 #[test]
+fn runs_lazy_async_functions_with_top_level_await() {
+    let source = r#"
+        async fn compute(value: int) -> int {
+            print("started");
+            return value * 2;
+        }
+        async fn succeed() -> Result<int, string> { return Ok(7); }
+        async fn use_success() -> Result<int, string> {
+            let value = (await succeed())?;
+            return Ok(value);
+        }
+
+        let abandoned: Future<int> = compute(1);
+        let future: Future<int> = compute(21);
+        print("before");
+        print(await future);
+        print(await future);
+        print(await use_success());
+    "#;
+    let output = run(source).expect("async program runs");
+    assert_eq!(output, ["before", "started", "42", "42", "Ok(7)"]);
+}
+
+#[test]
+fn runs_spawned_sleeps_concurrently_on_one_thread() {
+    let source = r#"
+        async fn delayed(value: string) -> Result<string, string> {
+            (await time.sleep_async(120))?;
+            return Ok(value);
+        }
+
+        async fn both() -> Result<void, string> {
+            let first: Task<Result<string, string>> = task.spawn(delayed("first"));
+            let second: Task<Result<string, string>> = task.spawn(delayed("second"));
+            print((await task.join(first))?);
+            print((await task.join(second))?);
+            return Ok();
+        }
+
+        print(await both());
+    "#;
+    let started = std::time::Instant::now();
+    let output = run(source).expect("concurrent async program runs");
+    let elapsed = started.elapsed();
+    assert_eq!(output, ["Ok(first)", "Ok(second)", "Ok()"]);
+    assert!(
+        elapsed < std::time::Duration::from_millis(210),
+        "two 120 ms sleeps took {elapsed:?}"
+    );
+}
+
+#[test]
+fn waits_for_unjoined_tasks_before_leaving_their_scope() {
+    let source = r#"
+        async fn child() -> Result<void, string> {
+            (await time.sleep_async(5))?;
+            print("child finished");
+            return Ok();
+        }
+
+        async fn parent() -> Result<void, string> {
+            task.spawn(child());
+            print("parent body finished");
+            return Ok();
+        }
+
+        print(await parent());
+    "#;
+    let output = run(source).expect("scoped task program runs");
+    assert_eq!(output, ["parent body finished", "child finished", "Ok()"]);
+}
+
+#[test]
+fn runs_ten_thousand_scoped_tasks_and_enforces_the_limit() {
+    let source = r#"
+        async fn tiny(value: int) -> int { return value }
+        let index = 0;
+        while index < 10000 {
+            task.spawn(tiny(index));
+            index = index + 1;
+        }
+    "#;
+    let started = std::time::Instant::now();
+    run(source).expect("10,000 scoped tasks run");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "10,000 short tasks exceeded the regression budget"
+    );
+
+    let over_limit = source.replace("index < 10000", "index < 10001");
+    let error = run(&over_limit).expect_err("10,001st task must be rejected");
+    assert!(error.contains("scope limit of 10000 tasks"), "{error}");
+}
+
+#[test]
+fn cancellation_and_timeout_run_deferred_cleanup() {
+    let source = r#"
+        async fn cancellable(label: string) -> Result<void, string> {
+            defer print("cleanup", label);
+            (await time.sleep_async(5000))?;
+            return Ok();
+        }
+
+        async fn exercise() -> Result<void, string> {
+            let handle = task.spawn(cancellable("cancel"));
+            (await time.sleep_async(5))?;
+            print(task.cancel(handle));
+            print(await task.join(handle));
+            print(await task.timeout(cancellable("timeout"), 5));
+            return Ok();
+        }
+
+        print(await exercise());
+    "#;
+    let started = std::time::Instant::now();
+    let output = run(source).expect("cancellation program runs");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(
+        output,
+        [
+            "true",
+            "cleanup cancel",
+            "Err(task was cancelled)",
+            "cleanup timeout",
+            "Err(operation timed out)",
+            "Ok()",
+        ]
+    );
+}
+
+#[test]
+fn performs_async_file_io() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = r#"
+        async fn round_trip() -> Result<string, string> {
+            (await fs.write_text_async("async.txt", "hello async"))?;
+            return await fs.read_text_async("async.txt");
+        }
+
+        print(await round_trip());
+    "#;
+    let output = run_in(source, directory.path()).expect("async file I/O runs");
+    assert_eq!(output, ["Ok(hello async)"]);
+}
+
+#[test]
+fn runs_processes_without_blocking_the_executor() {
+    let source = r#"
+        async fn version() -> Result<map<any>, string> {
+            return await process.run_async("rustc", ["--version"]);
+        }
+
+        print(await version());
+    "#;
+    let output = run(source).expect("async process runs");
+    assert!(output[0].starts_with("Ok({ exit_code: 0, success: true"));
+    assert!(output[0].contains("rustc"));
+}
+
+#[test]
+fn performs_http_requests_concurrently() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = std::thread::spawn(move || {
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("request");
+            workers.push(std::thread::spawn(move || {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).expect("read request");
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .expect("write response");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("request worker");
+        }
+    });
+    let source = format!(
+        r#"
+            async fn fetch(url: string) -> Result<string, string> {{
+                let response = (await http.get_async(url))?;
+                return Ok(response.body);
+            }}
+
+            async fn both() -> Result<void, string> {{
+                let first = task.spawn(fetch("http://{address}"));
+                let second = task.spawn(fetch("http://{address}"));
+                print((await task.join(first))?);
+                print((await task.join(second))?);
+                return Ok();
+            }}
+
+            print(await both());
+        "#
+    );
+    let started = std::time::Instant::now();
+    let output = run(&source).expect("async HTTP runs");
+    let elapsed = started.elapsed();
+    server.join().expect("server exits");
+    assert_eq!(output, ["Ok(hello)", "Ok(hello)", "Ok()"]);
+    assert!(
+        elapsed < std::time::Duration::from_millis(280),
+        "two 150 ms requests took {elapsed:?}"
+    );
+}
+
+#[test]
 fn executes_if_else_and_while() {
     let output = run("let n = 0; while n < 3 { n = n + 1 } if n == 3 { print(\"done\") } else { print(\"bad\") }").expect("program runs");
     assert_eq!(output, ["done"]);

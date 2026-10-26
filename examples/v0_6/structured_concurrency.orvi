@@ -1,0 +1,22 @@
+async fn delayed(label: string, milliseconds: int) -> Result<string, string> {
+    defer print("cleanup", label);
+    (await time.sleep_async(milliseconds))?;
+    return Ok(label);
+}
+
+async fn concurrent_work() -> Result<void, string> {
+    let first = task.spawn(delayed("first", 100));
+    let second = task.spawn(delayed("second", 100));
+
+    print((await task.join(first))?);
+    print((await task.join(second))?);
+
+    let cancelled = task.spawn(delayed("cancelled", 5000));
+    print("cancel requested", task.cancel(cancelled));
+    print(await task.join(cancelled));
+
+    print(await task.timeout(delayed("timed out", 5000), 10));
+    return Ok();
+}
+
+print(await concurrent_work());

@@ -959,6 +959,8 @@ fn classify_token(
                 text,
                 "Option"
                     | "Result"
+                    | "Future"
+                    | "Task"
                     | "any"
                     | "bool"
                     | "float"
@@ -992,6 +994,8 @@ fn classify_token(
         TokenKind::Let
         | TokenKind::Const
         | TokenKind::Fn
+        | TokenKind::Async
+        | TokenKind::Await
         | TokenKind::Struct
         | TokenKind::Interface
         | TokenKind::Import
@@ -1054,6 +1058,16 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "immutable variable declaration",
         ),
         ("fn", CompletionItemKind::KEYWORD, "function declaration"),
+        (
+            "async",
+            CompletionItemKind::KEYWORD,
+            "asynchronous function declaration",
+        ),
+        (
+            "await",
+            CompletionItemKind::KEYWORD,
+            "wait for a Future<T> result",
+        ),
         ("struct", CompletionItemKind::KEYWORD, "struct declaration"),
         (
             "interface",
@@ -1116,6 +1130,16 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ),
         ("list", CompletionItemKind::TYPE_PARAMETER, "list type"),
         ("map", CompletionItemKind::TYPE_PARAMETER, "map type"),
+        (
+            "Future",
+            CompletionItemKind::TYPE_PARAMETER,
+            "lazy asynchronous result type",
+        ),
+        (
+            "Task",
+            CompletionItemKind::TYPE_PARAMETER,
+            "scoped asynchronous task handle",
+        ),
         ("json", CompletionItemKind::MODULE, "JSON module"),
         ("fs", CompletionItemKind::MODULE, "filesystem module"),
         ("path", CompletionItemKind::MODULE, "path module"),
@@ -1137,9 +1161,19 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "fs.read_text(path)",
         ),
         (
+            "read_text_async",
+            CompletionItemKind::FUNCTION,
+            "fs.read_text_async(path)",
+        ),
+        (
             "write_text",
             CompletionItemKind::FUNCTION,
             "fs.write_text(path, contents)",
+        ),
+        (
+            "write_text_async",
+            CompletionItemKind::FUNCTION,
+            "fs.write_text_async(path, contents)",
         ),
         ("exists", CompletionItemKind::FUNCTION, "fs.exists(path)"),
         (
@@ -1180,6 +1214,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "process.run(program, args)",
         ),
         (
+            "run_async",
+            CompletionItemKind::FUNCTION,
+            "process.run_async(program, args)",
+        ),
+        (
             "input",
             CompletionItemKind::FUNCTION,
             "terminal.input(prompt)",
@@ -1195,10 +1234,32 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "terminal.password(prompt)",
         ),
         ("result", CompletionItemKind::FUNCTION, "task.result(name)"),
+        ("spawn", CompletionItemKind::FUNCTION, "task.spawn(future)"),
+        ("join", CompletionItemKind::FUNCTION, "task.join(handle)"),
+        (
+            "cancel",
+            CompletionItemKind::FUNCTION,
+            "task.cancel(handle)",
+        ),
+        (
+            "timeout",
+            CompletionItemKind::FUNCTION,
+            "task.timeout(future, milliseconds)",
+        ),
         (
             "request",
             CompletionItemKind::FUNCTION,
             "http.request(method, url, headers, body)",
+        ),
+        (
+            "get_async",
+            CompletionItemKind::FUNCTION,
+            "http.get_async(url)",
+        ),
+        (
+            "request_async",
+            CompletionItemKind::FUNCTION,
+            "http.request_async(method, url, headers, body)",
         ),
         ("unix_ms", CompletionItemKind::FUNCTION, "time.unix_ms()"),
         (
@@ -1210,6 +1271,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "sleep_ms",
             CompletionItemKind::FUNCTION,
             "time.sleep_ms(ms)",
+        ),
+        (
+            "sleep_async",
+            CompletionItemKind::FUNCTION,
+            "time.sleep_async(ms) -> Future<Result<void, string>>",
         ),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
@@ -1288,6 +1354,10 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "let" => "`let` declares a mutable variable.",
         "const" => "`const` declares an immutable variable.",
         "fn" => "`fn` declares a function.",
+        "async" => "`async fn` declares a function whose call returns a lazy `Future<T>`.",
+        "await" => "`await` executes a `Future<T>` and produces its `T` result.",
+        "Future" => "`Future<T>` is the lazy result type returned by an `async fn`.",
+        "Task" => "`Task<T>` is a scoped handle returned by `task.spawn(Future<T>)`.",
         "struct" => "`struct` declares a stable set of typed fields.",
         "interface" => "`interface` declares a structural field contract.",
         "import" => "`import { name } from \"module\"` imports selected names.",
@@ -1310,11 +1380,17 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "Ok" => "`Ok(value)` creates a successful `Result`.",
         "Err" => "`Err(error)` creates a failed `Result`.",
         "read_text" => "`fs.read_text(path)` returns `Result<string, string>`.",
+        "read_text_async" => "`fs.read_text_async(path)` returns `Future<Result<string, string>>`.",
         "write_text" => "`fs.write_text(path, contents)` returns `Result<void, string>`.",
+        "write_text_async" => {
+            "`fs.write_text_async(path, contents)` returns `Future<Result<void, string>>`."
+        }
         "exists" => "`fs.exists(path)` returns whether the path exists.",
         "create_dir_all" => "`fs.create_dir_all(path)` creates directories recursively.",
         "remove_file" => "`fs.remove_file(path)` removes one file.",
-        "join" => "`path.join(parts)` joins a `list<string>` into a path.",
+        "join" => {
+            "`path.join(parts)` joins path segments; `task.join(handle)` returns `Future<Result<T, string>>`."
+        }
         "parent" => "`path.parent(path)` returns `Option<string>`.",
         "file_name" => "`path.file_name(path)` returns `Option<string>`.",
         "is_absolute" => "`path.is_absolute(path)` returns `bool`.",
@@ -1323,19 +1399,32 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         }
         "current_dir" => "`env.current_dir()` returns `Result<string, string>`.",
         "run" => "`process.run(program, args)` runs a process without a shell.",
+        "run_async" => {
+            "`process.run_async(program, args)` runs a process without blocking the executor."
+        }
         "input" => "`terminal.input(prompt)` reads visible terminal input.",
         "confirm" => "`terminal.confirm(prompt)` reads a yes/no answer.",
         "password" => "`terminal.password(prompt)` reads hidden terminal input.",
         "parse" => "`json.parse(text)` returns `Result<any, string>`.",
         "stringify" => "`json.stringify(value)` returns `Result<string, string>`.",
         "result" => "`task.result(name)` returns the `Result` of a declared dependency.",
+        "spawn" => "`task.spawn(future)` starts a future on the current-thread executor.",
+        "cancel" => "`task.cancel(handle)` requests cooperative cancellation.",
+        "timeout" => "`task.timeout(future, ms)` returns a timed `Future<Result<T, string>>`.",
         "request" => {
             "`http.request(method, url, headers, body)` returns `Result<map<any>, string>`."
+        }
+        "get_async" => "`http.get_async(url)` returns `Future<Result<map<any>, string>>`.",
+        "request_async" => {
+            "`http.request_async(method, url, headers, body)` returns `Future<Result<map<any>, string>>`."
         }
         "unix_ms" => "`time.unix_ms()` returns Unix time in milliseconds as `Result<int, string>`.",
         "monotonic_ms" => "`time.monotonic_ms()` returns monotonic process time in milliseconds.",
         "sleep_ms" => {
             "`time.sleep_ms(ms)` sleeps synchronously and returns `Result<void, string>`."
+        }
+        "sleep_async" => {
+            "`time.sleep_async(ms)` yields to the executor and returns `Future<Result<void, string>>`."
         }
         _ => {
             let (_, symbol) = symbol_at(source, position)?;
@@ -1559,10 +1648,15 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "task"));
         assert!(items.iter().any(|item| item.label == "export"));
         assert!(items.iter().any(|item| item.label == "void"));
+        assert!(items.iter().any(|item| item.label == "async"));
+        assert!(items.iter().any(|item| item.label == "await"));
+        assert!(items.iter().any(|item| item.label == "Future"));
+        assert!(items.iter().any(|item| item.label == "Task"));
         assert!(items.iter().any(|item| item.label == "read_text"));
         assert!(items.iter().any(|item| item.label == "http"));
         assert!(items.iter().any(|item| item.label == "time"));
         assert!(items.iter().any(|item| item.label == "sleep_ms"));
+        assert!(items.iter().any(|item| item.label == "sleep_async"));
     }
 
     #[test]
@@ -1596,6 +1690,21 @@ mod tests {
             panic!("expected markdown hover");
         };
         assert!(contents.value.contains("standard output"));
+    }
+
+    #[test]
+    fn explains_async_language_items_on_hover() {
+        for (source, column, expected) in [
+            ("async fn work() {}", 1, "Future<T>"),
+            ("await work()", 1, "executes"),
+            ("let work: Future<int>", 11, "lazy result type"),
+        ] {
+            let hover = hover_at(source, Position::new(0, column)).expect("hover result");
+            let HoverContents::Markup(contents) = hover.contents else {
+                panic!("expected markdown hover");
+            };
+            assert!(contents.value.contains(expected), "{}", contents.value);
+        }
     }
 
     #[test]

@@ -84,8 +84,14 @@ impl Parser<'_> {
         if self.consume(TokenKind::Const) {
             return self.variable(false);
         }
+        if self.consume(TokenKind::Async) {
+            let start = self.previous().span;
+            self.expect(TokenKind::Fn, "expected 'fn' after 'async'")?;
+            return self.function(start, true);
+        }
         if self.consume(TokenKind::Fn) {
-            return self.function();
+            let start = self.previous().span;
+            return self.function(start, false);
         }
         if self.consume(TokenKind::Struct) {
             return self.struct_declaration();
@@ -147,8 +153,7 @@ impl Parser<'_> {
         })
     }
 
-    fn function(&mut self) -> Result<Statement, ParseError> {
-        let start = self.previous().span;
+    fn function(&mut self, start: Span, is_async: bool) -> Result<Statement, ParseError> {
         let name = self.expect_identifier("expected function name")?;
         self.expect(
             TokenKind::LeftParenthesis,
@@ -184,6 +189,7 @@ impl Parser<'_> {
             span: start.cover(end),
             kind: StatementKind::Function {
                 name,
+                is_async,
                 parameters,
                 return_type,
                 body,
@@ -548,6 +554,14 @@ impl Parser<'_> {
     }
 
     fn unary(&mut self) -> Result<Expression, ParseError> {
+        if self.consume(TokenKind::Await) {
+            let start = self.previous().span;
+            let operand = self.unary()?;
+            return Ok(Expression {
+                span: start.cover(operand.span),
+                kind: ExpressionKind::Await(Box::new(operand)),
+            });
+        }
         let operator = if self.consume(TokenKind::Bang) {
             Some(UnaryOperator::Not)
         } else if self.consume(TokenKind::Minus) {
@@ -917,6 +931,7 @@ impl Parser<'_> {
                 self.peek().kind,
                 TokenKind::Let
                     | TokenKind::Const
+                    | TokenKind::Async
                     | TokenKind::Fn
                     | TokenKind::Struct
                     | TokenKind::Interface

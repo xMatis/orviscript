@@ -77,6 +77,7 @@ pub enum StatementKind {
     },
     Function {
         name: Identifier,
+        is_async: bool,
         parameters: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
@@ -172,6 +173,7 @@ pub enum ExpressionKind {
         arms: Vec<MatchArm>,
     },
     Try(Box<Expression>),
+    Await(Box<Expression>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
