@@ -418,6 +418,8 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
         ("process".into(), module_symbol("process")),
         ("terminal".into(), module_symbol("terminal")),
         ("task".into(), module_symbol("task")),
+        ("http".into(), module_symbol("http")),
+        ("time".into(), module_symbol("time")),
         (
             "context".into(),
             Symbol {
@@ -1697,6 +1699,25 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             vec![StaticType::String],
             result_type(StaticType::Dynamic),
         )),
+        ("http", "get") => Some(function_type(
+            vec![StaticType::String],
+            result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
+        )),
+        ("http", "request") => Some(function_type(
+            vec![
+                StaticType::String,
+                StaticType::String,
+                StaticType::Map(Box::new(StaticType::String)),
+                StaticType::String,
+            ],
+            result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
+        )),
+        ("time", "unix_ms") => Some(function_type(Vec::new(), result_type(StaticType::Int))),
+        ("time", "monotonic_ms") => Some(function_type(Vec::new(), StaticType::Int)),
+        ("time", "sleep_ms") => Some(function_type(
+            vec![StaticType::Int],
+            result_type(StaticType::Void),
+        )),
         _ => None,
     }
 }
@@ -1922,6 +1943,20 @@ mod tests {
 
         let errors = errors("fs.write_text(\"only-one\"); process.run(1, [])");
         assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn checks_http_and_time_module_calls() {
+        assert!(
+            errors(
+                "fn fetch() -> Result<map<any>, string> { return http.get(\"https://example.com\") } fn clock() -> Result<int, string> { return time.unix_ms() } time.sleep_ms(0); print(time.monotonic_ms())"
+            )
+            .is_empty()
+        );
+        let errors = errors(
+            "http.get(1); http.request(\"GET\", \"https://example.com\", [], \"\"); time.sleep_ms(\"soon\")",
+        );
+        assert!(errors.len() >= 3);
     }
 
     #[test]

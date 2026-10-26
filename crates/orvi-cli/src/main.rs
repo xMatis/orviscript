@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use orvi_project::Project;
+use orvi_project::{Project, add_path_dependency, remove_dependency, resolve_import};
 use orvi_runtime::{ExecutionContext, TaskStatus, execute_file, execute_tasks};
 use orvi_sema::analyze_program_with_modules;
 use orvi_syntax::{Program, Span, StatementKind, format_source, line_column, parse};
@@ -20,7 +20,13 @@ Commands:
                 Create a new OrviScript project (defaults to the current directory)
   run [FILE]    Run a file or the current project's entry
   check [FILE]  Check a file or the current project's entry
-  test [FILE]   Run test_ tasks in a file or the current project's entry
+  test [FILE] [--filter TEXT] [--list]
+                Run, filter or list test_ tasks (all project files by default)
+  add <NAME> --path <DIRECTORY>
+                Add a local path dependency and refresh orvi.lock
+  remove <NAME> Remove a dependency and refresh orvi.lock
+  install       Validate dependencies and generate orvi.lock
+  deps          List resolved project dependencies
   fmt <FILE>    Format an OrviScript program in place
   fmt --check <FILE>
                 Check whether an OrviScript program is formatted
@@ -43,12 +49,29 @@ enum Command {
     Init(PathBuf),
     Run(Option<PathBuf>),
     Check(Option<PathBuf>),
-    Test(Option<PathBuf>),
-    TaskLink { alias: String, path: PathBuf },
+    Test {
+        path: Option<PathBuf>,
+        filter: Option<String>,
+        list: bool,
+    },
+    Add {
+        name: String,
+        path: PathBuf,
+    },
+    Remove(String),
+    Install,
+    Dependencies,
+    TaskLink {
+        alias: String,
+        path: PathBuf,
+    },
     TaskList,
     TaskRun(String),
     TaskUnlink(String),
-    Format { path: PathBuf, check: bool },
+    Format {
+        path: PathBuf,
+        check: bool,
+    },
 }
 
 fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
@@ -60,10 +83,53 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [command, path] if command == "init" => Ok(Command::Init(PathBuf::from(path))),
         [command] if command == "run" => Ok(Command::Run(None)),
         [command] if command == "check" => Ok(Command::Check(None)),
-        [command] if command == "test" => Ok(Command::Test(None)),
+        [command] if command == "test" => Ok(Command::Test {
+            path: None,
+            filter: None,
+            list: false,
+        }),
+        [command, option] if command == "test" && option == "--list" => Ok(Command::Test {
+            path: None,
+            filter: None,
+            list: true,
+        }),
+        [command, option, filter] if command == "test" && option == "--filter" => {
+            Ok(Command::Test {
+                path: None,
+                filter: Some(filter.to_string_lossy().into_owned()),
+                list: false,
+            })
+        }
+        [command] if command == "install" => Ok(Command::Install),
+        [command] if command == "deps" => Ok(Command::Dependencies),
+        [command, name] if command == "remove" => {
+            Ok(Command::Remove(name.to_string_lossy().into_owned()))
+        }
+        [command, name, option, path] if command == "add" && option == "--path" => {
+            Ok(Command::Add {
+                name: name.to_string_lossy().into_owned(),
+                path: PathBuf::from(path),
+            })
+        }
         [command, path] if command == "run" => Ok(Command::Run(Some(PathBuf::from(path)))),
         [command, path] if command == "check" => Ok(Command::Check(Some(PathBuf::from(path)))),
-        [command, path] if command == "test" => Ok(Command::Test(Some(PathBuf::from(path)))),
+        [command, path] if command == "test" => Ok(Command::Test {
+            path: Some(PathBuf::from(path)),
+            filter: None,
+            list: false,
+        }),
+        [command, path, option] if command == "test" && option == "--list" => Ok(Command::Test {
+            path: Some(PathBuf::from(path)),
+            filter: None,
+            list: true,
+        }),
+        [command, path, option, filter] if command == "test" && option == "--filter" => {
+            Ok(Command::Test {
+                path: Some(PathBuf::from(path)),
+                filter: Some(filter.to_string_lossy().into_owned()),
+                list: false,
+            })
+        }
         [command, action] if command == "task" && action == "list" => Ok(Command::TaskList),
         [command, action, alias] if command == "task" && action == "run" => {
             Ok(Command::TaskRun(alias.to_string_lossy().into_owned()))
@@ -111,7 +177,11 @@ fn main() -> ExitCode {
         Ok(Command::Init(path)) => init_project(&path),
         Ok(Command::Check(path)) => with_source_target(path, check_file),
         Ok(Command::Run(path)) => with_source_target(path, run_file),
-        Ok(Command::Test(path)) => with_source_target(path, test_file),
+        Ok(Command::Test { path, filter, list }) => test_command(path, filter.as_deref(), list),
+        Ok(Command::Add { name, path }) => add_dependency(&name, &path),
+        Ok(Command::Remove(name)) => remove_project_dependency(&name),
+        Ok(Command::Install) => install_dependencies(),
+        Ok(Command::Dependencies) => list_dependencies(),
         Ok(Command::TaskLink { alias, path }) => task_link(&alias, &path),
         Ok(Command::TaskList) => task_list(),
         Ok(Command::TaskRun(alias)) => task_run(&alias),
@@ -201,6 +271,102 @@ fn init_project(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn current_project() -> Result<Project, String> {
+    let current = env::current_dir()
+        .map_err(|error| format!("could not determine current directory: {error}"))?;
+    Project::discover(&current).map_err(|error| error.to_string())
+}
+
+fn add_dependency(name: &str, path: &Path) -> ExitCode {
+    let project = match current_project() {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match add_path_dependency(&project, name, path).and_then(|project| project.write_lockfile()) {
+        Ok(_) => {
+            println!("Added dependency {name} from {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn remove_project_dependency(name: &str) -> ExitCode {
+    let project = match current_project() {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match remove_dependency(&project, name).and_then(|project| project.write_lockfile()) {
+        Ok(_) => {
+            println!("Removed dependency {name}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn install_dependencies() -> ExitCode {
+    let project = match current_project() {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match project.write_lockfile() {
+        Ok(lockfile) => {
+            println!(
+                "Resolved {} package(s) into {}",
+                lockfile.packages.len(),
+                project.root.join(orvi_project::LOCK_FILE).display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn list_dependencies() -> ExitCode {
+    let project = match current_project() {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match project.resolve_dependencies() {
+        Ok(lockfile) => {
+            if lockfile.packages.is_empty() {
+                println!("No dependencies.");
+            } else {
+                for package in lockfile.packages {
+                    println!("{} {} ({})", package.name, package.version, package.source);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn check_file(path: &Path) -> ExitCode {
     let Some((source, parsed)) = load_and_parse(path) else {
         return ExitCode::from(1);
@@ -259,82 +425,140 @@ fn run_file(path: &Path) -> ExitCode {
     }
 }
 
-fn test_file(path: &Path) -> ExitCode {
-    let Some((source, parsed)) = load_and_parse(path) else {
-        return ExitCode::from(1);
-    };
-    if report_syntax_errors(path, &source, &parsed)
-        || report_semantic_errors(path, &source, &parsed.program)
-        || report_import_errors(path, &parsed.program)
-    {
-        return ExitCode::from(1);
-    }
-    let selected = parsed
-        .program
-        .statements
-        .iter()
-        .filter_map(|statement| match &statement.kind {
-            StatementKind::Task { name, .. } if name.name.starts_with("test_") => {
-                Some(name.name.clone())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        eprintln!("{}: error: no tasks with prefix 'test_'", path.display());
-        return ExitCode::from(1);
-    }
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let script_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let script_dir = script_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cwd.clone());
-    let context = ExecutionContext {
-        cwd,
-        project_dir: find_project_dir(&script_dir),
-        script_dir,
-    };
-    match execute_tasks(&parsed.program, context, script_path, &selected) {
-        Ok(execution) => {
-            for line in execution.output {
-                println!("{line}");
-            }
-            let mut failed = false;
-            for report in execution.tasks {
-                if report.status == TaskStatus::Pending {
-                    continue;
+fn test_command(path: Option<PathBuf>, filter: Option<&str>, list: bool) -> ExitCode {
+    let paths = match path {
+        Some(path) => vec![path],
+        None => {
+            let project = match current_project() {
+                Ok(project) => project,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
                 }
-                let is_test = selected.contains(&report.name);
-                let status = match report.status {
-                    TaskStatus::Succeeded => "passed",
-                    TaskStatus::Failed => {
-                        failed |= is_test;
-                        "failed"
-                    }
-                    TaskStatus::Skipped => {
-                        failed |= is_test;
-                        "skipped"
-                    }
-                    TaskStatus::Pending => "pending",
-                    TaskStatus::Running => "running",
-                };
-                let kind = if is_test { "test" } else { "dependency" };
-                println!("{kind} {}: {status}", report.name);
-                if let Some(error) = report.error {
-                    eprintln!("  {error}");
+            };
+            match project.source_files() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(1);
                 }
             }
-            if failed {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
+        }
+    };
+    let mut passed = 0_usize;
+    let mut failed = 0_usize;
+    let mut skipped = 0_usize;
+    let mut selected_count = 0_usize;
+    let mut invalid = false;
+
+    for path in paths {
+        let Some((source, parsed)) = load_and_parse(&path) else {
+            invalid = true;
+            continue;
+        };
+        if report_syntax_errors(&path, &source, &parsed)
+            || report_semantic_errors(&path, &source, &parsed.program)
+            || report_import_errors(&path, &parsed.program)
+        {
+            invalid = true;
+            continue;
+        }
+        let selected = parsed
+            .program
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                StatementKind::Task { name, .. }
+                    if name.name.starts_with("test_")
+                        && filter.is_none_or(|filter| name.name.contains(filter)) =>
+                {
+                    Some(name.name.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        selected_count += selected.len();
+        if list {
+            for name in selected {
+                println!("{}::{name}", path.display());
+            }
+            continue;
+        }
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let script_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let script_dir = script_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone());
+        let context = ExecutionContext {
+            cwd,
+            project_dir: find_project_dir(&script_dir),
+            script_dir,
+        };
+        match execute_tasks(&parsed.program, context, script_path, &selected) {
+            Ok(execution) => {
+                for line in execution.output {
+                    println!("{line}");
+                }
+                for report in execution.tasks {
+                    if report.status == TaskStatus::Pending {
+                        continue;
+                    }
+                    let is_test = selected.contains(&report.name);
+                    let status = match report.status {
+                        TaskStatus::Succeeded => {
+                            if is_test {
+                                passed += 1;
+                            }
+                            "passed"
+                        }
+                        TaskStatus::Failed => {
+                            if is_test {
+                                failed += 1;
+                            }
+                            "failed"
+                        }
+                        TaskStatus::Skipped => {
+                            if is_test {
+                                skipped += 1;
+                            }
+                            "skipped"
+                        }
+                        TaskStatus::Pending => "pending",
+                        TaskStatus::Running => "running",
+                    };
+                    let kind = if is_test { "test" } else { "dependency" };
+                    println!("{kind} {}: {status} ({})", report.name, path.display());
+                    if let Some(error) = report.error {
+                        eprintln!("  {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                report_error(&path, &source, error.span, &error.message);
+                invalid = true;
             }
         }
-        Err(error) => {
-            report_error(path, &source, error.span, &error.message);
-            ExitCode::from(1)
-        }
+    }
+
+    if selected_count == 0 {
+        eprintln!("error: no matching tasks with prefix 'test_'");
+        return ExitCode::from(1);
+    }
+    if list {
+        println!("Listed {selected_count} test(s).");
+    } else {
+        println!(
+            "Test summary: {passed} passed, {failed} failed, {skipped} skipped, {selected_count} total"
+        );
+    }
+    if invalid || failed > 0 || skipped > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -595,32 +819,10 @@ fn check_imports(
         if source.starts_with("std:") {
             continue;
         }
-        let candidate = module_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(source);
-        if candidate
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("orvi")
-        {
-            report_error(
-                module_path,
-                "",
-                statement.span,
-                "local module path must end with '.orvi'",
-            );
-            has_errors = true;
-            continue;
-        }
-        let imported_path = match candidate.canonicalize() {
+        let imported_path = match resolve_import(module_path, source) {
             Ok(path) => path,
             Err(error) => {
-                eprintln!(
-                    "{}: error: could not resolve module '{}': {error}",
-                    module_path.display(),
-                    candidate.display()
-                );
+                report_error(module_path, "", statement.span, &error.to_string());
                 has_errors = true;
                 continue;
             }
@@ -773,10 +975,7 @@ fn report_semantic_errors(path: &Path, source: &str, program: &orvi_syntax::Prog
             if import_source.starts_with("std:") {
                 return None;
             }
-            let module_path = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(import_source);
+            let module_path = resolve_import(path, import_source).ok()?;
             let module_source = fs::read_to_string(module_path).ok()?;
             let parsed = parse(&module_source);
             (!parsed.has_errors()).then(|| (import_source.clone(), parsed.program))
@@ -841,6 +1040,37 @@ mod tests {
         assert_eq!(
             parse_arguments(&[OsString::from("check"), OsString::from("app.orvi")]),
             Ok(Command::Check(Some(PathBuf::from("app.orvi"))))
+        );
+    }
+    #[test]
+    fn parses_test_and_dependency_commands() {
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("test"),
+                OsString::from("--filter"),
+                OsString::from("fast"),
+            ]),
+            Ok(Command::Test {
+                path: None,
+                filter: Some("fast".into()),
+                list: false,
+            })
+        );
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("add"),
+                OsString::from("math"),
+                OsString::from("--path"),
+                OsString::from("../math"),
+            ]),
+            Ok(Command::Add {
+                name: "math".into(),
+                path: PathBuf::from("../math"),
+            })
+        );
+        assert_eq!(
+            parse_arguments(&[OsString::from("install")]),
+            Ok(Command::Install)
         );
     }
     #[test]

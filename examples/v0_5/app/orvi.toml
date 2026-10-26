@@ -1,0 +1,7 @@
+[project]
+name = "package-demo"
+version = "0.1.0"
+entry = "src/main.orvi"
+
+[dependencies]
+math = { path = "../math" }

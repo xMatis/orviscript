@@ -1,0 +1,8 @@
+import { double } from "pkg:math"
+
+task test_double -> Result<void, string> {
+    if double(21) != 42 {
+        return Err("double returned an unexpected value")
+    }
+    return Ok()
+}

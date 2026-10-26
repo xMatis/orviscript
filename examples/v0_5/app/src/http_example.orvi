@@ -1,0 +1,7 @@
+fn fetch_text(url: string) -> Result<string, string> {
+    let response: map<any> = http.get(url)?
+    return Ok(response.body)
+}
+
+// Example call:
+// print(fetch_text("https://example.com"))

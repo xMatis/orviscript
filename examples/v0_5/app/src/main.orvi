@@ -1,0 +1,6 @@
+import { double } from "pkg:math"
+
+let started: int = time.monotonic_ms()
+print("21 doubled is", double(21))
+print("Unix time:", time.unix_ms())
+print("Elapsed:", time.monotonic_ms() - started, "ms")

@@ -444,3 +444,75 @@ fn keeps_task_scope_alive_while_calling_a_function() {
     assert_eq!(execution.output, ["alive"]);
     assert_eq!(execution.tasks[0].status, TaskStatus::Succeeded);
 }
+
+#[test]
+fn provides_http_and_time_modules() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            )
+            .expect("write response");
+    });
+    let source = format!(
+        "print(http.get(\"http://{address}\")); print(time.unix_ms()); print(time.monotonic_ms()); print(time.sleep_ms(0))"
+    );
+    let output = run(&source).expect("standard modules run");
+    server.join().expect("server exits");
+    assert!(output[0].starts_with("Ok({ status: 200"), "{}", output[0]);
+    assert!(output[0].contains("body: hello"), "{}", output[0]);
+    assert!(output[1].starts_with("Ok("));
+    assert!(output[2].parse::<i64>().is_ok());
+    assert_eq!(output[3], "Ok()");
+    assert_eq!(
+        run("print(http.get(\"file:///secret\"))").unwrap(),
+        ["Err(http URL must use http:// or https://)"]
+    );
+}
+
+#[test]
+fn imports_exports_from_path_packages() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let app = directory.path().join("app");
+    let package = directory.path().join("math");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(
+        app.join("orvi.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("orvi.toml"),
+        "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("src/main.orvi"),
+        "export fn double(value: int) -> int { return value * 2 }",
+    )
+    .unwrap();
+    let source = "import { double } from \"pkg:math\"; print(double(21))";
+    let entry = app.join("src/main.orvi");
+    std::fs::write(&entry, source).unwrap();
+    let parsed = parse(source);
+    let execution = execute_file(
+        &parsed.program,
+        ExecutionContext {
+            cwd: app.clone(),
+            script_dir: app.join("src"),
+            project_dir: app,
+        },
+        entry,
+    )
+    .expect("package import runs");
+    assert_eq!(execution.output, ["42"]);
+}

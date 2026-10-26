@@ -1,11 +1,14 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::{Rc, Weak};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use orvi_project::resolve_import;
 use orvi_syntax::{
     BinaryOperator, Expression, ExpressionKind, Literal, Parameter, PatternKind, Program, Span,
     Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
@@ -148,6 +151,8 @@ pub enum NativeModule {
     Process,
     Terminal,
     Task,
+    Http,
+    Time,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +175,11 @@ pub enum NativeFunction {
     TerminalConfirm,
     TerminalPassword,
     TaskResult,
+    HttpGet,
+    HttpRequest,
+    TimeUnixMs,
+    TimeMonotonicMs,
+    TimeSleepMs,
 }
 
 #[derive(Clone, Debug)]
@@ -564,6 +574,8 @@ impl Interpreter {
             ("process", NativeModule::Process),
             ("terminal", NativeModule::Terminal),
             ("task", NativeModule::Task),
+            ("http", NativeModule::Http),
+            ("time", NativeModule::Time),
         ] {
             globals.define(name.into(), Value::NativeModule(module), false, None);
         }
@@ -959,27 +971,10 @@ impl Interpreter {
     }
 
     fn resolve_module_path(&self, source: &str, span: Span) -> Result<PathBuf, RuntimeError> {
-        let source_path = PathBuf::from(source);
-        let path = if source_path.is_absolute() {
-            source_path
-        } else {
-            let Some(current_file) = self.current_files.last() else {
-                return Err(self.error("local imports require a source file path", span));
-            };
-            current_file
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(source_path)
+        let Some(current_file) = self.current_files.last() else {
+            return Err(self.error("imports require a source file path", span));
         };
-        if path.extension().and_then(|extension| extension.to_str()) != Some("orvi") {
-            return Err(self.error("local module path must end with '.orvi'", span));
-        }
-        path.canonicalize().map_err(|error| {
-            self.error(
-                format!("could not resolve module '{}': {error}", path.display()),
-                span,
-            )
-        })
+        resolve_import(current_file, source).map_err(|error| self.error(error.to_string(), span))
     }
 
     fn load_module(&mut self, path: &Path, span: Span) -> Result<Environment, RuntimeError> {
@@ -1688,6 +1683,46 @@ impl Interpreter {
                     Err(error) => Ok(err_value(error.to_string())),
                 }
             }
+            NativeFunction::HttpGet => {
+                let url = self.string_argument(arguments.next(), function, span)?;
+                self.http_request("GET", &url, Vec::new(), None, span)
+            }
+            NativeFunction::HttpRequest => {
+                let method = self.string_argument(arguments.next(), function, span)?;
+                let url = self.string_argument(arguments.next(), function, span)?;
+                let headers = self.string_map_argument(arguments.next(), function, span)?;
+                let body = self.string_argument(arguments.next(), function, span)?;
+                self.http_request(&method, &url, headers, Some(body), span)
+            }
+            NativeFunction::TimeUnixMs => {
+                let milliseconds = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+                    Err(error) => return Ok(err_value(error.to_string())),
+                };
+                Ok(ok_value(Value::Integer(milliseconds)))
+            }
+            NativeFunction::TimeMonotonicMs => {
+                static START: OnceLock<Instant> = OnceLock::new();
+                let milliseconds = START
+                    .get_or_init(Instant::now)
+                    .elapsed()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64;
+                Ok(Value::Integer(milliseconds))
+            }
+            NativeFunction::TimeSleepMs => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::Integer(milliseconds) = value else {
+                    return Err(self.error("time.sleep_ms expects int", span));
+                };
+                if !(0..=86_400_000).contains(&milliseconds) {
+                    return Ok(err_value(
+                        "sleep duration must be between 0 and 86400000 ms",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(milliseconds as u64));
+                Ok(ok_value(Value::Void))
+            }
             NativeFunction::TaskResult => {
                 let name = self.string_argument(arguments.next(), function, span)?;
                 let Some(needs) = &self.active_task_needs else {
@@ -1752,6 +1787,97 @@ impl Interpreter {
             .collect()
     }
 
+    fn string_map_argument(
+        &self,
+        value: Option<Value>,
+        function: NativeFunction,
+        span: Span,
+    ) -> Result<Vec<(String, String)>, RuntimeError> {
+        let value = value.expect("checked argument count");
+        let Value::Map(entries) = value else {
+            return Err(self.error(format!("{} expects map<string>", function.name()), span));
+        };
+        entries
+            .borrow()
+            .iter()
+            .map(|(key, value)| match value {
+                Value::String(value) => Ok((key.clone(), value.clone())),
+                value => Err(self.error(
+                    format!(
+                        "{} expects map<string>, received value {}",
+                        function.name(),
+                        value.type_name()
+                    ),
+                    span,
+                )),
+            })
+            .collect()
+    }
+
+    fn http_request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Ok(err_value("http URL must use http:// or https://"));
+        }
+        let method = method.to_ascii_uppercase();
+        if !method
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character == '-')
+        {
+            return Ok(err_value("invalid HTTP method"));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(30))
+            .timeout_write(Duration::from_secs(30))
+            .build();
+        let mut request = agent.request(&method, url);
+        for (name, value) in headers {
+            request = request.set(&name, &value);
+        }
+        let response = match body {
+            Some(body) => request.send_string(&body),
+            None => request.call(),
+        };
+        let response = match response {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => return Ok(err_value(error.to_string())),
+        };
+        let status = response.status();
+        let mut response_headers = Vec::new();
+        for name in response.headers_names() {
+            if let Some(value) = response.header(&name) {
+                response_headers.push((name.to_ascii_lowercase(), Value::String(value.into())));
+            }
+        }
+        let headers = self.map_value(response_headers);
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| self.error(format!("could not read HTTP response: {error}"), span))?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Ok(err_value("HTTP response exceeds 4 MiB limit"));
+        }
+        let body = match String::from_utf8(bytes) {
+            Ok(body) => body,
+            Err(error) => return Ok(err_value(format!("HTTP response is not UTF-8: {error}"))),
+        };
+        Ok(ok_value(self.map_value(vec![
+            ("status".into(), Value::Integer(i64::from(status))),
+            ("headers".into(), headers),
+            ("body".into(), Value::String(body)),
+        ])))
+    }
+
     fn resolve_path(&self, path: String) -> PathBuf {
         let path = PathBuf::from(path);
         if path.is_absolute() {
@@ -1797,6 +1923,12 @@ impl Interpreter {
                 Value::Map(values)
             }
         }
+    }
+
+    fn map_value(&mut self, entries: MapEntries) -> Value {
+        let entries = Rc::new(RefCell::new(entries));
+        self.maps.push(Rc::downgrade(&entries));
+        Value::Map(entries)
     }
 
     fn add(&self, left: Value, right: Value, span: Span) -> Result<Value, RuntimeError> {
@@ -2056,6 +2188,8 @@ impl NativeModule {
             Self::Process => "process",
             Self::Terminal => "terminal",
             Self::Task => "task",
+            Self::Http => "http",
+            Self::Time => "time",
         }
     }
 
@@ -2079,6 +2213,11 @@ impl NativeModule {
             (Self::Terminal, "confirm") => Some(NativeFunction::TerminalConfirm),
             (Self::Terminal, "password") => Some(NativeFunction::TerminalPassword),
             (Self::Task, "result") => Some(NativeFunction::TaskResult),
+            (Self::Http, "get") => Some(NativeFunction::HttpGet),
+            (Self::Http, "request") => Some(NativeFunction::HttpRequest),
+            (Self::Time, "unix_ms") => Some(NativeFunction::TimeUnixMs),
+            (Self::Time, "monotonic_ms") => Some(NativeFunction::TimeMonotonicMs),
+            (Self::Time, "sleep_ms") => Some(NativeFunction::TimeSleepMs),
             _ => None,
         }
     }
@@ -2093,6 +2232,8 @@ fn native_module(name: &str) -> Option<NativeModule> {
         "process" => Some(NativeModule::Process),
         "terminal" => Some(NativeModule::Terminal),
         "task" => Some(NativeModule::Task),
+        "http" => Some(NativeModule::Http),
+        "time" => Some(NativeModule::Time),
         _ => None,
     }
 }
@@ -2118,13 +2259,19 @@ impl NativeFunction {
             Self::TerminalConfirm => "terminal.confirm",
             Self::TerminalPassword => "terminal.password",
             Self::TaskResult => "task.result",
+            Self::HttpGet => "http.get",
+            Self::HttpRequest => "http.request",
+            Self::TimeUnixMs => "time.unix_ms",
+            Self::TimeMonotonicMs => "time.monotonic_ms",
+            Self::TimeSleepMs => "time.sleep_ms",
         }
     }
 
     fn arity(self) -> usize {
         match self {
             Self::FsWriteText | Self::ProcessRun => 2,
-            Self::EnvCurrentDir => 0,
+            Self::HttpRequest => 4,
+            Self::EnvCurrentDir | Self::TimeUnixMs | Self::TimeMonotonicMs => 0,
             _ => 1,
         }
     }

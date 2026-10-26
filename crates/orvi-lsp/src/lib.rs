@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use orvi_project::Project;
+use orvi_project::{Project, resolve_import};
 use orvi_sema::{Analysis, SymbolOccurrence, analyze_program, analyze_program_with_modules};
 use orvi_syntax::{Program, Span, Statement, StatementKind, TokenKind, format_source, lex, parse};
 use tower_lsp_server::jsonrpc::{Error, Result};
@@ -412,9 +412,8 @@ fn load_project_documents(uri: &Uri, overlays: &HashMap<String, String>) -> Vec<
     let Ok(project) = Project::discover(&path) else {
         return Vec::new();
     };
-    let Ok(mut paths) = project.source_files() else {
-        return Vec::new();
-    };
+    let mut paths = Vec::new();
+    collect_project_source_files(&project, &mut HashSet::new(), &mut paths);
     if !paths.iter().any(|candidate| same_path(candidate, &path)) {
         paths.push(path);
     }
@@ -427,6 +426,28 @@ fn load_project_documents(uri: &Uri, overlays: &HashMap<String, String>) -> Vec<
             Some(ProjectDocument { uri, path, source })
         })
         .collect()
+}
+
+fn collect_project_source_files(
+    project: &Project,
+    visited: &mut HashSet<PathBuf>,
+    paths: &mut Vec<PathBuf>,
+) {
+    let root = project
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| project.root.clone());
+    if !visited.insert(root) {
+        return;
+    }
+    if let Ok(mut project_paths) = project.source_files() {
+        paths.append(&mut project_paths);
+    }
+    for name in project.manifest.dependencies.keys() {
+        if let Ok(dependency) = project.dependency(name) {
+            collect_project_source_files(&dependency, visited, paths);
+        }
+    }
 }
 
 fn overlay_source(overlays: &HashMap<String, String>, path: &Path) -> Option<String> {
@@ -462,11 +483,8 @@ fn symbol_identity(
                 .iter()
                 .find(|name| name.span == selected.definition && name.name == selected.name)
         {
-            let path = module_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(import_source);
-            return Some((path.canonicalize().unwrap_or(path), name.name.clone()));
+            let path = resolve_import(module_path, import_source).ok()?;
+            return Some((path, name.name.clone()));
         }
         let StatementKind::Export(declaration) = &statement.kind else {
             continue;
@@ -525,10 +543,7 @@ fn import_definition_spans(
             if source.starts_with("std:") {
                 return None;
             }
-            let target = module_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(source);
+            let target = resolve_import(module_path, source).ok()?;
             if !same_path(&target, &identity.0) {
                 return None;
             }
@@ -602,22 +617,13 @@ fn import_diagnostics(
         if import_source.starts_with("std:") {
             continue;
         }
-        if Path::new(import_source)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("orvi")
-        {
-            result.push(diagnostic(
-                source,
-                statement.span,
-                "local module path must end with '.orvi'".into(),
-            ));
-            continue;
-        }
-        let target_path = module_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(import_source);
+        let target_path = match resolve_import(module_path, import_source) {
+            Ok(path) => path,
+            Err(error) => {
+                result.push(diagnostic(source, statement.span, error.to_string()));
+                continue;
+            }
+        };
         let target_source = overlay_source(overlays, &target_path)
             .or_else(|| fs::read_to_string(&target_path).ok());
         let Some(target_source) = target_source else {
@@ -692,10 +698,9 @@ fn import_completion_items(
     }) else {
         return Vec::new();
     };
-    let target_path = module_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(import_source);
+    let Ok(target_path) = resolve_import(module_path, import_source) else {
+        return Vec::new();
+    };
     let Some(target) = documents
         .iter()
         .find(|document| same_path(&document.path, &target_path))
@@ -837,10 +842,7 @@ fn imported_programs(
             if import_source.starts_with("std:") {
                 return None;
             }
-            let target_path = module_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(import_source);
+            let target_path = resolve_import(module_path, import_source).ok()?;
             let target = documents
                 .iter()
                 .find(|document| same_path(&document.path, &target_path))?;
@@ -1120,6 +1122,8 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("env", CompletionItemKind::MODULE, "environment module"),
         ("process", CompletionItemKind::MODULE, "process module"),
         ("terminal", CompletionItemKind::MODULE, "terminal module"),
+        ("http", CompletionItemKind::MODULE, "HTTP client module"),
+        ("time", CompletionItemKind::MODULE, "time module"),
         ("context", CompletionItemKind::VARIABLE, "execution context"),
         ("parse", CompletionItemKind::FUNCTION, "json.parse(text)"),
         (
@@ -1160,7 +1164,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             CompletionItemKind::FUNCTION,
             "path.is_absolute(path)",
         ),
-        ("get", CompletionItemKind::FUNCTION, "env.get(name)"),
+        (
+            "get",
+            CompletionItemKind::FUNCTION,
+            "env.get(name) / http.get(url)",
+        ),
         (
             "current_dir",
             CompletionItemKind::FUNCTION,
@@ -1187,6 +1195,22 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "terminal.password(prompt)",
         ),
         ("result", CompletionItemKind::FUNCTION, "task.result(name)"),
+        (
+            "request",
+            CompletionItemKind::FUNCTION,
+            "http.request(method, url, headers, body)",
+        ),
+        ("unix_ms", CompletionItemKind::FUNCTION, "time.unix_ms()"),
+        (
+            "monotonic_ms",
+            CompletionItemKind::FUNCTION,
+            "time.monotonic_ms()",
+        ),
+        (
+            "sleep_ms",
+            CompletionItemKind::FUNCTION,
+            "time.sleep_ms(ms)",
+        ),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
         (
@@ -1294,7 +1318,9 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "parent" => "`path.parent(path)` returns `Option<string>`.",
         "file_name" => "`path.file_name(path)` returns `Option<string>`.",
         "is_absolute" => "`path.is_absolute(path)` returns `bool`.",
-        "get" => "`env.get(name)` returns `Option<string>`.",
+        "get" => {
+            "`env.get(name)` returns `Option<string>`; `http.get(url)` returns an HTTP response in `Result`."
+        }
         "current_dir" => "`env.current_dir()` returns `Result<string, string>`.",
         "run" => "`process.run(program, args)` runs a process without a shell.",
         "input" => "`terminal.input(prompt)` reads visible terminal input.",
@@ -1303,6 +1329,14 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "parse" => "`json.parse(text)` returns `Result<any, string>`.",
         "stringify" => "`json.stringify(value)` returns `Result<string, string>`.",
         "result" => "`task.result(name)` returns the `Result` of a declared dependency.",
+        "request" => {
+            "`http.request(method, url, headers, body)` returns `Result<map<any>, string>`."
+        }
+        "unix_ms" => "`time.unix_ms()` returns Unix time in milliseconds as `Result<int, string>`.",
+        "monotonic_ms" => "`time.monotonic_ms()` returns monotonic process time in milliseconds.",
+        "sleep_ms" => {
+            "`time.sleep_ms(ms)` sleeps synchronously and returns `Result<void, string>`."
+        }
         _ => {
             let (_, symbol) = symbol_at(source, position)?;
             let kind = match symbol.kind {
@@ -1436,7 +1470,7 @@ mod tests {
     use super::{
         completion_items, diagnostics, document_symbols, format_document, hover_at,
         import_completion_items, import_diagnostics, is_identifier, load_project_documents,
-        position, project_symbol_description, project_symbol_locations, semantic_tokens,
+        position, project_symbol_description, project_symbol_locations, same_path, semantic_tokens,
         span_range, symbol_at, symbol_identity,
     };
     use orvi_syntax::Span;
@@ -1526,6 +1560,9 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "export"));
         assert!(items.iter().any(|item| item.label == "void"));
         assert!(items.iter().any(|item| item.label == "read_text"));
+        assert!(items.iter().any(|item| item.label == "http"));
+        assert!(items.iter().any(|item| item.label == "time"));
+        assert!(items.iter().any(|item| item.label == "sleep_ms"));
     }
 
     #[test]
@@ -1671,5 +1708,50 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert!(missing[0].message.contains("could not resolve module"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_path_package_exports() {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("orvi-lsp-package-{id}"));
+        let app = base.join("app");
+        let package = base.join("math");
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::create_dir_all(package.join("src")).unwrap();
+        fs::write(
+            app.join("orvi.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            package.join("orvi.toml"),
+            "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"src/main.orvi\"\n",
+        )
+        .unwrap();
+        let module = "export fn double(value: int) -> int { return value * 2 }";
+        let entry = "import { double } from \"pkg:math\"; print(double(21))";
+        fs::write(package.join("src/main.orvi"), module).unwrap();
+        fs::write(app.join("src/main.orvi"), entry).unwrap();
+
+        let entry_uri = Uri::from_file_path(app.join("src/main.orvi")).unwrap();
+        let documents = load_project_documents(&entry_uri, &HashMap::new());
+        assert_eq!(documents.len(), 2);
+        assert!(import_diagnostics(&app.join("src/main.orvi"), entry, &HashMap::new()).is_empty());
+        let completions = import_completion_items(
+            &app.join("src/main.orvi"),
+            entry,
+            Position::new(0, 12),
+            &documents,
+        );
+        assert!(completions.iter().any(|item| item.label == "double"));
+        let use_offset = entry.rfind("double").unwrap() + 1;
+        let (_, selected) = symbol_at(entry, position(entry, use_offset)).unwrap();
+        let identity = symbol_identity(&app.join("src/main.orvi"), entry, &selected).unwrap();
+        assert!(same_path(&identity.0, &package.join("src/main.orvi")));
+
+        fs::remove_dir_all(base).unwrap();
     }
 }

@@ -277,3 +277,110 @@ fn links_lists_runs_and_unlinks_global_task_aliases() {
 
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn manages_and_runs_local_path_dependencies() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("orviscript-dependencies-{id}"));
+    let app = base.join("app");
+    let math = base.join("math");
+    fs::create_dir_all(app.join("src")).unwrap();
+    fs::create_dir_all(math.join("src")).unwrap();
+    fs::write(
+        app.join("orvi.toml"),
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    fs::write(
+        math.join("orvi.toml"),
+        "[project]\nname = \"math\"\nversion = \"1.0.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    fs::write(
+        math.join("src/main.orvi"),
+        "export fn double(value: int) -> int { return value * 2 }",
+    )
+    .unwrap();
+    fs::write(
+        app.join("src/main.orvi"),
+        "import { double } from \"pkg:math\"; print(double(21))",
+    )
+    .unwrap();
+
+    let added = run_in(&["add", "math", "--path", math.to_str().unwrap()], &app);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(app.join("orvi.lock").is_file());
+    let dependencies = run_in(&["deps"], &app);
+    assert!(dependencies.status.success());
+    assert!(String::from_utf8_lossy(&dependencies.stdout).contains("math 1.0.0"));
+    let checked = run_in(&["check"], &app);
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let executed = run_in(&["run"], &app);
+    assert!(executed.status.success());
+    assert_eq!(String::from_utf8_lossy(&executed.stdout).trim(), "42");
+    let removed = run_in(&["remove", "math"], &app);
+    assert!(removed.status.success());
+    assert!(
+        !fs::read_to_string(app.join("orvi.toml"))
+            .unwrap()
+            .contains("math =")
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn discovers_lists_and_filters_tests_across_a_project() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!("orviscript-test-project-{id}"));
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("orvi.toml"),
+        "[project]\nname = \"tests\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/main.orvi"),
+        "task test_fast -> Result<void, string> { return Ok() }",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/other.orvi"),
+        "task test_slow -> Result<void, string> { return Ok() }",
+    )
+    .unwrap();
+
+    let listed = run_in(&["test", "--list"], &project);
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("test_fast"));
+    assert!(stdout.contains("test_slow"));
+    assert!(stdout.contains("Listed 2 test(s)."));
+
+    let filtered = run_in(&["test", "--filter", "fast"], &project);
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&filtered.stdout);
+    assert!(stdout.contains("test test_fast: passed"));
+    assert!(!stdout.contains("test_slow"));
+    assert!(stdout.contains("1 passed, 0 failed, 0 skipped, 1 total"));
+
+    fs::remove_dir_all(project).unwrap();
+}
