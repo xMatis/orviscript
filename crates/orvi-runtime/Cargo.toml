@@ -17,5 +17,10 @@ tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt", "sy
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
+orvi-sema = { path = "../orvi-sema" }
 tempfile = "3"
+
+[[bench]]
+name = "pipeline_breakdown"
+harness = false
 

@@ -14,3 +14,8 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/xMatis/orviscript"
 
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
+

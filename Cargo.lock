@@ -639,6 +639,7 @@ version = "0.6.0"
 dependencies = [
  "async-recursion",
  "orvi-project",
+ "orvi-sema",
  "orvi-syntax",
  "reqwest",
  "rpassword",

@@ -22,6 +22,18 @@ Compare the same one-million-iteration workload in OrviScript, JavaScript and Py
 
 The comparison script verifies that all three programs print the same checksum before measuring them. It uses the installed `orviscript` command when available and otherwise falls back to `target/release/orviscript`. Pass `-OrviExecutable` to select a downloaded release explicitly.
 
+Measure the parser, semantic analyzer, runtime startup and interpreter separately inside one optimized Rust process:
+
+```powershell
+cargo bench -p orvi-runtime --bench pipeline_breakdown
+```
+
+Use the `profiling` Cargo profile when collecting CPU profiles. It keeps debug symbols while retaining release optimizations:
+
+```powershell
+cargo build --profile profiling --locked --bin orviscript
+```
+
 Use `-Warmup` and `-Runs` to control sample counts. Reports are written to the ignored `artifacts/benchmarks/` directory as JSON and Markdown. Compare results only on the same machine, power plan and background-load conditions.
 
 Workloads:
@@ -29,5 +41,5 @@ Workloads:
 - `startup.orvi`: process and minimal-language startup cost;
 - `sync_loop.orvi`: 100,000 interpreted loop iterations;
 - `async_10000_tasks.orvi`: the maximum 10,000 lightweight tasks in one scope;
-- `async_timers.orvi`: 1,000 concurrent timers.
+- `async_timers.orvi`: 1,000 concurrent timers;
 - `comparison.orvi`, `comparison.js`, `comparison.py`: the same one-million-iteration integer summation, including process startup and program execution.
