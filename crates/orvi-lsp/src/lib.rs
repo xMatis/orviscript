@@ -4,22 +4,25 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use orvi_project::{Project, resolve_import};
-use orvi_sema::{Analysis, SymbolOccurrence, analyze_program, analyze_program_with_modules};
+use orvi_sema::{
+    Analysis, STANDARD_MODULES, StandardMember, SymbolOccurrence, analyze_program,
+    analyze_program_with_modules, standard_module,
+};
 use orvi_syntax::{Program, Span, Statement, StatementKind, TokenKind, format_source, lex, parse};
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkupContent, MarkupKind, MessageType, OneOf, Position, PrepareRenameResponse,
-    Range, ReferenceParams, RenameOptions, RenameParams, SemanticToken, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult, ServerCapabilities,
-    ServerInfo, SymbolKind as LspSymbolKind, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkDoneProgressOptions,
-    WorkspaceEdit,
+    DocumentSymbolResponse, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType, OneOf,
+    Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
+    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensResult, ServerCapabilities, ServerInfo, SymbolKind as LspSymbolKind,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -120,7 +123,10 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
-                completion_provider: Some(CompletionOptions::default()),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".into(), "\"".into(), ":".into(), ",".into()]),
+                    ..CompletionOptions::default()
+                }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(semantic_tokens_options().into()),
                 definition_provider: Some(OneOf::Left(true)),
@@ -190,17 +196,28 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let document = params.text_document_position.text_document;
         let source = self.document(&document.uri);
-        let mut items = completion_items(source.as_deref());
-        if let Some(source) = source.as_deref()
-            && let Some(path) = document.uri.to_file_path()
+        let position = params.text_document_position.position;
+        let items = if let Some(source) = source.as_deref()
+            && let Some(items) = standard_completion_items(source, position)
         {
-            items.extend(import_completion_items(
-                path.as_ref(),
-                source,
-                params.text_document_position.position,
-                &self.project_documents(&document.uri),
-            ));
-        }
+            items
+        } else {
+            let items = completion_items(source.as_deref());
+            if let Some(source) = source.as_deref()
+                && let Some(path) = document.uri.to_file_path()
+            {
+                let imported = import_completion_items(
+                    path.as_ref(),
+                    source,
+                    position,
+                    &self.project_documents(&document.uri),
+                );
+                if !imported.is_empty() {
+                    return Ok(Some(CompletionResponse::Array(imported)));
+                }
+            }
+            items
+        };
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -209,6 +226,11 @@ impl LanguageServer for Backend {
         let Some(source) = self.document(&document.uri) else {
             return Ok(None);
         };
+        if let Some(hover) =
+            standard_hover_at(&source, params.text_document_position_params.position)
+        {
+            return Ok(Some(hover));
+        }
         if let Some(path) = document.uri.to_file_path()
             && let Some((_, selected)) =
                 symbol_at(&source, params.text_document_position_params.position)
@@ -688,16 +710,32 @@ fn import_completion_items(
         return Vec::new();
     }
     let Some(import_source) = parsed.program.statements.iter().find_map(|statement| {
-        let StatementKind::Import { source, .. } = &statement.kind else {
+        let StatementKind::Import {
+            source: import_source,
+            ..
+        } = &statement.kind
+        else {
             return None;
         };
-        (statement.span.start() <= offset
-            && offset <= statement.span.end()
-            && !source.starts_with("std:"))
-        .then_some(source)
+        if statement.span.start() > offset || offset > statement.span.end() {
+            return None;
+        }
+        let prefix = &source_text(source, statement.span)[..offset - statement.span.start()];
+        (!prefix.contains(" from ")).then_some(import_source)
     }) else {
         return Vec::new();
     };
+    if let Some(module) = import_source.strip_prefix("std:") {
+        return standard_module(module)
+            .map(|module| {
+                module
+                    .members
+                    .iter()
+                    .map(|member| standard_member_completion(member, false))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     let Ok(target_path) = resolve_import(module_path, import_source) else {
         return Vec::new();
     };
@@ -735,6 +773,165 @@ fn import_completion_items(
             })
         })
         .collect()
+}
+
+fn source_text(source: &str, span: Span) -> &str {
+    &source[span.start()..span.end()]
+}
+
+fn standard_completion_items(source: &str, cursor: Position) -> Option<Vec<CompletionItem>> {
+    let offset = offset_at_position(source, cursor)?;
+    let prefix = &source[..offset];
+
+    if let Some(from) = prefix.rfind("from \"") {
+        let typed = &prefix[from + "from \"".len()..];
+        if !typed.contains('"')
+            && (typed.is_empty() || "std:".starts_with(typed) || typed.starts_with("std:"))
+        {
+            return Some(
+                STANDARD_MODULES
+                    .iter()
+                    .map(|module| CompletionItem {
+                        label: format!("std:{}", module.name),
+                        kind: Some(CompletionItemKind::MODULE),
+                        detail: Some(module.description.into()),
+                        documentation: Some(Documentation::MarkupContent(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!(
+                                "`std:{}`\n\n{}\n\nExports: {}",
+                                module.name,
+                                module.description,
+                                module
+                                    .members
+                                    .iter()
+                                    .map(|member| format!("`{}`", member.name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        })),
+                        insert_text: Some(format!("std:{}", module.name)),
+                        sort_text: Some(format!("0_{}", module.name)),
+                        ..CompletionItem::default()
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    let word_start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let before_word = &prefix[..word_start];
+    let before_dot = before_word.strip_suffix('.')?;
+    let module_start = before_dot
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let module = standard_module(&before_dot[module_start..])?;
+    Some(
+        module
+            .members
+            .iter()
+            .map(|member| standard_member_completion(member, true))
+            .collect(),
+    )
+}
+
+fn standard_member_completion(member: &StandardMember, call: bool) -> CompletionItem {
+    CompletionItem {
+        label: member.name.into(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        detail: Some(member.signature.into()),
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: member.description.into(),
+        })),
+        insert_text: Some(if call {
+            standard_member_snippet(member)
+        } else {
+            member.name.into()
+        }),
+        insert_text_format: call.then_some(InsertTextFormat::SNIPPET),
+        sort_text: Some(format!("0_{}", member.name)),
+        ..CompletionItem::default()
+    }
+}
+
+fn standard_member_snippet(member: &StandardMember) -> String {
+    let Some(parameters) = member
+        .signature
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(parameters, _)| parameters)
+    else {
+        return member.name.into();
+    };
+    if parameters.is_empty() {
+        return format!("{}()", member.name);
+    }
+    let placeholders = parameters
+        .split(", ")
+        .enumerate()
+        .map(|(index, parameter)| {
+            let name = parameter
+                .split_once(':')
+                .map_or(parameter, |(name, _)| name);
+            format!("${{{}:{}}}", index + 1, name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}({placeholders})", member.name)
+}
+
+fn standard_hover_at(source: &str, cursor: Position) -> Option<Hover> {
+    let offset = offset_at_position(source, cursor)?;
+    let token = lex(source)
+        .tokens
+        .into_iter()
+        .find(|token| token.span.start() <= offset && offset < token.span.end())?;
+    let member_name = token.text(source)?;
+    let direct_module = source[..token.span.start()]
+        .strip_suffix('.')
+        .and_then(|prefix| {
+            let start = prefix
+                .char_indices()
+                .rev()
+                .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
+                .map_or(0, |(index, character)| index + character.len_utf8());
+            standard_module(&prefix[start..])
+        });
+    let imported_module = parse(source)
+        .program
+        .statements
+        .into_iter()
+        .find_map(|statement| {
+            let StatementKind::Import { names, source } = statement.kind else {
+                return None;
+            };
+            names
+                .iter()
+                .any(|name| name.as_str() == member_name)
+                .then(|| source.strip_prefix("std:").and_then(standard_module))
+                .flatten()
+        });
+    let module = direct_module.or(imported_module)?;
+    let member = module
+        .members
+        .iter()
+        .find(|member| member.name == member_name)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!(
+                "```orviscript\n{}\n```\n\n{}\n\nModule: `std:{}`",
+                member.signature, member.description, module.name
+            ),
+        }),
+        range: Some(span_range(source, token.span)),
+    })
 }
 
 fn project_symbol_description(
@@ -1140,143 +1337,7 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             CompletionItemKind::TYPE_PARAMETER,
             "scoped asynchronous task handle",
         ),
-        ("json", CompletionItemKind::MODULE, "JSON module"),
-        ("fs", CompletionItemKind::MODULE, "filesystem module"),
-        ("path", CompletionItemKind::MODULE, "path module"),
-        ("env", CompletionItemKind::MODULE, "environment module"),
-        ("process", CompletionItemKind::MODULE, "process module"),
-        ("terminal", CompletionItemKind::MODULE, "terminal module"),
-        ("http", CompletionItemKind::MODULE, "HTTP client module"),
-        ("time", CompletionItemKind::MODULE, "time module"),
         ("context", CompletionItemKind::VARIABLE, "execution context"),
-        ("parse", CompletionItemKind::FUNCTION, "json.parse(text)"),
-        (
-            "stringify",
-            CompletionItemKind::FUNCTION,
-            "json.stringify(value)",
-        ),
-        (
-            "read_text",
-            CompletionItemKind::FUNCTION,
-            "fs.read_text(path)",
-        ),
-        (
-            "read_text_async",
-            CompletionItemKind::FUNCTION,
-            "fs.read_text_async(path)",
-        ),
-        (
-            "write_text",
-            CompletionItemKind::FUNCTION,
-            "fs.write_text(path, contents)",
-        ),
-        (
-            "write_text_async",
-            CompletionItemKind::FUNCTION,
-            "fs.write_text_async(path, contents)",
-        ),
-        ("exists", CompletionItemKind::FUNCTION, "fs.exists(path)"),
-        (
-            "create_dir_all",
-            CompletionItemKind::FUNCTION,
-            "fs.create_dir_all(path)",
-        ),
-        (
-            "remove_file",
-            CompletionItemKind::FUNCTION,
-            "fs.remove_file(path)",
-        ),
-        ("join", CompletionItemKind::FUNCTION, "path.join(parts)"),
-        ("parent", CompletionItemKind::FUNCTION, "path.parent(path)"),
-        (
-            "file_name",
-            CompletionItemKind::FUNCTION,
-            "path.file_name(path)",
-        ),
-        (
-            "is_absolute",
-            CompletionItemKind::FUNCTION,
-            "path.is_absolute(path)",
-        ),
-        (
-            "get",
-            CompletionItemKind::FUNCTION,
-            "env.get(name) / http.get(url)",
-        ),
-        (
-            "current_dir",
-            CompletionItemKind::FUNCTION,
-            "env.current_dir()",
-        ),
-        (
-            "run",
-            CompletionItemKind::FUNCTION,
-            "process.run(program, args)",
-        ),
-        (
-            "run_async",
-            CompletionItemKind::FUNCTION,
-            "process.run_async(program, args)",
-        ),
-        (
-            "input",
-            CompletionItemKind::FUNCTION,
-            "terminal.input(prompt)",
-        ),
-        (
-            "confirm",
-            CompletionItemKind::FUNCTION,
-            "terminal.confirm(prompt)",
-        ),
-        (
-            "password",
-            CompletionItemKind::FUNCTION,
-            "terminal.password(prompt)",
-        ),
-        ("result", CompletionItemKind::FUNCTION, "task.result(name)"),
-        ("spawn", CompletionItemKind::FUNCTION, "task.spawn(future)"),
-        ("join", CompletionItemKind::FUNCTION, "task.join(handle)"),
-        (
-            "cancel",
-            CompletionItemKind::FUNCTION,
-            "task.cancel(handle)",
-        ),
-        (
-            "timeout",
-            CompletionItemKind::FUNCTION,
-            "task.timeout(future, milliseconds)",
-        ),
-        (
-            "request",
-            CompletionItemKind::FUNCTION,
-            "http.request(method, url, headers, body)",
-        ),
-        (
-            "get_async",
-            CompletionItemKind::FUNCTION,
-            "http.get_async(url)",
-        ),
-        (
-            "request_async",
-            CompletionItemKind::FUNCTION,
-            "http.request_async(method, url, headers, body)",
-        ),
-        ("unix_ms", CompletionItemKind::FUNCTION, "time.unix_ms()"),
-        (
-            "monotonic_ms",
-            CompletionItemKind::FUNCTION,
-            "time.monotonic_ms()",
-        ),
-        (
-            "sleep_ms",
-            CompletionItemKind::FUNCTION,
-            "time.sleep_ms(ms)",
-        ),
-        (
-            "sleep_async",
-            CompletionItemKind::FUNCTION,
-            "time.sleep_async(ms) -> Future<Result<void, string>>",
-        ),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
         (
@@ -1308,6 +1369,21 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ..CompletionItem::default()
     })
     .collect::<Vec<_>>();
+    for module in STANDARD_MODULES {
+        if items.iter().any(|item| item.label == module.name) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: module.name.into(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some(format!("std:{}", module.name)),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: module.description.into(),
+            })),
+            ..CompletionItem::default()
+        });
+    }
     if let Some(source) = source {
         let parsed = parse(source);
         if !parsed.has_errors() {
@@ -1379,53 +1455,6 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "None" => "`None` is an `Option` without a value.",
         "Ok" => "`Ok(value)` creates a successful `Result`.",
         "Err" => "`Err(error)` creates a failed `Result`.",
-        "read_text" => "`fs.read_text(path)` returns `Result<string, string>`.",
-        "read_text_async" => "`fs.read_text_async(path)` returns `Future<Result<string, string>>`.",
-        "write_text" => "`fs.write_text(path, contents)` returns `Result<void, string>`.",
-        "write_text_async" => {
-            "`fs.write_text_async(path, contents)` returns `Future<Result<void, string>>`."
-        }
-        "exists" => "`fs.exists(path)` returns whether the path exists.",
-        "create_dir_all" => "`fs.create_dir_all(path)` creates directories recursively.",
-        "remove_file" => "`fs.remove_file(path)` removes one file.",
-        "join" => {
-            "`path.join(parts)` joins path segments; `task.join(handle)` returns `Future<Result<T, string>>`."
-        }
-        "parent" => "`path.parent(path)` returns `Option<string>`.",
-        "file_name" => "`path.file_name(path)` returns `Option<string>`.",
-        "is_absolute" => "`path.is_absolute(path)` returns `bool`.",
-        "get" => {
-            "`env.get(name)` returns `Option<string>`; `http.get(url)` returns an HTTP response in `Result`."
-        }
-        "current_dir" => "`env.current_dir()` returns `Result<string, string>`.",
-        "run" => "`process.run(program, args)` runs a process without a shell.",
-        "run_async" => {
-            "`process.run_async(program, args)` runs a process without blocking the executor."
-        }
-        "input" => "`terminal.input(prompt)` reads visible terminal input.",
-        "confirm" => "`terminal.confirm(prompt)` reads a yes/no answer.",
-        "password" => "`terminal.password(prompt)` reads hidden terminal input.",
-        "parse" => "`json.parse(text)` returns `Result<any, string>`.",
-        "stringify" => "`json.stringify(value)` returns `Result<string, string>`.",
-        "result" => "`task.result(name)` returns the `Result` of a declared dependency.",
-        "spawn" => "`task.spawn(future)` starts a future on the current-thread executor.",
-        "cancel" => "`task.cancel(handle)` requests cooperative cancellation.",
-        "timeout" => "`task.timeout(future, ms)` returns a timed `Future<Result<T, string>>`.",
-        "request" => {
-            "`http.request(method, url, headers, body)` returns `Result<map<any>, string>`."
-        }
-        "get_async" => "`http.get_async(url)` returns `Future<Result<map<any>, string>>`.",
-        "request_async" => {
-            "`http.request_async(method, url, headers, body)` returns `Future<Result<map<any>, string>>`."
-        }
-        "unix_ms" => "`time.unix_ms()` returns Unix time in milliseconds as `Result<int, string>`.",
-        "monotonic_ms" => "`time.monotonic_ms()` returns monotonic process time in milliseconds.",
-        "sleep_ms" => {
-            "`time.sleep_ms(ms)` sleeps synchronously and returns `Result<void, string>`."
-        }
-        "sleep_async" => {
-            "`time.sleep_async(ms)` yields to the executor and returns `Future<Result<void, string>>`."
-        }
         _ => {
             let (_, symbol) = symbol_at(source, position)?;
             let kind = match symbol.kind {
@@ -1560,14 +1589,15 @@ mod tests {
         completion_items, diagnostics, document_symbols, format_document, hover_at,
         import_completion_items, import_diagnostics, is_identifier, load_project_documents,
         position, project_symbol_description, project_symbol_locations, same_path, semantic_tokens,
-        span_range, symbol_at, symbol_identity,
+        span_range, standard_completion_items, standard_hover_at, symbol_at, symbol_identity,
     };
     use orvi_syntax::Span;
     use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower_lsp_server::ls_types::{
-        CompletionItemKind, DiagnosticSeverity, HoverContents, Position, Range, Uri,
+        CompletionItemKind, DiagnosticSeverity, HoverContents, InsertTextFormat, Position, Range,
+        Uri,
     };
 
     #[test]
@@ -1652,11 +1682,60 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "await"));
         assert!(items.iter().any(|item| item.label == "Future"));
         assert!(items.iter().any(|item| item.label == "Task"));
-        assert!(items.iter().any(|item| item.label == "read_text"));
         assert!(items.iter().any(|item| item.label == "http"));
         assert!(items.iter().any(|item| item.label == "time"));
-        assert!(items.iter().any(|item| item.label == "sleep_ms"));
-        assert!(items.iter().any(|item| item.label == "sleep_async"));
+        assert_eq!(items.iter().filter(|item| item.label == "task").count(), 1);
+        assert!(!items.iter().any(|item| item.label == "read_text"));
+        assert!(!items.iter().any(|item| item.label == "sleep_async"));
+    }
+
+    #[test]
+    fn completes_standard_modules_and_only_the_selected_module_members() {
+        let module_source = "import { value } from \"std:f";
+        let modules =
+            standard_completion_items(module_source, Position::new(0, module_source.len() as u32))
+                .expect("standard module completion");
+        assert!(modules.iter().any(|item| item.label == "std:fs"));
+        assert!(modules.iter().any(|item| item.label == "std:http"));
+
+        let import_source = "import { read } from \"std:fs\";";
+        let members = import_completion_items(
+            std::path::Path::new("main.orvi"),
+            import_source,
+            Position::new(0, 12),
+            &[],
+        );
+        let read_text = members
+            .iter()
+            .find(|item| item.label == "read_text")
+            .expect("filesystem member completion");
+        assert!(
+            read_text
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Result<string")
+        );
+        assert!(!members.iter().any(|item| item.label == "sleep_async"));
+    }
+
+    #[test]
+    fn completes_standard_module_calls_with_argument_snippets() {
+        let source = "fs.re";
+        let members = standard_completion_items(source, Position::new(0, source.len() as u32))
+            .expect("member completion");
+        let read_text = members
+            .iter()
+            .find(|item| item.label == "read_text")
+            .expect("read_text completion");
+        assert_eq!(
+            read_text.insert_text.as_deref(),
+            Some("read_text(${1:path})")
+        );
+        assert_eq!(
+            read_text.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
     }
 
     #[test]
@@ -1676,11 +1755,21 @@ mod tests {
     #[test]
     fn explains_standard_api_on_hover() {
         let source = "fs.read_text(\"file\")";
-        let hover = hover_at(source, Position::new(0, 5)).expect("hover result");
+        let hover = standard_hover_at(source, Position::new(0, 5)).expect("hover result");
         let HoverContents::Markup(contents) = hover.contents else {
             panic!("expected markdown hover");
         };
         assert!(contents.value.contains("Result<string, string>"));
+        assert!(contents.value.contains("std:fs"));
+
+        let imported = "import { read_text } from \"std:fs\"; read_text(\"file\")";
+        let use_column = imported.rfind("read_text").unwrap() as u32 + 2;
+        let hover =
+            standard_hover_at(imported, Position::new(0, use_column)).expect("import hover");
+        let HoverContents::Markup(contents) = hover.contents else {
+            panic!("expected markdown hover");
+        };
+        assert!(contents.value.contains("Reads a UTF-8 text file"));
     }
 
     #[test]

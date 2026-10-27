@@ -17,4 +17,4 @@ For code signing, configure an Inno Setup signing tool and pass `/DSignToolName=
 
 ## Release contract
 
-All Rust crates and `editors/vscode/package.json` must have the same semantic version. `scripts/release/Get-OrviVersion.ps1` enforces this. A `vX.Y.Z` tag must match that version; release CI builds archives, a VSIX, the Windows installer, and SHA-256 files. Future releases change the project version and create a matching tag—the installer source stays unchanged.
+All Rust crates and `editors/vscode/package.json` must have the same semantic version. `scripts/release/Get-OrviVersion.ps1` enforces this. A `vX.Y.Z` tag must match that version; release CI builds archives, a VSIX, the Windows installer, and SHA-256 files. Future releases change the project version and create a matching tag; the installer source stays unchanged.

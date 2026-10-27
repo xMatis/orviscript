@@ -3531,3 +3531,25 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
         Value::NativePrint => "<native fn print>".into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::native_module;
+    use orvi_sema::STANDARD_MODULES;
+
+    #[test]
+    fn standard_library_catalog_matches_runtime_exports() {
+        for module in STANDARD_MODULES {
+            let runtime_module = native_module(module.name)
+                .unwrap_or_else(|| panic!("std:{} is missing from the runtime", module.name));
+            for member in module.members {
+                assert!(
+                    runtime_module.member(member.name).is_some(),
+                    "std:{} has no runtime export '{}'",
+                    module.name,
+                    member.name
+                );
+            }
+        }
+    }
+}

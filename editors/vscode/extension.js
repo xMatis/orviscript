@@ -1,7 +1,7 @@
 const childProcess = require("node:child_process");
-const fs = require("node:fs");
-const path = require("node:path");
 const vscode = require("vscode");
+
+const { resolveServer } = require("./server-path.js");
 
 let connection;
 
@@ -40,7 +40,10 @@ class LanguageServerConnection {
   }
 
   async start() {
-    const executable = resolveServer(this.context.extensionPath);
+    const executable = resolveServer({
+      configured: vscode.workspace.getConfiguration("orviscript").get("server.path", "").trim(),
+      extensionPath: this.context.extensionPath,
+    });
     this.output.appendLine(`Starting ${executable}`);
     this.process = childProcess.spawn(executable, [], {
       cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
@@ -68,7 +71,7 @@ class LanguageServerConnection {
 
     const initialization = await this.request("initialize", {
       processId: process.pid,
-      clientInfo: { name: "OrviScript VS Code", version: "0.6.1" },
+      clientInfo: { name: "OrviScript VS Code", version: "0.6.2" },
       rootUri: vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? null,
       capabilities: {
         general: { positionEncodings: ["utf-16"] },
@@ -132,7 +135,7 @@ class LanguageServerConnection {
     const selector = { language: "orviscript" };
 
     if (capabilities.completionProvider) {
-      this.disposables.push(vscode.languages.registerCompletionItemProvider(selector, {
+      const provider = vscode.languages.registerCompletionItemProvider(selector, {
         provideCompletionItems: async (document, position) => {
           const response = await this.request("textDocument/completion", documentPosition(document, position));
           const items = Array.isArray(response) ? response : response?.items ?? [];
@@ -140,11 +143,16 @@ class LanguageServerConnection {
             const completion = new vscode.CompletionItem(item.label, completionKind(item.kind));
             completion.detail = item.detail;
             completion.documentation = item.documentation?.value ?? item.documentation;
-            completion.insertText = item.insertText;
+            completion.insertText = item.insertTextFormat === 2
+              ? new vscode.SnippetString(item.insertText)
+              : item.insertText;
+            completion.filterText = item.filterText;
+            completion.sortText = item.sortText;
             return completion;
           });
         },
-      }));
+      }, ...(capabilities.completionProvider.triggerCharacters ?? []));
+      this.disposables.push(provider);
     }
 
     if (capabilities.hoverProvider) {
@@ -329,15 +337,6 @@ class LanguageServerConnection {
   }
 }
 
-function resolveServer(extensionPath) {
-  const configured = vscode.workspace.getConfiguration("orviscript").get("server.path", "").trim();
-  if (configured) return configured;
-
-  const executable = process.platform === "win32" ? "orvi-lsp.exe" : "orvi-lsp";
-  const repositoryBuild = path.resolve(extensionPath, "..", "..", "target", "debug", executable);
-  return fs.existsSync(repositoryBuild) ? repositoryBuild : "orvi-lsp";
-}
-
 function documentPosition(document, position) {
   return {
     textDocument: { uri: document.uri.toString() },
@@ -350,6 +349,8 @@ function completionKind(kind) {
     3: vscode.CompletionItemKind.Function,
     4: vscode.CompletionItemKind.Constructor,
     6: vscode.CompletionItemKind.Variable,
+    8: vscode.CompletionItemKind.Interface,
+    9: vscode.CompletionItemKind.Module,
     12: vscode.CompletionItemKind.Value,
     13: vscode.CompletionItemKind.Enum,
     14: vscode.CompletionItemKind.Keyword,

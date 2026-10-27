@@ -48,7 +48,7 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const initialized = await waitFor((message) => message.id === 1);
     assert.equal(initialized.result.serverInfo.name, "orvi-lsp");
-    assert.equal(initialized.result.serverInfo.version, "0.6.1");
+    assert.equal(initialized.result.serverInfo.version, "0.6.2");
     assert.equal(initialized.result.capabilities.textDocumentSync, 1);
 
     send({ jsonrpc: "2.0", method: "initialized", params: {} });
@@ -97,6 +97,80 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const completion = await waitFor((message) => message.id === 2);
     assert.ok(completion.result.some((item) => item.label === "print"));
+
+    const completionUri = "file:///standard-library-completion.orvi";
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: completionUri,
+          languageId: "orviscript",
+          version: 1,
+          text: "import { read } from \"std:fs\";",
+        },
+      },
+    });
+    await waitFor((message) => message.method === "textDocument/publishDiagnostics"
+      && message.params.uri === completionUri);
+    send({
+      jsonrpc: "2.0",
+      id: 20,
+      method: "textDocument/completion",
+      params: {
+        textDocument: { uri: completionUri },
+        position: { line: 0, character: 12 },
+      },
+    });
+    const standardMembers = await waitFor((message) => message.id === 20);
+    assert.ok(standardMembers.result.some((item) => item.label === "read_text"));
+    assert.ok(!standardMembers.result.some((item) => item.label === "sleep_async"));
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri: completionUri, version: 2 },
+        contentChanges: [{ text: "fs.re" }],
+      },
+    });
+    await waitFor((message) => message.method === "textDocument/publishDiagnostics"
+      && message.params.uri === completionUri && message.params.version === 2);
+    send({
+      jsonrpc: "2.0",
+      id: 21,
+      method: "textDocument/completion",
+      params: {
+        textDocument: { uri: completionUri },
+        position: { line: 0, character: 5 },
+      },
+    });
+    const memberCalls = await waitFor((message) => message.id === 21);
+    const readText = memberCalls.result.find((item) => item.label === "read_text");
+    assert.equal(readText.insertText, "read_text(${1:path})");
+    assert.equal(readText.insertTextFormat, 2);
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri: completionUri, version: 3 },
+        contentChanges: [{ text: "import { value } from \"std:f" }],
+      },
+    });
+    await waitFor((message) => message.method === "textDocument/publishDiagnostics"
+      && message.params.uri === completionUri && message.params.version === 3);
+    send({
+      jsonrpc: "2.0",
+      id: 22,
+      method: "textDocument/completion",
+      params: {
+        textDocument: { uri: completionUri },
+        position: { line: 0, character: 28 },
+      },
+    });
+    const standardModules = await waitFor((message) => message.id === 22);
+    assert.ok(standardModules.result.some((item) => item.label === "std:fs"));
 
     send({
       jsonrpc: "2.0",
@@ -340,6 +414,14 @@ test("language server publishes diagnostics for an open document", { timeout: 60
         && !Object.hasOwn(message.params, "version"),
     );
     assert.deepEqual(closed.params.diagnostics, []);
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didClose",
+      params: { textDocument: { uri: completionUri } },
+    });
+    await waitFor((message) => message.method === "textDocument/publishDiagnostics"
+      && message.params.uri === completionUri && !Object.hasOwn(message.params, "version"));
 
     send({ jsonrpc: "2.0", id: 13, method: "shutdown", params: null });
     await waitFor((message) => message.id === 13);

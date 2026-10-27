@@ -53,6 +53,256 @@ pub struct Analysis {
     pub symbols: Vec<SymbolOccurrence>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardMember {
+    pub name: &'static str,
+    pub signature: &'static str,
+    pub description: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardModule {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub members: &'static [StandardMember],
+}
+
+const JSON_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "parse",
+        signature: "fn parse(text: string) -> Result<any, string>",
+        description: "Parses a JSON string.",
+    },
+    StandardMember {
+        name: "stringify",
+        signature: "fn stringify(value: any) -> Result<string, string>",
+        description: "Serializes a value as JSON.",
+    },
+];
+const FS_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "read_text",
+        signature: "fn read_text(path: string) -> Result<string, string>",
+        description: "Reads a UTF-8 text file.",
+    },
+    StandardMember {
+        name: "read_text_async",
+        signature: "fn read_text_async(path: string) -> Future<Result<string, string>>",
+        description: "Reads a UTF-8 text file without blocking the executor.",
+    },
+    StandardMember {
+        name: "write_text",
+        signature: "fn write_text(path: string, contents: string) -> Result<void, string>",
+        description: "Writes a UTF-8 text file.",
+    },
+    StandardMember {
+        name: "write_text_async",
+        signature: "fn write_text_async(path: string, contents: string) -> Future<Result<void, string>>",
+        description: "Writes a UTF-8 text file without blocking the executor.",
+    },
+    StandardMember {
+        name: "exists",
+        signature: "fn exists(path: string) -> bool",
+        description: "Checks whether a path exists.",
+    },
+    StandardMember {
+        name: "create_dir_all",
+        signature: "fn create_dir_all(path: string) -> Result<void, string>",
+        description: "Creates a directory and its missing parents.",
+    },
+    StandardMember {
+        name: "remove_file",
+        signature: "fn remove_file(path: string) -> Result<void, string>",
+        description: "Removes a file.",
+    },
+];
+const PATH_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "join",
+        signature: "fn join(parts: list<string>) -> string",
+        description: "Joins path components using the platform separator.",
+    },
+    StandardMember {
+        name: "parent",
+        signature: "fn parent(path: string) -> Option<string>",
+        description: "Returns the parent path when one exists.",
+    },
+    StandardMember {
+        name: "file_name",
+        signature: "fn file_name(path: string) -> Option<string>",
+        description: "Returns the final path component when one exists.",
+    },
+    StandardMember {
+        name: "is_absolute",
+        signature: "fn is_absolute(path: string) -> bool",
+        description: "Checks whether a path is absolute.",
+    },
+];
+const ENV_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "get",
+        signature: "fn get(name: string) -> Option<string>",
+        description: "Reads an environment variable.",
+    },
+    StandardMember {
+        name: "current_dir",
+        signature: "fn current_dir() -> Result<string, string>",
+        description: "Returns the current working directory.",
+    },
+];
+const PROCESS_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "run",
+        signature: "fn run(program: string, args: list<string>) -> Result<map<any>, string>",
+        description: "Runs a program directly without a shell.",
+    },
+    StandardMember {
+        name: "run_async",
+        signature: "fn run_async(program: string, args: list<string>) -> Future<Result<map<any>, string>>",
+        description: "Runs a program without blocking the executor.",
+    },
+];
+const TERMINAL_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "input",
+        signature: "fn input(prompt: string) -> Result<string, string>",
+        description: "Reads visible terminal input.",
+    },
+    StandardMember {
+        name: "confirm",
+        signature: "fn confirm(prompt: string) -> Result<bool, string>",
+        description: "Reads a yes or no answer.",
+    },
+    StandardMember {
+        name: "password",
+        signature: "fn password(prompt: string) -> Result<string, string>",
+        description: "Reads terminal input without echoing it.",
+    },
+];
+const TASK_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "result",
+        signature: "fn result(name: string) -> Result<any, string>",
+        description: "Returns the result of a declared workflow dependency.",
+    },
+    StandardMember {
+        name: "spawn",
+        signature: "fn spawn(future: Future<any>) -> Task<any>",
+        description: "Starts a future in the current structured-concurrency scope.",
+    },
+    StandardMember {
+        name: "join",
+        signature: "fn join(task: Task<any>) -> Future<Result<any, string>>",
+        description: "Waits for a scoped task result.",
+    },
+    StandardMember {
+        name: "cancel",
+        signature: "fn cancel(task: Task<any>) -> bool",
+        description: "Requests cooperative cancellation of a scoped task.",
+    },
+    StandardMember {
+        name: "timeout",
+        signature: "fn timeout(future: Future<any>, milliseconds: int) -> Future<Result<any, string>>",
+        description: "Runs a future with a deadline.",
+    },
+];
+const HTTP_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "get",
+        signature: "fn get(url: string) -> Result<map<any>, string>",
+        description: "Performs a bounded HTTP GET request.",
+    },
+    StandardMember {
+        name: "get_async",
+        signature: "fn get_async(url: string) -> Future<Result<map<any>, string>>",
+        description: "Performs a bounded HTTP GET request without blocking the executor.",
+    },
+    StandardMember {
+        name: "request",
+        signature: "fn request(method: string, url: string, headers: map<string>, body: string) -> Result<map<any>, string>",
+        description: "Performs a bounded HTTP request.",
+    },
+    StandardMember {
+        name: "request_async",
+        signature: "fn request_async(method: string, url: string, headers: map<string>, body: string) -> Future<Result<map<any>, string>>",
+        description: "Performs a bounded HTTP request without blocking the executor.",
+    },
+];
+const TIME_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "unix_ms",
+        signature: "fn unix_ms() -> Result<int, string>",
+        description: "Returns Unix time in milliseconds.",
+    },
+    StandardMember {
+        name: "monotonic_ms",
+        signature: "fn monotonic_ms() -> int",
+        description: "Returns milliseconds from the process monotonic clock.",
+    },
+    StandardMember {
+        name: "sleep_ms",
+        signature: "fn sleep_ms(milliseconds: int) -> Result<void, string>",
+        description: "Blocks the current thread for a bounded duration.",
+    },
+    StandardMember {
+        name: "sleep_async",
+        signature: "fn sleep_async(milliseconds: int) -> Future<Result<void, string>>",
+        description: "Waits without blocking the executor.",
+    },
+];
+
+pub const STANDARD_MODULES: &[StandardModule] = &[
+    StandardModule {
+        name: "json",
+        description: "JSON parsing and serialization",
+        members: JSON_MEMBERS,
+    },
+    StandardModule {
+        name: "fs",
+        description: "Filesystem operations",
+        members: FS_MEMBERS,
+    },
+    StandardModule {
+        name: "path",
+        description: "Cross-platform path operations",
+        members: PATH_MEMBERS,
+    },
+    StandardModule {
+        name: "env",
+        description: "Process environment access",
+        members: ENV_MEMBERS,
+    },
+    StandardModule {
+        name: "process",
+        description: "Direct child process execution",
+        members: PROCESS_MEMBERS,
+    },
+    StandardModule {
+        name: "terminal",
+        description: "Interactive terminal input",
+        members: TERMINAL_MEMBERS,
+    },
+    StandardModule {
+        name: "task",
+        description: "Workflow results and structured concurrency",
+        members: TASK_MEMBERS,
+    },
+    StandardModule {
+        name: "http",
+        description: "Bounded HTTP client operations",
+        members: HTTP_MEMBERS,
+    },
+    StandardModule {
+        name: "time",
+        description: "Wall-clock, monotonic time, and timers",
+        members: TIME_MEMBERS,
+    },
+];
+
+pub fn standard_module(name: &str) -> Option<&'static StandardModule> {
+    STANDARD_MODULES.iter().find(|module| module.name == name)
+}
+
 impl fmt::Display for SemanticError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
@@ -487,17 +737,29 @@ impl Analyzer {
         for statement in statements {
             let statement = declaration_statement(statement);
             if let StatementKind::Import { names, source } = &statement.kind {
-                let standard_module = source.strip_prefix("std:");
+                let standard_name = source.strip_prefix("std:");
                 for name in names {
-                    let value_type = if let Some(module) = standard_module {
-                        module_member_type(module, name.as_str()).unwrap_or_else(|| {
+                    let value_type = if let Some(module) = standard_name {
+                        if standard_module(module).is_none() {
                             self.errors.push(SemanticError {
                                 kind: SemanticErrorKind::UndefinedName,
-                                message: format!("module '{source}' has no export '{}'", name.name),
+                                message: format!("unknown standard module '{source}'"),
                                 span: name.span,
                             });
                             StaticType::Dynamic
-                        })
+                        } else {
+                            module_member_type(module, name.as_str()).unwrap_or_else(|| {
+                                self.errors.push(SemanticError {
+                                    kind: SemanticErrorKind::UndefinedName,
+                                    message: format!(
+                                        "module '{source}' has no export '{}'",
+                                        name.name
+                                    ),
+                                    span: name.span,
+                                });
+                                StaticType::Dynamic
+                            })
+                        }
                     } else if let Some(exports) = self.module_exports.get(source) {
                         match exports.get(name.as_str()) {
                             Some(symbol) => symbol.value_type.clone(),
@@ -1889,9 +2151,31 @@ fn literal_type(literal: &Literal) -> StaticType {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticErrorKind, analyze, analyze_program, analyze_program_with_modules};
+    use super::{
+        STANDARD_MODULES, SemanticErrorKind, analyze, analyze_program,
+        analyze_program_with_modules, module_member_type,
+    };
     use orvi_syntax::parse;
     use std::collections::HashMap;
+
+    #[test]
+    fn standard_library_catalog_matches_semantic_types() {
+        for module in STANDARD_MODULES {
+            assert!(
+                !module.members.is_empty(),
+                "{} must expose members",
+                module.name
+            );
+            for member in module.members {
+                assert!(
+                    module_member_type(module.name, member.name).is_some(),
+                    "std:{}.{} is missing a semantic type",
+                    module.name,
+                    member.name
+                );
+            }
+        }
+    }
 
     fn errors(source: &str) -> Vec<super::SemanticError> {
         let parsed = parse(source);
@@ -2163,9 +2447,15 @@ mod tests {
     fn declares_named_imports_and_checks_standard_exports() {
         assert!(errors("import { read_text } from \"std:fs\"; read_text(\"file\")").is_empty());
         assert!(errors("import { value } from \"./module.orvi\"; print(value)").is_empty());
-        let errors = errors("import { missing } from \"std:fs\";");
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].kind, SemanticErrorKind::UndefinedName);
+        let missing_export = errors("import { missing } from \"std:fs\";");
+        assert_eq!(missing_export.len(), 1);
+        assert_eq!(missing_export[0].kind, SemanticErrorKind::UndefinedName);
+        let missing_module = errors("import { value } from \"std:missing\";");
+        assert_eq!(missing_module.len(), 1);
+        assert_eq!(
+            missing_module[0].message,
+            "unknown standard module 'std:missing'"
+        );
     }
 
     #[test]

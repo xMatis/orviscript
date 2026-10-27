@@ -2,7 +2,7 @@
   "name": "orviscript",
   "displayName": "OrviScript",
   "description": "Language support for OrviScript",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "orviscript",
   "license": "Apache-2.0",
   "repository": {
@@ -29,7 +29,7 @@
         "orviscript.server.path": {
           "type": "string",
           "default": "",
-          "description": "Path to the orvi-lsp executable. Leave empty to use the workspace build or PATH."
+          "description": "Path to the orvi-lsp executable. Leave empty to use the workspace build, standard OrviScript installation, or PATH."
         }
       }
     },

@@ -39,7 +39,7 @@ RestartApplications=no
 ChangesEnvironment=yes
 ChangesAssociations=yes
 UsePreviousAppDir=yes
-UsePreviousTasks=yes
+UsePreviousTasks=no
 UninstallDisplayIcon={app}\assets\orviscript-file-icon.ico
 #ifdef SignToolName
 SignTool={#SignToolName}
@@ -47,7 +47,7 @@ SignedUninstaller=yes
 #endif
 
 [Tasks]
-Name: "vscode"; Description: "Install or update the OrviScript extension for Visual Studio Code"; GroupDescription: "Editor integration:"; Flags: unchecked
+Name: "vscode"; Description: "Install or update the OrviScript extension for Visual Studio Code"; GroupDescription: "Editor integration:"
 
 [Files]
 Source: "{#SourceDir}\orviscript.exe"; DestDir: "{app}"; Flags: ignoreversion
