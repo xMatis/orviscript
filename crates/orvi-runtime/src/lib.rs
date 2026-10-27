@@ -15,6 +15,8 @@ use orvi_syntax::{
     Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 
+mod bytecode;
+
 type MapEntries = Vec<(String, Value)>;
 const MAX_ASYNC_TASKS_PER_SCOPE: usize = 10_000;
 const GC_STATEMENT_INTERVAL: usize = 256;
@@ -420,6 +422,9 @@ fn execute_internal(
     context: ExecutionContext,
     entry_file: Option<PathBuf>,
 ) -> Result<Execution, RuntimeError> {
+    if let Some(bytecode) = bytecode::compile(program) {
+        return bytecode::execute(&bytecode);
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()

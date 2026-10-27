@@ -1,6 +1,6 @@
 [package]
 name = "orvi-sema"
-version = "0.6.0"
+version = "0.6.1"
 description = "Semantic analysis for OrviScript"
 edition.workspace = true
 license.workspace = true

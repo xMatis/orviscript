@@ -603,7 +603,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "orvi-cli"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "orvi-project",
  "orvi-runtime",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "orvi-lsp"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "orvi-project",
  "orvi-sema",
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "orvi-project"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "pathdiff",
  "serde",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "orvi-runtime"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-recursion",
  "orvi-project",
@@ -650,14 +650,14 @@ dependencies = [
 
 [[package]]
 name = "orvi-sema"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "orvi-syntax",
 ]
 
 [[package]]
 name = "orvi-syntax"
-version = "0.6.0"
+version = "0.6.1"
 
 [[package]]
 name = "parking_lot_core"

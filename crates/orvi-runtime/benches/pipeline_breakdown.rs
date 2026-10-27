@@ -1,4 +1,6 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use orvi_runtime::execute;
@@ -6,6 +8,25 @@ use orvi_sema::analyze_program;
 use orvi_syntax::{Program, parse};
 
 const SOURCE: &str = include_str!("../../../benchmarks/comparison.orvi");
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct CountingAllocator;
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.dealloc(pointer, layout) }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Measurement {
@@ -56,6 +77,13 @@ fn main() {
     let execution = execute(&parsed.program).expect("comparison.orvi must execute");
     assert_eq!(execution.output, ["499999500000"]);
 
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    let allocation_probe = execute(&parsed.program).expect("comparison.orvi must execute");
+    let execution_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let execution_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
+    black_box(&allocation_probe);
+
     let parse_samples = 20_000;
     let parse_time = measure(parse_samples, 100, || parse(black_box(SOURCE)));
 
@@ -92,6 +120,9 @@ fn main() {
     print_measurement("empty runtime startup", runtime_startup, startup_samples);
     print_measurement("execute 1M loop", execution_time, execution_samples);
     print_measurement("complete in-process", pipeline_time, pipeline_samples);
+    println!(
+        "execute 1M allocations: {execution_allocations} allocations, {execution_deallocations} deallocations before result drop"
+    );
 
     let execution_without_startup = execution_time.median.saturating_sub(runtime_startup.median);
     let accounted = parse_time.median + semantic_time.median + execution_time.median;
