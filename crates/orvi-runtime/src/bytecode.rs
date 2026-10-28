@@ -43,6 +43,7 @@ enum Instruction {
     Push(Value),
     Load(usize),
     Store(usize, Span),
+    Bind(usize, Span),
     Pop,
     Unary(UnaryOperator, Span),
     Binary(BinaryOperator, Span),
@@ -67,6 +68,7 @@ enum Instruction {
         target: usize,
     },
     MatchFail(Span),
+    RequireType(TypeAnnotation, Span),
 }
 
 #[derive(Clone)]
@@ -88,12 +90,21 @@ struct Compiler {
     slot_types: Vec<Option<TypeAnnotation>>,
     functions: HashMap<String, FunctionReference>,
     in_function: bool,
+    stack_parameter: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FunctionReference {
     index: usize,
     arity: usize,
+    inline: Option<InlineFunction>,
+}
+
+#[derive(Clone)]
+struct InlineFunction {
+    parameters: Vec<Parameter>,
+    expression: Expression,
+    return_type: Option<TypeAnnotation>,
 }
 
 pub(super) fn compile(program: &Program) -> Option<Bytecode> {
@@ -153,6 +164,7 @@ pub(super) fn compile_with_bindings(
         slot_types,
         functions: functions.clone(),
         in_function: false,
+        stack_parameter: None,
     };
     compiler.compile_statements(&program.statements)?;
     let compiled_functions = compile_functions(program, &functions)?;
@@ -175,6 +187,8 @@ fn collect_function_references(program: &Program) -> Option<HashMap<String, Func
             name,
             is_async,
             parameters,
+            return_type,
+            body,
             ..
         } = &declaration.kind
         {
@@ -187,11 +201,101 @@ fn collect_function_references(program: &Program) -> Option<HashMap<String, Func
                 FunctionReference {
                     index,
                     arity: parameters.len(),
+                    inline: inline_function(parameters, return_type, body),
                 },
             );
         }
     }
     Some(functions)
+}
+
+fn inline_function(
+    parameters: &[Parameter],
+    return_type: &Option<TypeAnnotation>,
+    body: &[Statement],
+) -> Option<InlineFunction> {
+    let [
+        Statement {
+            kind: StatementKind::Return(Some(expression)),
+            ..
+        },
+    ] = body
+    else {
+        return None;
+    };
+    let parameter_names = parameters
+        .iter()
+        .map(|parameter| parameter.name.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if !is_inline_expression(expression, &parameter_names, 0) {
+        return None;
+    }
+    Some(InlineFunction {
+        parameters: parameters.to_vec(),
+        expression: expression.clone(),
+        return_type: return_type.clone(),
+    })
+}
+
+fn is_inline_expression(
+    expression: &Expression,
+    parameters: &std::collections::HashSet<&str>,
+    depth: usize,
+) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    match &expression.kind {
+        ExpressionKind::Literal(_) => true,
+        ExpressionKind::Variable(name) => parameters.contains(name.as_str()),
+        ExpressionKind::Unary { operand, .. } => {
+            is_inline_expression(operand, parameters, depth + 1)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            is_inline_expression(left, parameters, depth + 1)
+                && is_inline_expression(right, parameters, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+fn can_inline_parameter_from_stack(inline: &InlineFunction) -> bool {
+    let [parameter] = inline.parameters.as_slice() else {
+        return false;
+    };
+    let mut occurrences = 0;
+    count_parameter_occurrences(
+        &inline.expression,
+        parameter.name.as_str(),
+        &mut occurrences,
+    );
+    occurrences == 1
+        && matches!(
+            first_expression_leaf(&inline.expression),
+            ExpressionKind::Variable(name) if name.name == parameter.name.name
+        )
+}
+
+fn count_parameter_occurrences(expression: &Expression, parameter: &str, count: &mut usize) {
+    match &expression.kind {
+        ExpressionKind::Variable(name) if name.name == parameter => *count += 1,
+        ExpressionKind::Unary { operand, .. } => {
+            count_parameter_occurrences(operand, parameter, count);
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            count_parameter_occurrences(left, parameter, count);
+            count_parameter_occurrences(right, parameter, count);
+        }
+        _ => {}
+    }
+}
+
+fn first_expression_leaf(expression: &Expression) -> &ExpressionKind {
+    match &expression.kind {
+        ExpressionKind::Unary { operand, .. } => first_expression_leaf(operand),
+        ExpressionKind::Binary { left, .. } => first_expression_leaf(left),
+        kind => kind,
+    }
 }
 
 fn compile_functions(
@@ -255,6 +359,7 @@ impl Compiler {
             slot_types,
             functions,
             in_function: true,
+            stack_parameter: None,
         }
     }
 
@@ -382,7 +487,9 @@ impl Compiler {
                 ));
             }
             ExpressionKind::Variable(name) => {
-                if let Some(local) = self.resolve(&name.name) {
+                if self.stack_parameter.as_deref() == Some(name.as_str()) {
+                    self.stack_parameter = None;
+                } else if let Some(local) = self.resolve(&name.name) {
                     self.instructions.push(Instruction::Load(local.slot));
                 } else if name.name == "None" {
                     self.instructions.push(Instruction::Push(Value::Variant {
@@ -485,15 +592,54 @@ impl Compiler {
                         return None;
                     }
                 } else {
-                    let function = self.functions.get(name.as_str())?;
+                    let function = self.functions.get(name.as_str())?.clone();
                     if function.arity != arguments.len() {
                         return None;
                     }
-                    self.instructions.push(Instruction::Call(
-                        function.index,
-                        arguments.len(),
-                        expression.span,
-                    ));
+                    if let Some(inline) = function.inline {
+                        if can_inline_parameter_from_stack(&inline) {
+                            let parameter = &inline.parameters[0];
+                            if let Some(parameter_type) = &parameter.type_annotation {
+                                self.instructions.push(Instruction::RequireType(
+                                    parameter_type.clone(),
+                                    expression.span,
+                                ));
+                            }
+                            self.stack_parameter = Some(parameter.name.name.clone());
+                            self.compile_expression(&inline.expression)?;
+                            if self.stack_parameter.take().is_some() {
+                                return None;
+                            }
+                        } else {
+                            let mut scope = HashMap::with_capacity(inline.parameters.len());
+                            for parameter in inline.parameters.iter().rev() {
+                                let slot = self.slot_types.len();
+                                self.slot_types.push(parameter.type_annotation.clone());
+                                self.instructions
+                                    .push(Instruction::Bind(slot, expression.span));
+                                scope.insert(
+                                    parameter.name.name.clone(),
+                                    Local {
+                                        slot,
+                                        mutable: false,
+                                    },
+                                );
+                            }
+                            self.scopes.push(scope);
+                            self.compile_expression(&inline.expression)?;
+                            self.scopes.pop();
+                        }
+                        if let Some(return_type) = inline.return_type {
+                            self.instructions
+                                .push(Instruction::RequireType(return_type, expression.span));
+                        }
+                    } else {
+                        self.instructions.push(Instruction::Call(
+                            function.index,
+                            arguments.len(),
+                            expression.span,
+                        ));
+                    }
                 }
             }
             ExpressionKind::Index { object, index } => {
@@ -746,6 +892,22 @@ fn execute_chunk_inner(
                 }
                 slots[*slot] = value.clone();
             }
+            Instruction::Bind(slot, span) => {
+                let value = stack.pop().expect("verified bytecode stack");
+                if let Some(type_annotation) = &slot_types[*slot]
+                    && !value_matches_type(&value, type_annotation)
+                {
+                    return Err(error(
+                        format!(
+                            "expected {}, received {}",
+                            display_type(type_annotation),
+                            value.type_name()
+                        ),
+                        *span,
+                    ));
+                }
+                slots[*slot] = value;
+            }
             Instruction::Pop => {
                 stack.pop().expect("verified bytecode stack");
             }
@@ -781,6 +943,19 @@ fn execute_chunk_inner(
                     return Err(error("condition must be bool", *span));
                 }
             }
+            Instruction::RequireType(expected, span) => {
+                let value = stack.last().expect("verified bytecode stack");
+                if !value_matches_type(value, expected) {
+                    return Err(error(
+                        format!(
+                            "expected {}, received {}",
+                            display_type(expected),
+                            value.type_name()
+                        ),
+                        *span,
+                    ));
+                }
+            }
             Instruction::Jump(target) => instruction_pointer = *target,
             Instruction::Print(argument_count) => {
                 let start = stack.len() - argument_count;
@@ -794,23 +969,20 @@ fn execute_chunk_inner(
                 stack.push(Value::Void);
             }
             Instruction::Call(function, argument_count, span) => {
-                let start = stack.len() - argument_count;
-                let arguments = stack.split_off(start);
                 let function = &bytecode.functions[*function];
-                if arguments.len() != function.parameters {
+                if *argument_count != function.parameters {
                     return Err(error(
                         format!(
                             "function '{}' expects {} arguments, received {}",
-                            function.name,
-                            function.parameters,
-                            arguments.len()
+                            function.name, function.parameters, argument_count
                         ),
                         *span,
                     ));
                 }
                 let mut function_slots = heap.slot_pool.pop().unwrap_or_default();
                 function_slots.resize(function.slot_types.len(), Value::Null);
-                for (index, argument) in arguments.into_iter().enumerate() {
+                for index in (0..*argument_count).rev() {
+                    let argument = stack.pop().expect("verified bytecode call stack");
                     if let Some(expected) = &function.slot_types[index]
                         && !value_matches_type(&argument, expected)
                     {
@@ -1228,6 +1400,53 @@ mod tests {
             ),
             ["3628800", "positive"]
         );
+    }
+
+    #[test]
+    fn inlines_safe_leaf_functions_without_changing_call_semantics() {
+        let parsed = parse(
+            "fn combine(left: int, right: int) -> int { return left * 10 + right; } fn twice(value: int) -> int { return value + value; } let left = 99; let counter = 0; print(combine(2, 3)); print(twice(counter = counter + 1)); print(counter); print(left);",
+        );
+        assert!(!parsed.has_errors());
+        let bytecode = compile(&parsed.program).expect("leaf functions compile");
+        assert!(
+            !bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::Call(..))),
+            "eligible leaf calls should be expanded into the caller"
+        );
+        assert_eq!(
+            execute(&bytecode).expect("inlined calls execute").output,
+            ["23", "2", "1", "99"]
+        );
+    }
+
+    #[test]
+    fn keeps_complex_functions_as_calls_and_checks_inlined_types() {
+        let parsed = parse(
+            "fn step(value: int) -> int { let next = value + 1; return next; } print(step(41));",
+        );
+        let bytecode = compile(&parsed.program).expect("complex function compiles");
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::Call(..)))
+        );
+        assert_eq!(execute(&bytecode).unwrap().output, ["42"]);
+
+        let parsed =
+            parse("fn identity(value: int) -> string { return value; } print(identity(1));");
+        let error = execute(&compile(&parsed.program).expect("inline type check compiles"))
+            .expect_err("return type must still be enforced after inlining");
+        assert_eq!(error.message, "expected string, received int");
+
+        let parsed =
+            parse("fn increment(value: int) -> int { return value + 1; } print(increment(\"x\"));");
+        let error = execute(&compile(&parsed.program).expect("inline argument check compiles"))
+            .expect_err("parameter type must still be enforced after inlining");
+        assert_eq!(error.message, "expected int, received string");
     }
 
     #[test]

@@ -109,6 +109,12 @@ fn main() {
 
     let functions = parse(FUNCTION_SOURCE);
     assert!(!functions.has_errors());
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    DEALLOCATIONS.store(0, Ordering::Relaxed);
+    let function_probe = execute(&functions.program).expect("function benchmark must execute");
+    let function_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let function_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
+    black_box(&function_probe);
     let function_time = measure(execution_samples, 2, || {
         execute(black_box(&functions.program)).expect("function benchmark must execute")
     });
@@ -138,6 +144,9 @@ fn main() {
     print_measurement("complete in-process", pipeline_time, pipeline_samples);
     println!(
         "execute 1M allocations: {execution_allocations} allocations, {execution_deallocations} deallocations before result drop"
+    );
+    println!(
+        "execute 1M calls allocations: {function_allocations} allocations, {function_deallocations} deallocations before result drop"
     );
 
     let execution_without_startup = execution_time.median.saturating_sub(runtime_startup.median);
