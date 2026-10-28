@@ -47,6 +47,10 @@ enum Instruction {
     Pop,
     Unary(UnaryOperator, Span),
     Binary(BinaryOperator, Span),
+    IntegerBinary(BinaryOperator, Span),
+    IntegerConstant(BinaryOperator, i64, Span),
+    IntegerSlotConstant(usize, BinaryOperator, i64, Span),
+    IntegerSlotBinary(usize, BinaryOperator, usize, Span),
     JumpIfFalse(usize, Span),
     JumpIfTrue(usize, Span),
     RequireBool(Span),
@@ -82,6 +86,15 @@ enum CompiledPattern {
 struct Local {
     slot: usize,
     mutable: bool,
+    primitive: Option<PrimitiveKind>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrimitiveKind {
+    Bool,
+    Integer,
+    Float,
+    String,
 }
 
 struct Compiler {
@@ -91,6 +104,7 @@ struct Compiler {
     functions: HashMap<String, FunctionReference>,
     in_function: bool,
     stack_parameter: Option<String>,
+    stack_parameter_type: Option<PrimitiveKind>,
 }
 
 #[derive(Clone)]
@@ -153,6 +167,7 @@ pub(super) fn compile_with_bindings(
             Local {
                 slot,
                 mutable: false,
+                primitive: primitive_from_value(&value),
             },
         );
         slot_types.push(None);
@@ -165,6 +180,7 @@ pub(super) fn compile_with_bindings(
         functions: functions.clone(),
         in_function: false,
         stack_parameter: None,
+        stack_parameter_type: None,
     };
     compiler.compile_statements(&program.statements)?;
     let compiled_functions = compile_functions(program, &functions)?;
@@ -298,6 +314,26 @@ fn first_expression_leaf(expression: &Expression) -> &ExpressionKind {
     }
 }
 
+fn primitive_from_annotation(annotation: &TypeAnnotation) -> Option<PrimitiveKind> {
+    match annotation.name.as_str() {
+        "bool" => Some(PrimitiveKind::Bool),
+        "int" => Some(PrimitiveKind::Integer),
+        "float" => Some(PrimitiveKind::Float),
+        "string" => Some(PrimitiveKind::String),
+        _ => None,
+    }
+}
+
+fn primitive_from_value(value: &Value) -> Option<PrimitiveKind> {
+    match value {
+        Value::Bool(_) => Some(PrimitiveKind::Bool),
+        Value::Integer(_) => Some(PrimitiveKind::Integer),
+        Value::Float(_) => Some(PrimitiveKind::Float),
+        Value::String(_) => Some(PrimitiveKind::String),
+        _ => None,
+    }
+}
+
 fn compile_functions(
     program: &Program,
     references: &HashMap<String, FunctionReference>,
@@ -349,6 +385,10 @@ impl Compiler {
                 Local {
                     slot,
                     mutable: false,
+                    primitive: parameter
+                        .type_annotation
+                        .as_ref()
+                        .and_then(primitive_from_annotation),
                 },
             );
             slot_types.push(parameter.type_annotation.clone());
@@ -360,6 +400,7 @@ impl Compiler {
             functions,
             in_function: true,
             stack_parameter: None,
+            stack_parameter_type: None,
         }
     }
 
@@ -393,6 +434,10 @@ impl Compiler {
                 type_annotation,
                 initializer,
             } => {
+                let primitive = type_annotation
+                    .as_ref()
+                    .and_then(primitive_from_annotation)
+                    .or_else(|| self.expression_primitive(initializer));
                 self.compile_expression(initializer)?;
                 let slot = self.slot_types.len();
                 self.slot_types.push(type_annotation.clone());
@@ -401,6 +446,7 @@ impl Compiler {
                     Local {
                         slot,
                         mutable: *mutable,
+                        primitive,
                     },
                 );
                 self.instructions
@@ -467,6 +513,97 @@ impl Compiler {
         Some(())
     }
 
+    fn expression_primitive(&self, expression: &Expression) -> Option<PrimitiveKind> {
+        match &expression.kind {
+            ExpressionKind::Literal(Literal::Bool(_)) => Some(PrimitiveKind::Bool),
+            ExpressionKind::Literal(Literal::Integer(_)) => Some(PrimitiveKind::Integer),
+            ExpressionKind::Literal(Literal::Float(_)) => Some(PrimitiveKind::Float),
+            ExpressionKind::Literal(Literal::String(_)) => Some(PrimitiveKind::String),
+            ExpressionKind::Literal(Literal::Null) => None,
+            ExpressionKind::Variable(name) => {
+                if self.stack_parameter.as_deref() == Some(name.as_str()) {
+                    self.stack_parameter_type
+                } else {
+                    self.resolve(name.as_str())
+                        .and_then(|local| local.primitive)
+                }
+            }
+            ExpressionKind::Assign { name, .. } => self
+                .resolve(name.as_str())
+                .and_then(|local| local.primitive),
+            ExpressionKind::Unary { operator, operand } => match operator {
+                UnaryOperator::Not
+                    if self.expression_primitive(operand) == Some(PrimitiveKind::Bool) =>
+                {
+                    Some(PrimitiveKind::Bool)
+                }
+                UnaryOperator::Negate => match self.expression_primitive(operand) {
+                    Some(kind @ (PrimitiveKind::Integer | PrimitiveKind::Float)) => Some(kind),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.expression_primitive(left);
+                let right = self.expression_primitive(right);
+                match operator {
+                    BinaryOperator::Add
+                        if left == Some(PrimitiveKind::String)
+                            && right == Some(PrimitiveKind::String) =>
+                    {
+                        Some(PrimitiveKind::String)
+                    }
+                    BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide => match (left, right) {
+                        (Some(PrimitiveKind::Integer), Some(PrimitiveKind::Integer)) => {
+                            Some(PrimitiveKind::Integer)
+                        }
+                        (
+                            Some(PrimitiveKind::Integer | PrimitiveKind::Float),
+                            Some(PrimitiveKind::Integer | PrimitiveKind::Float),
+                        ) => Some(PrimitiveKind::Float),
+                        _ => None,
+                    },
+                    BinaryOperator::Remainder
+                        if left == Some(PrimitiveKind::Integer)
+                            && right == Some(PrimitiveKind::Integer) =>
+                    {
+                        Some(PrimitiveKind::Integer)
+                    }
+                    BinaryOperator::Equal | BinaryOperator::NotEqual => Some(PrimitiveKind::Bool),
+                    BinaryOperator::Less
+                    | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterEqual
+                        if matches!(
+                            (left, right),
+                            (
+                                Some(PrimitiveKind::Integer | PrimitiveKind::Float),
+                                Some(PrimitiveKind::Integer | PrimitiveKind::Float)
+                            )
+                        ) =>
+                    {
+                        Some(PrimitiveKind::Bool)
+                    }
+                    BinaryOperator::And | BinaryOperator::Or
+                        if left == Some(PrimitiveKind::Bool)
+                            && right == Some(PrimitiveKind::Bool) =>
+                    {
+                        Some(PrimitiveKind::Bool)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn compile_expression(&mut self, expression: &Expression) -> Option<()> {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self
@@ -489,6 +626,7 @@ impl Compiler {
             ExpressionKind::Variable(name) => {
                 if self.stack_parameter.as_deref() == Some(name.as_str()) {
                     self.stack_parameter = None;
+                    self.stack_parameter_type = None;
                 } else if let Some(local) = self.resolve(&name.name) {
                     self.instructions.push(Instruction::Load(local.slot));
                 } else if name.name == "None" {
@@ -505,9 +643,16 @@ impl Compiler {
                 if !local.mutable {
                     return None;
                 }
+                let instruction_start = self.instructions.len();
                 self.compile_expression(value)?;
-                self.instructions
-                    .push(Instruction::Store(local.slot, expression.span));
+                if !self.fuse_integer_slot_assignment(
+                    instruction_start,
+                    local.slot,
+                    expression.span,
+                ) {
+                    self.instructions
+                        .push(Instruction::Store(local.slot, expression.span));
+                }
             }
             ExpressionKind::IndexAssign {
                 object,
@@ -540,6 +685,8 @@ impl Compiler {
                 operator,
                 right,
             } => {
+                let left_primitive = self.expression_primitive(left);
+                let right_primitive = self.expression_primitive(right);
                 self.compile_expression(left)?;
                 match operator {
                     BinaryOperator::And => {
@@ -564,9 +711,27 @@ impl Compiler {
                         self.patch_jump(end, self.instructions.len());
                     }
                     _ => {
-                        self.compile_expression(right)?;
-                        self.instructions
-                            .push(Instruction::Binary(*operator, expression.span));
+                        if left_primitive == Some(PrimitiveKind::Integer)
+                            && right_primitive == Some(PrimitiveKind::Integer)
+                            && let ExpressionKind::Literal(Literal::Integer(constant)) = right.kind
+                        {
+                            self.instructions.push(Instruction::IntegerConstant(
+                                *operator,
+                                constant,
+                                expression.span,
+                            ));
+                        } else {
+                            self.compile_expression(right)?;
+                            if left_primitive == Some(PrimitiveKind::Integer)
+                                && right_primitive == Some(PrimitiveKind::Integer)
+                            {
+                                self.instructions
+                                    .push(Instruction::IntegerBinary(*operator, expression.span));
+                            } else {
+                                self.instructions
+                                    .push(Instruction::Binary(*operator, expression.span));
+                            }
+                        }
                     }
                 }
             }
@@ -606,10 +771,15 @@ impl Compiler {
                                 ));
                             }
                             self.stack_parameter = Some(parameter.name.name.clone());
+                            self.stack_parameter_type = parameter
+                                .type_annotation
+                                .as_ref()
+                                .and_then(primitive_from_annotation);
                             self.compile_expression(&inline.expression)?;
                             if self.stack_parameter.take().is_some() {
                                 return None;
                             }
+                            self.stack_parameter_type = None;
                         } else {
                             let mut scope = HashMap::with_capacity(inline.parameters.len());
                             for parameter in inline.parameters.iter().rev() {
@@ -622,6 +792,10 @@ impl Compiler {
                                     Local {
                                         slot,
                                         mutable: false,
+                                        primitive: parameter
+                                            .type_annotation
+                                            .as_ref()
+                                            .and_then(primitive_from_annotation),
                                     },
                                 );
                             }
@@ -704,6 +878,45 @@ impl Compiler {
             .find_map(|scope| scope.get(name).copied())
     }
 
+    fn fuse_integer_slot_assignment(&mut self, start: usize, slot: usize, span: Span) -> bool {
+        let tail = &self.instructions[start..];
+        let fused = match tail {
+            [
+                Instruction::Load(loaded),
+                Instruction::IntegerConstant(operator, constant, _),
+            ] if *loaded == slot => Some(Instruction::IntegerSlotConstant(
+                slot, *operator, *constant, span,
+            )),
+            [
+                Instruction::Load(loaded),
+                Instruction::RequireType(parameter_type, _),
+                Instruction::IntegerConstant(operator, constant, _),
+                Instruction::RequireType(return_type, _),
+            ] if *loaded == slot
+                && primitive_from_annotation(parameter_type) == Some(PrimitiveKind::Integer)
+                && primitive_from_annotation(return_type) == Some(PrimitiveKind::Integer) =>
+            {
+                Some(Instruction::IntegerSlotConstant(
+                    slot, *operator, *constant, span,
+                ))
+            }
+            [
+                Instruction::Load(loaded),
+                Instruction::Load(right),
+                Instruction::IntegerBinary(operator, _),
+            ] if *loaded == slot => Some(Instruction::IntegerSlotBinary(
+                slot, *operator, *right, span,
+            )),
+            _ => None,
+        };
+        let Some(instruction) = fused else {
+            return false;
+        };
+        self.instructions.truncate(start);
+        self.instructions.push(instruction);
+        true
+    }
+
     fn emit(&mut self, instruction: Instruction) -> usize {
         let index = self.instructions.len();
         self.instructions.push(instruction);
@@ -757,6 +970,7 @@ fn compile_pattern(
                     Local {
                         slot,
                         mutable: false,
+                        primitive: None,
                     },
                 );
                 slot
@@ -919,6 +1133,39 @@ fn execute_chunk_inner(
                 let right = stack.pop().expect("verified bytecode stack");
                 let left = stack.pop().expect("verified bytecode stack");
                 stack.push(binary(*operator, left, right, *span)?);
+            }
+            Instruction::IntegerBinary(operator, span) => {
+                let right = stack.pop().expect("verified bytecode stack");
+                let left = stack.pop().expect("verified bytecode stack");
+                let (Value::Integer(left), Value::Integer(right)) = (left, right) else {
+                    return Err(error("integer instruction received a non-int value", *span));
+                };
+                stack.push(integer_binary(*operator, left, right, *span)?);
+            }
+            Instruction::IntegerConstant(operator, right, span) => {
+                let left = stack.pop().expect("verified bytecode stack");
+                let Value::Integer(left) = left else {
+                    return Err(error("integer instruction received a non-int value", *span));
+                };
+                stack.push(integer_binary(*operator, left, *right, *span)?);
+            }
+            Instruction::IntegerSlotConstant(slot, operator, right, span) => {
+                let Value::Integer(left) = &slots[*slot] else {
+                    return Err(error("integer instruction received a non-int value", *span));
+                };
+                let result = integer_binary(*operator, *left, *right, *span)?;
+                slots[*slot] = result.clone();
+                stack.push(result);
+            }
+            Instruction::IntegerSlotBinary(left_slot, operator, right_slot, span) => {
+                let (Value::Integer(left), Value::Integer(right)) =
+                    (&slots[*left_slot], &slots[*right_slot])
+                else {
+                    return Err(error("integer instruction received a non-int value", *span));
+                };
+                let result = integer_binary(*operator, *left, *right, *span)?;
+                slots[*left_slot] = result.clone();
+                stack.push(result);
             }
             Instruction::JumpIfFalse(target, span) => {
                 let value = stack.pop().expect("verified bytecode stack");
@@ -1279,6 +1526,47 @@ fn binary(
     }
 }
 
+fn integer_binary(
+    operator: BinaryOperator,
+    left: i64,
+    right: i64,
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    match operator {
+        BinaryOperator::Add => left
+            .checked_add(right)
+            .map(Value::Integer)
+            .ok_or_else(|| error("integer overflow", span)),
+        BinaryOperator::Subtract => left
+            .checked_sub(right)
+            .map(Value::Integer)
+            .ok_or_else(|| error("integer overflow", span)),
+        BinaryOperator::Multiply => left
+            .checked_mul(right)
+            .map(Value::Integer)
+            .ok_or_else(|| error("integer overflow", span)),
+        BinaryOperator::Divide if right == 0 => Err(error("division by zero", span)),
+        BinaryOperator::Divide => left
+            .checked_div(right)
+            .map(Value::Integer)
+            .ok_or_else(|| error("integer overflow", span)),
+        BinaryOperator::Remainder if right == 0 => Err(error("division by zero", span)),
+        BinaryOperator::Remainder => left
+            .checked_rem(right)
+            .map(Value::Integer)
+            .ok_or_else(|| error("integer overflow", span)),
+        BinaryOperator::Equal => Ok(Value::Bool(left == right)),
+        BinaryOperator::NotEqual => Ok(Value::Bool(left != right)),
+        BinaryOperator::Less => Ok(Value::Bool(left < right)),
+        BinaryOperator::LessEqual => Ok(Value::Bool(left <= right)),
+        BinaryOperator::Greater => Ok(Value::Bool(left > right)),
+        BinaryOperator::GreaterEqual => Ok(Value::Bool(left >= right)),
+        BinaryOperator::And | BinaryOperator::Or => {
+            Err(error("invalid integer operator state", span))
+        }
+    }
+}
+
 fn numeric(
     left: Value,
     right: Value,
@@ -1380,6 +1668,69 @@ mod tests {
         let parsed = parse("print(1 / 0);");
         let error = execute(&compile(&parsed.program).unwrap()).unwrap_err();
         assert_eq!(error.message, "division by zero");
+    }
+
+    #[test]
+    fn specializes_integer_operations_without_changing_results() {
+        let parsed = parse(
+            "let left = 20; let right = 3; print(left + 2); print(left + right); print(left - right); print(left * right); print(left / right); print(left % right); print(left == right); print(left != right); print(left < right); print(left <= right); print(left > right); print(left >= right); print(left + -2); left = left + 2; print(left); left = left + right; print(left); print(\"orvi\" + \"script\");",
+        );
+        let bytecode = compile(&parsed.program).expect("integer operations compile");
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::IntegerConstant(..)))
+        );
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::IntegerBinary(..)))
+        );
+        assert!(
+            bytecode.instructions.iter().any(|instruction| matches!(
+                instruction,
+                super::Instruction::IntegerSlotConstant(..)
+            ))
+        );
+        assert!(
+            bytecode.instructions.iter().any(|instruction| matches!(
+                instruction,
+                super::Instruction::IntegerSlotBinary(..)
+            ))
+        );
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::Binary(..)))
+        );
+        assert_eq!(
+            execute(&bytecode).unwrap().output,
+            [
+                "22",
+                "23",
+                "17",
+                "60",
+                "6",
+                "2",
+                "false",
+                "true",
+                "false",
+                "false",
+                "true",
+                "true",
+                "18",
+                "22",
+                "25",
+                "orviscript"
+            ]
+        );
+
+        let parsed = parse("print(9223372036854775807 + 1);");
+        let error = execute(&compile(&parsed.program).unwrap()).unwrap_err();
+        assert_eq!(error.message, "integer overflow");
     }
 
     #[test]
