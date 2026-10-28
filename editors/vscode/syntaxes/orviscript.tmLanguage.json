@@ -52,7 +52,7 @@
     },
     "types": {
       "patterns": [
-        { "name": "support.type.builtin.orviscript", "match": "\\b(?:Option|Result|Future|Task|any|bool|float|fn|int|list|map|null|number|string|void)\\b" }
+        { "name": "support.type.builtin.orviscript", "match": "\\b(?:Option|Result|Future|Task|Worker|any|bool|float|fn|int|list|map|null|number|string|void)\\b" }
       ]
     },
     "functionDeclarations": {

@@ -1,6 +1,6 @@
 [package]
 name = "orvi-runtime"
-version = "0.6.2"
+version = "0.8.0"
 description = "Interpreter runtime for OrviScript"
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 orvi-project = { path = "../orvi-project" }
+orvi-sema = { path = "../orvi-sema" }
 orvi-syntax = { path = "../orvi-syntax" }
 serde_json = "1"
 rpassword = "7"
@@ -17,10 +18,13 @@ tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt", "sy
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
-orvi-sema = { path = "../orvi-sema" }
 tempfile = "3"
 
 [[bench]]
 name = "pipeline_breakdown"
+harness = false
+
+[[bench]]
+name = "worker_scaling"
 harness = false
 

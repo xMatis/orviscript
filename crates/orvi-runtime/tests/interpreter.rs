@@ -44,6 +44,160 @@ fn evaluates_variables_and_arithmetic() {
 }
 
 #[test]
+fn runs_isolated_workers_and_transfers_values_and_output() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let handle: Worker<map<any>> = worker.spawn(
+                "print(worker_input); worker_input * worker_input",
+                7
+            );
+            let result = (await worker.join(handle))?;
+            print(result.value);
+            print(result.output);
+            print(worker.threads() > 0);
+            return Ok();
+        }
+        print(await main());
+    "#;
+    let output = run(source).expect("worker program runs");
+    assert_eq!(output, ["49", "[7]", "true", "Ok()"]);
+}
+
+#[test]
+fn rejects_unsupported_worker_messages_and_nested_workers() {
+    let unsupported = run("fn local() -> int { return 1; } worker.spawn(\"worker_input\", local)")
+        .expect_err("functions cannot cross worker boundaries");
+    assert!(
+        unsupported.contains("cannot contain fn values"),
+        "{unsupported}"
+    );
+
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let handle = worker.spawn("worker.spawn(\"1\", null)", null);
+            print(await worker.join(handle));
+            return Ok();
+        }
+        await main();
+    "#;
+    let output = run(source).expect("nested worker failure is returned as a value");
+    assert!(
+        output[0].contains("workers cannot spawn nested workers"),
+        "{}",
+        output[0]
+    );
+}
+
+#[test]
+fn cancels_cpu_workers_cooperatively() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let handle = worker.spawn(
+                "let index = 0; while index < 1000000000 { index = index + 1; } index",
+                null
+            );
+            worker.cancel(handle);
+            print(await worker.join(handle));
+            return Ok();
+        }
+        await main();
+    "#;
+    let output = run(source).expect("cancelled worker is joined");
+    assert!(
+        output[0].contains("execution was cancelled"),
+        "{}",
+        output[0]
+    );
+}
+
+#[test]
+fn times_out_cpu_workers_and_finishes_the_scope() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let handle = worker.spawn(
+                "let index = 0; while index < 1000000000 { index = index + 1; } index",
+                null
+            );
+            print(await worker.timeout(handle, 0));
+            return Ok();
+        }
+        await main();
+    "#;
+    let output = run(source).expect("timed out worker is cancelled and drained");
+    assert_eq!(output, ["Err(worker timed out)"]);
+}
+
+#[test]
+fn executes_multiple_workers_on_parallel_threads() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            print(worker.threads());
+            let first = worker.spawn("time.sleep_ms(200)", null);
+            let second = worker.spawn("time.sleep_ms(200)", null);
+            (await worker.join(first))?;
+            (await worker.join(second))?;
+            return Ok();
+        }
+        await main();
+    "#;
+    let started = std::time::Instant::now();
+    let output = run(source).expect("parallel workers finish");
+    let threads = output[0].parse::<usize>().expect("thread count");
+    if threads > 1 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(350),
+            "two 200 ms workers should overlap"
+        );
+    }
+}
+
+#[test]
+fn reports_worker_status_and_pool_statistics() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let success = worker.spawn("worker_input + 1", 41);
+            (await worker.join(success))?;
+            print(worker.status(success));
+            print(worker.cancel(success));
+
+            let failure = worker.spawn("1 / 0", null);
+            print(await worker.join(failure));
+            print(worker.status(failure));
+
+            let stats = worker.stats();
+            print(stats.threads > 0);
+            print(stats.queue_capacity == 1024);
+            print(stats.queued == 0);
+            print(stats.running == 0);
+            print(stats.completed == 2);
+            print(stats.failed == 1);
+            print(stats.panicked == 0);
+            print(stats.rejected == 0);
+            return Ok();
+        }
+        await main();
+    "#;
+    let output = run(source).expect("worker telemetry is available");
+    assert_eq!(
+        output,
+        [
+            "succeeded",
+            "false",
+            "Err(division by zero)",
+            "failed",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+            "true",
+        ]
+    );
+}
+
+#[test]
 fn runs_lazy_async_functions_with_top_level_await() {
     let source = r#"
         async fn compute(value: int) -> int {

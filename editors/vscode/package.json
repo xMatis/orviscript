@@ -2,7 +2,7 @@
   "name": "orviscript",
   "displayName": "OrviScript",
   "description": "Language support for OrviScript",
-  "version": "0.6.2",
+  "version": "0.8.0",
   "publisher": "orviscript",
   "license": "Apache-2.0",
   "repository": {

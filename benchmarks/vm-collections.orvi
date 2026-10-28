@@ -1,0 +1,10 @@
+let values = [0, 0, 0, 0];
+let record = { total: 0 };
+let index = 0;
+while index < 250000 {
+    let slot = index % 4;
+    values[slot] = values[slot] + 1;
+    record.total = record.total + values[slot];
+    index = index + 1;
+}
+print(record.total);

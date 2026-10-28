@@ -8,6 +8,8 @@ use orvi_sema::analyze_program;
 use orvi_syntax::{Program, parse};
 
 const SOURCE: &str = include_str!("../../../benchmarks/comparison.orvi");
+const FUNCTION_SOURCE: &str = "fn add_one(value: int) -> int { return value + 1; } let index = 0; let total = 0; while index < 1000000 { total = add_one(total); index = index + 1; } total";
+const COLLECTION_SOURCE: &str = "let values = [0, 0, 0, 0]; let record = { total: 0 }; let index = 0; while index < 250000 { let slot = index % 4; values[slot] = values[slot] + 1; record.total = record.total + values[slot]; index = index + 1; } record.total";
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -105,6 +107,18 @@ fn main() {
         execute(black_box(&parsed.program)).expect("comparison.orvi must execute")
     });
 
+    let functions = parse(FUNCTION_SOURCE);
+    assert!(!functions.has_errors());
+    let function_time = measure(execution_samples, 2, || {
+        execute(black_box(&functions.program)).expect("function benchmark must execute")
+    });
+
+    let collections = parse(COLLECTION_SOURCE);
+    assert!(!collections.has_errors());
+    let collection_time = measure(execution_samples, 2, || {
+        execute(black_box(&collections.program)).expect("collection benchmark must execute")
+    });
+
     let pipeline_samples = 10;
     let pipeline_time = measure(pipeline_samples, 2, || {
         let parsed = parse(black_box(SOURCE));
@@ -119,6 +133,8 @@ fn main() {
     print_measurement("semantic analysis", semantic_time, semantic_samples);
     print_measurement("empty runtime startup", runtime_startup, startup_samples);
     print_measurement("execute 1M loop", execution_time, execution_samples);
+    print_measurement("execute 1M calls", function_time, execution_samples);
+    print_measurement("collections 250K", collection_time, execution_samples);
     print_measurement("complete in-process", pipeline_time, pipeline_samples);
     println!(
         "execute 1M allocations: {execution_allocations} allocations, {execution_deallocations} deallocations before result drop"

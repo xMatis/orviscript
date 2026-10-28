@@ -2,7 +2,7 @@
 
 OrviScript is an open-source, automation-first, general-purpose programming language powered by Rust.
 
-Version 0.6.2 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a bytecode fast path for synchronous primitive control flow with a compatible tree-walk fallback, explicit module exports, automation APIs, native task workflows, project manifests, local path packages with a deterministic lockfile, project-wide test discovery, async functions and I/O, structured concurrency on a current-thread executor, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, context-aware standard library completion and hover help, document symbols, cross-file go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include whole-program type inference, a public package registry, CPU-parallel workers or standalone bundling.
+Version 0.8.0 is an early but runnable language milestone. It includes a reusable lexer and parser, enforced type annotations, semantic checks, a bytecode-first VM for synchronous functions and collections with a compatible tree-walk fallback, explicit module exports, automation APIs, native task workflows, project manifests, local path packages with a deterministic lockfile, project-wide test discovery, async functions and I/O, structured concurrency on a current-thread executor, isolated CPU-parallel workers, a Rust language server, and a Visual Studio Code extension with `.orvi` file recognition and icons, syntax and semantic highlighting, live diagnostics, context-aware standard library completion and hover help, document symbols, cross-file go-to-definition, references, rename, and formatting. The language remains incomplete and does not yet include whole-program type inference, a public package registry or standalone bundling.
 
 ## Goals
 
@@ -68,9 +68,32 @@ orviscript install
 orviscript deps
 ```
 
-This writes a `[dependencies]` entry to `orvi.toml` and a deterministic `orvi.lock`. Import the dependency entry with `import { name } from "pkg:math"` or another contained source file with `pkg:math/src/file.orvi`. Package names must match their manifests; missing packages, conflicting names, traversal attempts and dependency cycles are rejected. Version 0.6.2 intentionally supports path packages only and reserves remote registry support for a later release.
+This writes a `[dependencies]` entry to `orvi.toml` and a deterministic `orvi.lock`. Import the dependency entry with `import { name } from "pkg:math"` or another contained source file with `pkg:math/src/file.orvi`. Package names must match their manifests; missing packages, conflicting names, traversal attempts and dependency cycles are rejected. Version 0.8.0 intentionally supports path packages only and reserves remote registry support for a later release.
 
-The 0.6.2 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, distinct `void` and `null` types, numbers, strings, booleans, mutable reference lists and maps, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, explicit exports, local, package and standard module imports, JSON, filesystem, path, environment, process, terminal, HTTP and time APIs, explicit execution context paths, native workflow declarations, a project-wide test command and a global task registry. `async fn`, `await`, `Future<T>`, `Task<T>`, async filesystem/process/HTTP/timer APIs and scoped `spawn`/`join`/`cancel`/`timeout` run on a single-thread executor. Project manifests define a contained entry file and local dependencies, while semantic checks carry exported function signatures across local and package modules. The runtime enforces declared types and uses tracing GC for reference cycles.
+The 0.8.0 subset supports mutable `let` bindings, immutable `const` bindings, optional type annotations on bindings and functions, distinct `void` and `null` types, numbers, strings, booleans, mutable reference lists and maps, typed structs with fields and defaults, structural interfaces, `Option<T>`, `Result<T, E>`, exhaustive `match` expressions, error propagation with `?`, LIFO cleanup through `defer` and `using`, explicit exports, local, package and standard module imports, JSON, filesystem, path, environment, process, terminal, HTTP, time and worker APIs, explicit execution context paths, native workflow declarations, a project-wide test command and a global task registry. `async fn`, `await`, `Future<T>`, `Task<T>`, async filesystem/process/HTTP/timer APIs and scoped `task.spawn`/`join`/`cancel`/`timeout` run on a single-thread executor. `Worker<T>` and `worker.spawn` use a bounded native thread pool for isolated CPU-parallel code, with serializable messages, structured joining, cooperative cancellation and deadlines. Project manifests define a contained entry file and local dependencies, while semantic checks carry exported function signatures across local and package modules. The runtime enforces declared types and uses tracing GC for reference cycles.
+
+The 0.8.0 VM compiles synchronous top-level functions, recursion, explicit returns, lists, maps, indexing, field access, collection mutation, `Option`, `Result`, `?` and `match`. Function slots and operand stacks are recycled between calls, recursion is bounded to 128 frames, and VM-created collection cycles are handled by tracing cleanup. Worker threads keep a bounded cache of 64 compiled source chunks. Programs using closures, structs, imports, cleanup or async features continue through the compatible tree-walk backend.
+
+Run isolated CPU work by passing source and a transferable input value. A completed worker returns a map containing `value` and captured `output`:
+
+```orvi
+async fn main() -> Result<void, string> {
+    let handle: Worker<map<any>> = worker.spawn(
+        "print(worker_input); worker_input * worker_input",
+        12
+    );
+    let result = (await worker.join(handle))?;
+    print(result.value);
+    print(result.output);
+    return Ok();
+}
+
+await main();
+```
+
+Worker messages support `void`, `null`, booleans, finite numbers, strings, lists, maps, `Option` and `Result`. Functions, futures, tasks, workers, modules, structs and cyclic values cannot cross the isolation boundary. Worker source cannot create nested workers. Each lexical scope waits for its unfinished workers before it exits.
+
+Use `worker.status(handle)` for a nonblocking state check and `worker.stats()` for pool capacity, current load and lifetime counters. Set `ORVISCRIPT_WORKER_THREADS` to a value from 1 through 32 before starting OrviScript to cap the pool. Invalid values fall back to the detected CPU parallelism. A panic inside an isolated worker is converted to an error and does not terminate its pool thread.
 
 The VS Code extension lives in `editors/vscode`. It provides document formatting through the same formatter used by the CLI. Build the language server, then launch a development window with the extension enabled:
 

@@ -1158,6 +1158,7 @@ fn classify_token(
                     | "Result"
                     | "Future"
                     | "Task"
+                    | "Worker"
                     | "any"
                     | "bool"
                     | "float"
@@ -1337,6 +1338,11 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             CompletionItemKind::TYPE_PARAMETER,
             "scoped asynchronous task handle",
         ),
+        (
+            "Worker",
+            CompletionItemKind::TYPE_PARAMETER,
+            "isolated parallel CPU worker handle",
+        ),
         ("context", CompletionItemKind::VARIABLE, "execution context"),
         ("Option", CompletionItemKind::ENUM, "optional value type"),
         ("Result", CompletionItemKind::ENUM, "success or error type"),
@@ -1434,6 +1440,9 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "await" => "`await` executes a `Future<T>` and produces its `T` result.",
         "Future" => "`Future<T>` is the lazy result type returned by an `async fn`.",
         "Task" => "`Task<T>` is a scoped handle returned by `task.spawn(Future<T>)`.",
+        "Worker" => {
+            "`Worker<T>` is an isolated CPU worker handle returned by `worker.spawn(source, input)`."
+        }
         "struct" => "`struct` declares a stable set of typed fields.",
         "interface" => "`interface` declares a structural field contract.",
         "import" => "`import { name } from \"module\"` imports selected names.",
@@ -1682,8 +1691,10 @@ mod tests {
         assert!(items.iter().any(|item| item.label == "await"));
         assert!(items.iter().any(|item| item.label == "Future"));
         assert!(items.iter().any(|item| item.label == "Task"));
+        assert!(items.iter().any(|item| item.label == "Worker"));
         assert!(items.iter().any(|item| item.label == "http"));
         assert!(items.iter().any(|item| item.label == "time"));
+        assert!(items.iter().any(|item| item.label == "worker"));
         assert_eq!(items.iter().filter(|item| item.label == "task").count(), 1);
         assert!(!items.iter().any(|item| item.label == "read_text"));
         assert!(!items.iter().any(|item| item.label == "sleep_async"));

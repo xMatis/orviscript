@@ -250,6 +250,43 @@ const TIME_MEMBERS: &[StandardMember] = &[
         description: "Waits without blocking the executor.",
     },
 ];
+const WORKER_MEMBERS: &[StandardMember] = &[
+    StandardMember {
+        name: "spawn",
+        signature: "fn spawn(source: string, input: any) -> Worker<map<any>>",
+        description: "Runs isolated OrviScript source on the bounded CPU worker pool.",
+    },
+    StandardMember {
+        name: "join",
+        signature: "fn join(worker: Worker<any>) -> Future<Result<map<any>, string>>",
+        description: "Waits for a worker and returns its value and captured output.",
+    },
+    StandardMember {
+        name: "cancel",
+        signature: "fn cancel(worker: Worker<any>) -> bool",
+        description: "Requests cooperative cancellation of a worker.",
+    },
+    StandardMember {
+        name: "timeout",
+        signature: "fn timeout(worker: Worker<any>, milliseconds: int) -> Future<Result<map<any>, string>>",
+        description: "Waits for a worker until a deadline, then cancels it.",
+    },
+    StandardMember {
+        name: "threads",
+        signature: "fn threads() -> int",
+        description: "Returns the bounded worker pool size.",
+    },
+    StandardMember {
+        name: "status",
+        signature: "fn status(worker: Worker<any>) -> string",
+        description: "Returns the current worker state without waiting.",
+    },
+    StandardMember {
+        name: "stats",
+        signature: "fn stats() -> map<any>",
+        description: "Returns worker pool capacity, load, and lifetime counters.",
+    },
+];
 
 pub const STANDARD_MODULES: &[StandardModule] = &[
     StandardModule {
@@ -297,6 +334,11 @@ pub const STANDARD_MODULES: &[StandardModule] = &[
         description: "Wall-clock, monotonic time, and timers",
         members: TIME_MEMBERS,
     },
+    StandardModule {
+        name: "worker",
+        description: "Isolated parallel CPU execution",
+        members: WORKER_MEMBERS,
+    },
 ];
 
 pub fn standard_module(name: &str) -> Option<&'static StandardModule> {
@@ -337,6 +379,7 @@ enum StaticType {
     Result(Box<StaticType>, Box<StaticType>),
     Future(Box<StaticType>),
     Task(Box<StaticType>),
+    Worker(Box<StaticType>),
     Function {
         parameters: Vec<StaticType>,
         result: Box<StaticType>,
@@ -351,9 +394,21 @@ pub fn analyze_program(program: &Program) -> Analysis {
     analyze_program_with_modules(program, &HashMap::new())
 }
 
+pub fn analyze_worker_program(program: &Program) -> Analysis {
+    analyze_program_internal(program, &HashMap::new(), true)
+}
+
 pub fn analyze_program_with_modules(
     program: &Program,
     modules: &HashMap<String, Program>,
+) -> Analysis {
+    analyze_program_internal(program, modules, false)
+}
+
+fn analyze_program_internal(
+    program: &Program,
+    modules: &HashMap<String, Program>,
+    worker_mode: bool,
 ) -> Analysis {
     let struct_names = program
         .statements
@@ -397,6 +452,18 @@ pub fn analyze_program_with_modules(
             .map(|(source, program)| (source.clone(), exported_symbols(program)))
             .collect(),
     };
+    if worker_mode {
+        analyzer.scopes[0].insert(
+            "worker_input".into(),
+            Symbol {
+                kind: SymbolKind::Constant,
+                mutable: false,
+                arity: None,
+                definition: None,
+                value_type: StaticType::Dynamic,
+            },
+        );
+    }
     analyzer.statements(&program.statements, false);
     analyzer.errors.extend(task_cycle_errors(program));
     Analysis {
@@ -680,6 +747,7 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
         ("task".into(), module_symbol("task")),
         ("http".into(), module_symbol("http")),
         ("time".into(), module_symbol("time")),
+        ("worker".into(), module_symbol("worker")),
         (
             "context".into(),
             Symbol {
@@ -1756,7 +1824,7 @@ impl Analyzer {
         };
         if !matches!(
             annotation.name.as_str(),
-            "list" | "map" | "Option" | "Result" | "Future" | "Task"
+            "list" | "map" | "Option" | "Result" | "Future" | "Task" | "Worker"
         ) && !annotation.arguments.is_empty()
         {
             self.errors.push(SemanticError {
@@ -1798,7 +1866,8 @@ impl Analyzer {
             | (StaticType::Map(expected), StaticType::Map(actual))
             | (StaticType::Option(expected), StaticType::Option(actual))
             | (StaticType::Future(expected), StaticType::Future(actual))
-            | (StaticType::Task(expected), StaticType::Task(actual)) => {
+            | (StaticType::Task(expected), StaticType::Task(actual))
+            | (StaticType::Worker(expected), StaticType::Worker(actual)) => {
                 self.is_assignable(expected, actual)
             }
             (
@@ -1874,6 +1943,9 @@ impl StaticType {
         if let (Self::Task(expected), Self::Task(actual)) = (self, actual) {
             return expected.accepts(actual);
         }
+        if let (Self::Worker(expected), Self::Worker(actual)) = (self, actual) {
+            return expected.accepts(actual);
+        }
         self == &Self::Dynamic
             || actual == &Self::Dynamic
             || self == actual
@@ -1901,6 +1973,7 @@ impl StaticType {
             }
             Self::Future(value) => format!("Future<{}>", value.display_name()),
             Self::Task(value) => format!("Task<{}>", value.display_name()),
+            Self::Worker(value) => format!("Worker<{}>", value.display_name()),
             Self::Function { parameters, result } => format!(
                 "fn({}) -> {}",
                 parameters
@@ -1973,6 +2046,10 @@ fn static_type_from_annotation(
         "Task" if annotation.arguments.len() == 1 => {
             static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
                 .map(|value| StaticType::Task(Box::new(value)))
+        }
+        "Worker" if annotation.arguments.len() == 1 => {
+            static_type_from_annotation(&annotation.arguments[0], struct_names, interface_names)
+                .map(|value| StaticType::Worker(Box::new(value)))
         }
         "fn" => Some(StaticType::Function {
             parameters: Vec::new(),
@@ -2080,6 +2157,38 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             ],
             StaticType::Future(Box::new(result_type(StaticType::Dynamic))),
         )),
+        ("worker", "spawn") => Some(function_type(
+            vec![StaticType::String, StaticType::Dynamic],
+            StaticType::Worker(Box::new(StaticType::Map(Box::new(StaticType::Dynamic)))),
+        )),
+        ("worker", "join") => Some(function_type(
+            vec![StaticType::Worker(Box::new(StaticType::Dynamic))],
+            StaticType::Future(Box::new(result_type(StaticType::Map(Box::new(
+                StaticType::Dynamic,
+            ))))),
+        )),
+        ("worker", "cancel") => Some(function_type(
+            vec![StaticType::Worker(Box::new(StaticType::Dynamic))],
+            StaticType::Bool,
+        )),
+        ("worker", "timeout") => Some(function_type(
+            vec![
+                StaticType::Worker(Box::new(StaticType::Dynamic)),
+                StaticType::Int,
+            ],
+            StaticType::Future(Box::new(result_type(StaticType::Map(Box::new(
+                StaticType::Dynamic,
+            ))))),
+        )),
+        ("worker", "threads") => Some(function_type(Vec::new(), StaticType::Int)),
+        ("worker", "status") => Some(function_type(
+            vec![StaticType::Worker(Box::new(StaticType::Dynamic))],
+            StaticType::String,
+        )),
+        ("worker", "stats") => Some(function_type(
+            Vec::new(),
+            StaticType::Map(Box::new(StaticType::Dynamic)),
+        )),
         ("http", "get") => Some(function_type(
             vec![StaticType::String],
             result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
@@ -2153,7 +2262,7 @@ fn literal_type(literal: &Literal) -> StaticType {
 mod tests {
     use super::{
         STANDARD_MODULES, SemanticErrorKind, analyze, analyze_program,
-        analyze_program_with_modules, module_member_type,
+        analyze_program_with_modules, analyze_worker_program, module_member_type,
     };
     use orvi_syntax::parse;
     use std::collections::HashMap;
@@ -2253,6 +2362,17 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn checks_worker_handles_and_worker_input() {
+        let worker_errors = errors(
+            "let handle: Worker<map<any>> = worker.spawn(\"worker_input\", 7); let result: Future<Result<map<any>, string>> = worker.join(handle);",
+        );
+        assert!(worker_errors.is_empty(), "{worker_errors:?}");
+        let worker = parse("worker_input");
+        assert!(analyze_worker_program(&worker.program).errors.is_empty());
+        assert_eq!(errors("print(worker_input)").len(), 1);
     }
 
     #[test]

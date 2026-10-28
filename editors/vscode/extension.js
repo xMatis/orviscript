@@ -71,7 +71,7 @@ class LanguageServerConnection {
 
     const initialization = await this.request("initialize", {
       processId: process.pid,
-      clientInfo: { name: "OrviScript VS Code", version: "0.6.2" },
+      clientInfo: { name: "OrviScript VS Code", version: "0.8.0" },
       rootUri: vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? null,
       capabilities: {
         general: { positionEncodings: ["utf-16"] },

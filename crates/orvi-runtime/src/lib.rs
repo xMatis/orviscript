@@ -5,7 +5,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
@@ -16,6 +17,9 @@ use orvi_syntax::{
 };
 
 mod bytecode;
+mod worker;
+
+use worker::{TransferValue, WorkerPool, WorkerTaskValue};
 
 type MapEntries = Vec<(String, Value)>;
 const MAX_ASYNC_TASKS_PER_SCOPE: usize = 10_000;
@@ -44,6 +48,7 @@ pub enum Value {
     Function(Rc<UserFunction>),
     Future(Rc<RefCell<FutureValue>>),
     AsyncTask(Rc<RefCell<AsyncTaskValue>>),
+    Worker(Rc<RefCell<WorkerTaskValue>>),
     NativePrint,
 }
 
@@ -136,6 +141,11 @@ enum FutureState {
         future: Rc<RefCell<FutureValue>>,
         duration: Duration,
     },
+    WorkerJoining(Rc<RefCell<WorkerTaskValue>>),
+    WorkerTimingOut {
+        worker: Rc<RefCell<WorkerTaskValue>>,
+        duration: Duration,
+    },
     Running,
     Ready(Result<Value, RuntimeError>),
 }
@@ -213,6 +223,7 @@ pub enum NativeModule {
     Task,
     Http,
     Time,
+    Worker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,6 +261,13 @@ pub enum NativeFunction {
     TaskJoin,
     TaskCancel,
     TaskTimeout,
+    WorkerSpawn,
+    WorkerJoin,
+    WorkerCancel,
+    WorkerTimeout,
+    WorkerThreads,
+    WorkerStatus,
+    WorkerStats,
 }
 
 #[derive(Clone, Debug)]
@@ -445,9 +463,11 @@ async fn execute_internal_async(
     let mut interpreter = Interpreter::new(context, entry_file);
     let result = interpreter.execute_statements(&program.statements).await;
     let tasks = interpreter.finish_current_task_scope().await;
+    let workers = interpreter.finish_current_worker_scope().await;
     let cleanup = interpreter.run_deferred().await;
     let control = result?;
     tasks?;
+    workers?;
     cleanup?;
     let value = match control {
         Control::Continue(value) => value,
@@ -465,6 +485,81 @@ async fn execute_internal_async(
         value,
         collected_objects: interpreter.collected_objects,
     })
+}
+
+fn worker_result_value(result: worker::WorkerResult) -> Value {
+    match result {
+        Ok(value) => ok_value(worker::value_from_transfer(value)),
+        Err(message) => err_value(message),
+    }
+}
+
+fn execute_worker_job(
+    source: &str,
+    input: TransferValue,
+    context: ExecutionContext,
+    cancellation: Arc<AtomicBool>,
+) -> worker::WorkerResult {
+    let parsed = orvi_syntax::parse(source);
+    if let Some(error) = parsed.lexical_errors.first() {
+        return Err(format!("worker lexical error: {error}"));
+    }
+    if let Some(error) = parsed.parse_errors.first() {
+        return Err(format!("worker parse error: {error}"));
+    }
+    let analysis = orvi_sema::analyze_worker_program(&parsed.program);
+    if let Some(error) = analysis.errors.first() {
+        return Err(format!("worker semantic error: {error}"));
+    }
+    let input = worker::value_from_transfer(input);
+    if let Some(bytecode) = bytecode::compile_worker_cached(source, &parsed.program, input.clone())
+    {
+        let execution = bytecode::execute_with_cancellation(&bytecode, &cancellation)
+            .map_err(|error| error.message)?;
+        return worker_execution_result(execution.value, execution.output);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("worker executor could not start: {error}"))?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
+        let mut interpreter = Interpreter::new(context, None);
+        interpreter.is_worker = true;
+        interpreter.worker_cancellation = Some(cancellation);
+        interpreter
+            .globals
+            .define("worker_input".into(), input, false, None);
+        let control = interpreter
+            .execute_statements(&parsed.program.statements)
+            .await
+            .map_err(|error| error.message)?;
+        interpreter
+            .finish_current_task_scope()
+            .await
+            .map_err(|error| error.message)?;
+        interpreter
+            .run_deferred()
+            .await
+            .map_err(|error| error.message)?;
+        let value = match control {
+            Control::Continue(value) => value,
+            Control::Return(_) => return Err("return is only valid inside a function".into()),
+        };
+        let output = interpreter.output.borrow().clone();
+        worker_execution_result(value, output)
+    })
+}
+
+fn worker_execution_result(value: Value, output: Vec<String>) -> worker::WorkerResult {
+    let output = Value::List(Rc::new(RefCell::new(
+        output.into_iter().map(Value::String).collect(),
+    )));
+    worker::transfer_from_value(&Value::Map(Rc::new(RefCell::new(vec![
+        ("value".into(), value),
+        ("output".into(), output),
+    ]))))
 }
 
 pub fn execute_tasks(
@@ -500,6 +595,7 @@ async fn execute_tasks_async(
     }
     let reports = interpreter.run_tasks(&tasks, selected).await;
     interpreter.finish_current_task_scope().await?;
+    interpreter.finish_current_worker_scope().await?;
     interpreter.run_deferred().await?;
     Ok(TaskExecution {
         output: interpreter.output.borrow().clone(),
@@ -532,6 +628,10 @@ struct Interpreter {
     suspended_environments: Vec<Environment>,
     cancellation: Option<Rc<Cancellation>>,
     task_scopes: Vec<Vec<Rc<RefCell<AsyncTaskValue>>>>,
+    worker_cancellation: Option<Arc<AtomicBool>>,
+    worker_pool: Option<Arc<WorkerPool>>,
+    worker_scopes: Vec<Vec<Rc<RefCell<WorkerTaskValue>>>>,
+    is_worker: bool,
     http_client: Rc<RefCell<Option<reqwest::Client>>>,
 }
 
@@ -694,6 +794,7 @@ impl Interpreter {
             ("task", NativeModule::Task),
             ("http", NativeModule::Http),
             ("time", NativeModule::Time),
+            ("worker", NativeModule::Worker),
         ] {
             globals.define(name.into(), Value::NativeModule(module), false, None);
         }
@@ -737,6 +838,10 @@ impl Interpreter {
             suspended_environments: Vec::new(),
             cancellation: None,
             task_scopes: vec![Vec::new()],
+            worker_cancellation: None,
+            worker_pool: None,
+            worker_scopes: vec![Vec::new()],
+            is_worker: false,
             http_client: Rc::new(RefCell::new(None)),
         }
     }
@@ -767,6 +872,10 @@ impl Interpreter {
             suspended_environments: Vec::new(),
             cancellation: Some(cancellation),
             task_scopes: vec![Vec::new()],
+            worker_cancellation: self.worker_cancellation.clone(),
+            worker_pool: self.worker_pool.clone(),
+            worker_scopes: vec![Vec::new()],
+            is_worker: self.is_worker,
             http_client: self.http_client.clone(),
         }
     }
@@ -776,8 +885,12 @@ impl Interpreter {
             .cancellation
             .as_ref()
             .is_some_and(|cancellation| cancellation.cancelled.get())
+            || self
+                .worker_cancellation
+                .as_deref()
+                .is_some_and(worker::is_cancelled)
         {
-            Err(self.error("task was cancelled", span))
+            Err(self.error("execution was cancelled", span))
         } else {
             Ok(())
         }
@@ -1143,6 +1256,7 @@ impl Interpreter {
         self.deferred.push(Vec::new());
         if scoped_tasks {
             self.task_scopes.push(Vec::new());
+            self.worker_scopes.push(Vec::new());
         }
         let result = self.execute_statements(statements).await;
         let tasks = if scoped_tasks {
@@ -1150,15 +1264,21 @@ impl Interpreter {
         } else {
             Ok(())
         };
+        let workers = if scoped_tasks {
+            self.finish_current_worker_scope().await
+        } else {
+            Ok(())
+        };
         let cleanup = self.run_deferred().await;
         if scoped_tasks {
             self.task_scopes.pop();
+            self.worker_scopes.pop();
         }
         self.deferred.pop();
         self.suspended_environments.pop();
         self.environment = previous;
         match result {
-            Ok(control) => tasks.and(cleanup).map(|()| control),
+            Ok(control) => tasks.and(workers).and(cleanup).map(|()| control),
             Err(error) => Err(error),
         }
     }
@@ -1868,6 +1988,69 @@ impl Interpreter {
         first_error.map_or(Ok(()), Err)
     }
 
+    async fn join_worker(
+        &self,
+        worker: Rc<RefCell<WorkerTaskValue>>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(result) = worker.borrow().result.clone() {
+            return Ok(worker_result_value(result));
+        }
+        let receiver = worker
+            .borrow_mut()
+            .receiver
+            .take()
+            .ok_or_else(|| self.error("worker result is already being awaited", span))?;
+        let result = receiver
+            .await
+            .unwrap_or_else(|_| Err("worker stopped without returning a result".into()));
+        worker.borrow_mut().result = Some(result.clone());
+        Ok(worker_result_value(result))
+    }
+
+    async fn timeout_worker(
+        &self,
+        worker: Rc<RefCell<WorkerTaskValue>>,
+        duration: Duration,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(result) = worker.borrow().result.clone() {
+            return Ok(worker_result_value(result));
+        }
+        let mut receiver = worker
+            .borrow_mut()
+            .receiver
+            .take()
+            .ok_or_else(|| self.error("worker result is already being awaited", span))?;
+        match tokio::time::timeout(duration, &mut receiver).await {
+            Ok(result) => {
+                let result = result
+                    .unwrap_or_else(|_| Err("worker stopped without returning a result".into()));
+                worker.borrow_mut().result = Some(result.clone());
+                Ok(worker_result_value(result))
+            }
+            Err(_) => {
+                worker::cancel(&worker.borrow());
+                worker.borrow_mut().receiver = Some(receiver);
+                Ok(err_value("worker timed out"))
+            }
+        }
+    }
+
+    async fn finish_current_worker_scope(&self) -> Result<(), RuntimeError> {
+        let workers = self
+            .worker_scopes
+            .last()
+            .expect("interpreter always has a worker scope")
+            .clone();
+        for worker in workers {
+            if worker.borrow().result.is_none() {
+                self.join_worker(worker, Span::empty(0)).await?;
+            }
+        }
+        Ok(())
+    }
+
     #[async_recursion(?Send)]
     async fn await_future(&mut self, value: Value, span: Span) -> Result<Value, RuntimeError> {
         let Value::Future(future) = value else {
@@ -1884,7 +2067,9 @@ impl Interpreter {
                 | FutureState::Sleeping(_)
                 | FutureState::Native(_)
                 | FutureState::Joining(_)
-                | FutureState::TimingOut { .. } => {}
+                | FutureState::TimingOut { .. }
+                | FutureState::WorkerJoining(_)
+                | FutureState::WorkerTimingOut { .. } => {}
             }
             std::mem::replace(&mut future.state, FutureState::Running)
         };
@@ -1915,6 +2100,10 @@ impl Interpreter {
             FutureState::TimingOut { future, duration } => {
                 let task = self.spawn_async_task(Value::Future(future), span)?;
                 self.timeout_async_task(task, duration, span).await
+            }
+            FutureState::WorkerJoining(worker) => self.join_worker(worker, span).await,
+            FutureState::WorkerTimingOut { worker, duration } => {
+                self.timeout_worker(worker, duration, span).await
             }
             FutureState::Running | FutureState::Ready(_) => {
                 unreachable!("future state was checked before replacement")
@@ -2419,6 +2608,92 @@ impl Interpreter {
                     duration: Duration::from_millis(milliseconds as u64),
                 }))
             }
+            NativeFunction::WorkerSpawn => {
+                if self.is_worker {
+                    return Err(self.error("workers cannot spawn nested workers", span));
+                }
+                let source = self.string_argument(arguments.next(), function, span)?;
+                let input = arguments.next().expect("checked argument count");
+                let scope = self
+                    .worker_scopes
+                    .last_mut()
+                    .expect("interpreter always has a worker scope");
+                if scope.len() >= worker::MAX_WORKERS_PER_SCOPE {
+                    return Err(self.error("worker scope limit exceeded", span));
+                }
+                let input = worker::transfer_from_value(&input)
+                    .map_err(|message| self.error(message, span))?;
+                let pool = self.worker_pool.get_or_insert_with(WorkerPool::new).clone();
+                let worker = pool
+                    .spawn(source, input, self.context.clone())
+                    .map_err(|message| self.error(message, span))?;
+                self.worker_scopes
+                    .last_mut()
+                    .expect("interpreter always has a worker scope")
+                    .push(worker.clone());
+                Ok(Value::Worker(worker))
+            }
+            NativeFunction::WorkerJoin => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::Worker(worker) = value else {
+                    return Err(self.error("worker.join expects Worker<T>", span));
+                };
+                Ok(self.register_future(FutureState::WorkerJoining(worker)))
+            }
+            NativeFunction::WorkerCancel => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::Worker(worker) = value else {
+                    return Err(self.error("worker.cancel expects Worker<T>", span));
+                };
+                Ok(Value::Bool(worker::cancel(&worker.borrow())))
+            }
+            NativeFunction::WorkerTimeout => {
+                let value = arguments.next().expect("checked argument count");
+                let milliseconds = arguments.next().expect("checked argument count");
+                let Value::Worker(worker) = value else {
+                    return Err(self.error("worker.timeout expects Worker<T>", span));
+                };
+                let Value::Integer(milliseconds) = milliseconds else {
+                    return Err(self.error("worker.timeout expects int milliseconds", span));
+                };
+                if !(0..=86_400_000).contains(&milliseconds) {
+                    return Ok(self.register_future(FutureState::Ready(Ok(err_value(
+                        "timeout must be between 0 and 86400000 ms",
+                    )))));
+                }
+                Ok(self.register_future(FutureState::WorkerTimingOut {
+                    worker,
+                    duration: Duration::from_millis(milliseconds as u64),
+                }))
+            }
+            NativeFunction::WorkerThreads => Ok(Value::Integer(
+                self.worker_pool
+                    .get_or_insert_with(WorkerPool::new)
+                    .thread_count() as i64,
+            )),
+            NativeFunction::WorkerStatus => {
+                let value = arguments.next().expect("checked argument count");
+                let Value::Worker(worker) = value else {
+                    return Err(self.error("worker.status expects Worker<T>", span));
+                };
+                Ok(Value::String(worker::status(&worker.borrow()).into()))
+            }
+            NativeFunction::WorkerStats => {
+                let stats = self.worker_pool.get_or_insert_with(WorkerPool::new).stats();
+                Ok(Value::Map(Rc::new(RefCell::new(vec![
+                    ("threads".into(), Value::Integer(stats.threads as i64)),
+                    (
+                        "queue_capacity".into(),
+                        Value::Integer(stats.queue_capacity as i64),
+                    ),
+                    ("queued".into(), Value::Integer(stats.queued as i64)),
+                    ("running".into(), Value::Integer(stats.running as i64)),
+                    ("completed".into(), Value::Integer(stats.completed as i64)),
+                    ("failed".into(), Value::Integer(stats.failed as i64)),
+                    ("panicked".into(), Value::Integer(stats.panicked as i64)),
+                    ("rejected".into(), Value::Integer(stats.rejected as i64)),
+                ]))))
+            }
             NativeFunction::TaskResult => {
                 let name = self.string_argument(arguments.next(), function, span)?;
                 let Some(needs) = &self.active_task_needs else {
@@ -2870,6 +3145,7 @@ impl NativeModule {
             Self::Task => "task",
             Self::Http => "http",
             Self::Time => "time",
+            Self::Worker => "worker",
         }
     }
 
@@ -2908,6 +3184,13 @@ impl NativeModule {
             (Self::Time, "monotonic_ms") => Some(NativeFunction::TimeMonotonicMs),
             (Self::Time, "sleep_ms") => Some(NativeFunction::TimeSleepMs),
             (Self::Time, "sleep_async") => Some(NativeFunction::TimeSleepAsync),
+            (Self::Worker, "spawn") => Some(NativeFunction::WorkerSpawn),
+            (Self::Worker, "join") => Some(NativeFunction::WorkerJoin),
+            (Self::Worker, "cancel") => Some(NativeFunction::WorkerCancel),
+            (Self::Worker, "timeout") => Some(NativeFunction::WorkerTimeout),
+            (Self::Worker, "threads") => Some(NativeFunction::WorkerThreads),
+            (Self::Worker, "status") => Some(NativeFunction::WorkerStatus),
+            (Self::Worker, "stats") => Some(NativeFunction::WorkerStats),
             _ => None,
         }
     }
@@ -2924,6 +3207,7 @@ fn native_module(name: &str) -> Option<NativeModule> {
         "task" => Some(NativeModule::Task),
         "http" => Some(NativeModule::Http),
         "time" => Some(NativeModule::Time),
+        "worker" => Some(NativeModule::Worker),
         _ => None,
     }
 }
@@ -2964,6 +3248,13 @@ impl NativeFunction {
             Self::TimeMonotonicMs => "time.monotonic_ms",
             Self::TimeSleepMs => "time.sleep_ms",
             Self::TimeSleepAsync => "time.sleep_async",
+            Self::WorkerSpawn => "worker.spawn",
+            Self::WorkerJoin => "worker.join",
+            Self::WorkerCancel => "worker.cancel",
+            Self::WorkerTimeout => "worker.timeout",
+            Self::WorkerThreads => "worker.threads",
+            Self::WorkerStatus => "worker.status",
+            Self::WorkerStats => "worker.stats",
         }
     }
 
@@ -2974,8 +3265,13 @@ impl NativeFunction {
             | Self::ProcessRun
             | Self::ProcessRunAsync
             | Self::TaskTimeout => 2,
+            Self::WorkerSpawn | Self::WorkerTimeout => 2,
             Self::HttpRequest | Self::HttpRequestAsync => 4,
-            Self::EnvCurrentDir | Self::TimeUnixMs | Self::TimeMonotonicMs => 0,
+            Self::EnvCurrentDir
+            | Self::TimeUnixMs
+            | Self::TimeMonotonicMs
+            | Self::WorkerThreads => 0,
+            Self::WorkerStats => 0,
             _ => 1,
         }
     }
@@ -3117,7 +3413,9 @@ fn mark_value(
                     marked_environments,
                     marked_lists,
                 ),
-                FutureState::Sleeping(_)
+                FutureState::WorkerJoining(_)
+                | FutureState::WorkerTimingOut { .. }
+                | FutureState::Sleeping(_)
                 | FutureState::Native(_)
                 | FutureState::Running
                 | FutureState::Ready(Err(_)) => {}
@@ -3132,6 +3430,7 @@ fn mark_value(
                 mark_value(value, marked_environments, marked_lists);
             }
         }
+        Value::Worker(_) => {}
         Value::Variant {
             payload: Some(value),
             ..
@@ -3154,6 +3453,7 @@ impl Value {
             Self::Function(_) | Self::NativePrint | Self::NativeFunction(_) => "fn".into(),
             Self::Future(_) => "Future".into(),
             Self::AsyncTask(_) => "Task".into(),
+            Self::Worker(_) => "Worker".into(),
             Self::NativeModule(module) => format!("module {}", module.name()),
             Self::StructType(definition) => format!("type {}", definition.name),
             Self::InterfaceType(definition) => format!("type {}", definition.name),
@@ -3230,6 +3530,7 @@ fn value_matches_type_inner(
         ),
         "Future" => matches!(value, Value::Future(_)) && type_annotation.arguments.len() == 1,
         "Task" => matches!(value, Value::AsyncTask(_)) && type_annotation.arguments.len() == 1,
+        "Worker" => matches!(value, Value::Worker(_)) && type_annotation.arguments.len() == 1,
         "Option" => match value {
             Value::Variant {
                 tag: VariantTag::None,
@@ -3440,6 +3741,7 @@ fn values_equal_inner(left: &Value, right: &Value, visited: &mut HashSet<(usize,
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::Future(a), Value::Future(b)) => Rc::ptr_eq(a, b),
         (Value::AsyncTask(a), Value::AsyncTask(b)) => Rc::ptr_eq(a, b),
+        (Value::Worker(a), Value::Worker(b)) => Rc::ptr_eq(a, b),
         (Value::NativePrint, Value::NativePrint) => true,
         _ => false,
     }
@@ -3518,6 +3820,8 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             FutureState::Native(_) => "<future io>".into(),
             FutureState::Joining(_) => "<future joining>".into(),
             FutureState::TimingOut { .. } => "<future timeout>".into(),
+            FutureState::WorkerJoining(_) => "<future worker join>".into(),
+            FutureState::WorkerTimingOut { .. } => "<future worker timeout>".into(),
             FutureState::Running => "<future running>".into(),
             FutureState::Ready(_) => "<future ready>".into(),
         },
@@ -3527,6 +3831,9 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             } else {
                 "<task running>".into()
             }
+        }
+        Value::Worker(worker) => {
+            format!("<worker {}>", worker::status(&worker.borrow()))
         }
         Value::NativePrint => "<native fn print>".into(),
     }
