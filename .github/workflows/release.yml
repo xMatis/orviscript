@@ -64,6 +64,8 @@ jobs:
           mkdir -p "artifacts/${name}"
           cp "target/${{ matrix.target }}/release/orviscript" "artifacts/${name}/"
           cp "target/${{ matrix.target }}/release/orvi-lsp" "artifacts/${name}/"
+          "target/${{ matrix.target }}/release/orviscript" diagnostics export "artifacts/${name}/diagnostic-rules.compiled.json"
+          cp diagnostics/diagnostic-rules.schema.json "artifacts/${name}/"
           cp README.md LICENSE "artifacts/${name}/"
           tar -C artifacts -czf "artifacts/${name}.tar.gz" "${name}"
           cd artifacts

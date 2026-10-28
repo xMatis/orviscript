@@ -1,0 +1,21 @@
+{
+  "$schema": "./diagnostic-rules.schema.json",
+  "schemaVersion": 1,
+  "includes": [],
+  "rules": [
+    {
+      "id": "ORVI1001",
+      "category": "foreign_syntax",
+      "match": {
+        "token": "function",
+        "context": "function_declaration"
+      },
+      "message": "Unknown syntax. Did you mean 'fn'?",
+      "replacement": "fn",
+      "severity": "error",
+      "quickFix": true,
+      "priority": 100,
+      "sourceLanguages": ["javascript", "typescript"]
+    }
+  ]
+}

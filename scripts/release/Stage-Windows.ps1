@@ -22,6 +22,11 @@ Copy-Item (Join-Path $repositoryRoot "target/release/orvi-lsp.exe") $OutputDirec
 Copy-Item (Join-Path $repositoryRoot "README.md") $OutputDirectory
 Copy-Item (Join-Path $repositoryRoot "LICENSE") $OutputDirectory
 Copy-Item (Join-Path $repositoryRoot "assets/orviscript-file-icon.ico") $OutputDirectory
+Copy-Item (Join-Path $repositoryRoot "diagnostics/diagnostic-rules.schema.json") $OutputDirectory
+
+$compiledRules = Join-Path $OutputDirectory "diagnostic-rules.compiled.json"
+& (Join-Path $repositoryRoot "target/release/orviscript.exe") diagnostics export $compiledRules | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "Diagnostic rules export failed." }
 
 $vsixPath = Join-Path $OutputDirectory "orviscript-vscode.vsix"
 Push-Location (Join-Path $repositoryRoot "editors/vscode")

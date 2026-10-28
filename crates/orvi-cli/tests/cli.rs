@@ -124,6 +124,43 @@ fn prints_positioned_syntax_diagnostics() {
 }
 
 #[test]
+fn explains_foreign_syntax_with_a_structured_fix() {
+    let path = source_file("function greet() {}");
+    let output = run(&["check", path.to_str().expect("UTF-8 temporary path")]);
+    fs::remove_file(path).expect("temporary source can be removed");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[ORVI1001]: Unknown syntax. Did you mean 'fn'?"));
+    assert!(stderr.contains("help: replace 'function' with 'fn'"));
+}
+
+#[test]
+fn exports_the_compiled_diagnostic_catalog() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("orviscript-rules-{id}"));
+    let path = directory.join("nested/diagnostic-rules.compiled.json");
+    let output = run(&[
+        "diagnostics",
+        "export",
+        path.to_str().expect("UTF-8 temporary path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exported = fs::read_to_string(&path).expect("compiled catalog was exported");
+    assert!(exported.contains("\"id\": \"ORVI1001\""));
+    assert!(exported.contains("\"token\": \"function\""));
+    assert!(exported.contains("\"includes\": []"));
+    assert!(exported.contains("\"catalogHash\":"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn prints_semantic_diagnostics() {
     let path = source_file("let value = missing;");
     let output = run(&["check", path.to_str().expect("UTF-8 temporary path")]);

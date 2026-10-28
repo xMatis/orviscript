@@ -48,7 +48,7 @@ test("language server publishes diagnostics for an open document", { timeout: 60
     });
     const initialized = await waitFor((message) => message.id === 1);
     assert.equal(initialized.result.serverInfo.name, "orvi-lsp");
-    assert.equal(initialized.result.serverInfo.version, "0.8.2");
+    assert.equal(initialized.result.serverInfo.version, "0.9.0");
     assert.equal(initialized.result.capabilities.textDocumentSync, 1);
 
     send({ jsonrpc: "2.0", method: "initialized", params: {} });
@@ -85,6 +85,84 @@ test("language server publishes diagnostics for an open document", { timeout: 60
         && message.params.version === 2,
     );
     assert.deepEqual(corrected.params.diagnostics, []);
+
+    const foreignUri = "file:///foreign-syntax.orvi";
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: foreignUri,
+          languageId: "orviscript",
+          version: 1,
+          text: "function greet() {}",
+        },
+      },
+    });
+    const foreignDiagnostic = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.uri === foreignUri,
+    );
+    assert.equal(foreignDiagnostic.params.diagnostics.length, 1);
+    assert.equal(foreignDiagnostic.params.diagnostics[0].code, "ORVI1001");
+    assert.equal(foreignDiagnostic.params.diagnostics[0].range.end.character, 8);
+
+    send({
+      jsonrpc: "2.0",
+      id: 30,
+      method: "textDocument/codeAction",
+      params: {
+        textDocument: { uri: foreignUri },
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 8 } },
+        context: { diagnostics: foreignDiagnostic.params.diagnostics },
+      },
+    });
+    const quickFix = await waitFor((message) => message.id === 30);
+    assert.equal(quickFix.result.length, 1);
+    assert.equal(quickFix.result[0].kind, "quickfix");
+    assert.equal(quickFix.result[0].edit.changes[foreignUri][0].newText, "fn");
+
+    send({
+      jsonrpc: "2.0",
+      method: "workspace/didChangeConfiguration",
+      params: {
+        settings: {
+          diagnostics: {
+            enabledCategories: ["another_category"],
+            minimumSeverity: "hint",
+          },
+        },
+      },
+    });
+    const filteredDiagnostic = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.uri === foreignUri && !Object.hasOwn(message.params, "version"),
+    );
+    assert.deepEqual(filteredDiagnostic.params.diagnostics, []);
+
+    send({
+      jsonrpc: "2.0",
+      method: "workspace/didChangeConfiguration",
+      params: {
+        settings: {
+          diagnostics: { enabledCategories: [], minimumSeverity: "hint" },
+        },
+      },
+    });
+    const restoredDiagnostic = await waitFor(
+      (message) => message.method === "textDocument/publishDiagnostics"
+        && message.params.uri === foreignUri
+        && message.params.diagnostics[0]?.code === "ORVI1001",
+    );
+    assert.equal(restoredDiagnostic.params.diagnostics.length, 1);
+
+    send({
+      jsonrpc: "2.0",
+      method: "textDocument/didClose",
+      params: { textDocument: { uri: foreignUri } },
+    });
+    await waitFor((message) => message.method === "textDocument/publishDiagnostics"
+      && message.params.uri === foreignUri && !Object.hasOwn(message.params, "version"));
 
     send({
       jsonrpc: "2.0",

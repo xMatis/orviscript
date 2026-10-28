@@ -2,7 +2,7 @@
   "name": "orviscript",
   "displayName": "OrviScript",
   "description": "Language support for OrviScript",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "publisher": "orviscript",
   "license": "Apache-2.0",
   "repository": {
@@ -14,7 +14,7 @@
     "onLanguage:orviscript"
   ],
   "scripts": {
-    "check": "cargo build --manifest-path ../../Cargo.toml --bin orvi-lsp && node --check extension.js && node --check protocol.mjs && node validate.mjs && node --test --test-concurrency=1 test/*.test.mjs"
+    "check": "cargo build --manifest-path ../../Cargo.toml --bin orvi-lsp && node --check extension.js && node --check inline-diagnostics.js && node --check protocol.mjs && node validate.mjs && node --test --test-concurrency=1 test/*.test.mjs"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -30,6 +30,25 @@
           "type": "string",
           "default": "",
           "description": "Path to the orvi-lsp executable. Leave empty to use the workspace build, standard OrviScript installation, or PATH."
+        },
+        "orviscript.diagnostics.inlineMessages": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show OrviScript rule diagnostics at the end of the affected line. Standard squiggles and Quick Fix actions remain available when disabled."
+        },
+        "orviscript.diagnostics.enabledCategories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Diagnostic rule categories to enable. Leave empty to enable every compiled category."
+        },
+        "orviscript.diagnostics.minimumSeverity": {
+          "type": "string",
+          "enum": ["error", "warning", "information", "hint"],
+          "default": "hint",
+          "description": "Lowest severity of compiled rule diagnostics to publish."
         }
       }
     },

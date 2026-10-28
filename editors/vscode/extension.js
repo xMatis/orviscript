@@ -2,17 +2,31 @@ const childProcess = require("node:child_process");
 const vscode = require("vscode");
 
 const { resolveServer } = require("./server-path.js");
+const { inlineDiagnosticEntries } = require("./inline-diagnostics.js");
 
 let connection;
 
 async function activate(context) {
   const diagnostics = vscode.languages.createDiagnosticCollection("orviscript");
   const output = vscode.window.createOutputChannel("OrviScript");
-  context.subscriptions.push(diagnostics, output);
+  const inlineDiagnostics = vscode.window.createTextEditorDecorationType({
+    after: {
+      color: new vscode.ThemeColor("editorCodeLens.foreground"),
+      margin: "0 0 0 1.5rem",
+    },
+    rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+  });
+  context.subscriptions.push(diagnostics, output, inlineDiagnostics);
 
   try {
     const protocol = await import("./protocol.mjs");
-    connection = new LanguageServerConnection(context, diagnostics, output, protocol);
+    connection = new LanguageServerConnection(
+      context,
+      diagnostics,
+      inlineDiagnostics,
+      output,
+      protocol,
+    );
     context.subscriptions.push(connection);
     await connection.start();
   } catch (error) {
@@ -26,10 +40,21 @@ function deactivate() {
   return connection?.stop();
 }
 
+function diagnosticSettings() {
+  const configuration = vscode.workspace.getConfiguration("orviscript");
+  return {
+    diagnostics: {
+      enabledCategories: configuration.get("diagnostics.enabledCategories", []),
+      minimumSeverity: configuration.get("diagnostics.minimumSeverity", "hint"),
+    },
+  };
+}
+
 class LanguageServerConnection {
-  constructor(context, diagnostics, output, protocol) {
+  constructor(context, diagnostics, inlineDiagnostics, output, protocol) {
     this.context = context;
     this.diagnostics = diagnostics;
+    this.inlineDiagnostics = inlineDiagnostics;
     this.output = output;
     this.protocol = protocol;
     this.reader = new protocol.MessageReader();
@@ -37,6 +62,7 @@ class LanguageServerConnection {
     this.pending = new Map();
     this.ready = false;
     this.disposables = [];
+    this.publishedDiagnostics = new Map();
   }
 
   async start() {
@@ -71,12 +97,18 @@ class LanguageServerConnection {
 
     const initialization = await this.request("initialize", {
       processId: process.pid,
-      clientInfo: { name: "OrviScript VS Code", version: "0.8.2" },
+      clientInfo: { name: "OrviScript VS Code", version: "0.9.0" },
       rootUri: vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? null,
+      initializationOptions: diagnosticSettings(),
       capabilities: {
         general: { positionEncodings: ["utf-16"] },
         textDocument: {
           completion: { completionItem: {} },
+          codeAction: {
+            codeActionLiteralSupport: {
+              codeActionKind: { valueSet: ["quickfix"] },
+            },
+          },
           definition: {},
           hover: { contentFormat: ["markdown", "plaintext"] },
           publishDiagnostics: { versionSupport: true },
@@ -100,6 +132,16 @@ class LanguageServerConnection {
       vscode.workspace.onDidOpenTextDocument((document) => this.open(document)),
       vscode.workspace.onDidChangeTextDocument((event) => this.change(event.document)),
       vscode.workspace.onDidCloseTextDocument((document) => this.close(document)),
+      vscode.window.onDidChangeVisibleTextEditors(() => this.renderAllInlineDiagnostics()),
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (event.affectsConfiguration("orviscript.diagnostics.inlineMessages")) {
+          this.renderAllInlineDiagnostics();
+        }
+        if (event.affectsConfiguration("orviscript.diagnostics.enabledCategories")
+          || event.affectsConfiguration("orviscript.diagnostics.minimumSeverity")) {
+          this.notify("workspace/didChangeConfiguration", { settings: diagnosticSettings() });
+        }
+      }),
     );
   }
 
@@ -129,6 +171,12 @@ class LanguageServerConnection {
       textDocument: { uri: document.uri.toString() },
     });
     this.diagnostics.delete(document.uri);
+    this.publishedDiagnostics.delete(document.uri.toString());
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.uri.toString() === document.uri.toString()) {
+        editor.setDecorations(this.inlineDiagnostics, []);
+      }
+    }
   }
 
   registerLanguageFeatures(capabilities) {
@@ -234,6 +282,32 @@ class LanguageServerConnection {
       }));
     }
 
+    if (capabilities.codeActionProvider) {
+      this.disposables.push(vscode.languages.registerCodeActionsProvider(selector, {
+        provideCodeActions: async (document, range, context) => {
+          const response = await this.request("textDocument/codeAction", {
+            textDocument: { uri: document.uri.toString() },
+            range: asProtocolRange(range),
+            context: {
+              diagnostics: context.diagnostics.map(asProtocolDiagnostic),
+              only: context.only ? [context.only.value] : undefined,
+              triggerKind: context.triggerKind,
+            },
+          });
+          return (response ?? []).map((item) => {
+            if (!item.edit) return undefined;
+            const action = new vscode.CodeAction(
+              item.title,
+              item.kind === "quickfix" ? vscode.CodeActionKind.QuickFix : undefined,
+            );
+            action.edit = asWorkspaceEdit(item.edit);
+            action.isPreferred = item.isPreferred;
+            return action;
+          }).filter(Boolean);
+        },
+      }, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }));
+    }
+
     const semantic = capabilities.semanticTokensProvider;
     if (semantic?.legend) {
       const legend = new vscode.SemanticTokensLegend(
@@ -278,11 +352,42 @@ class LanguageServerConnection {
         return diagnostic;
       });
       this.diagnostics.set(uri, items);
+      this.publishedDiagnostics.set(uri.toString(), items);
+      this.renderInlineDiagnostics(uri, items);
       return;
     }
 
     if (message.method === "window/logMessage") {
       this.output.appendLine(message.params.message);
+    }
+  }
+
+  renderAllInlineDiagnostics() {
+    for (const editor of vscode.window.visibleTextEditors) {
+      const items = this.publishedDiagnostics.get(editor.document.uri.toString()) ?? [];
+      this.renderInlineDiagnostics(editor.document.uri, items);
+    }
+  }
+
+  renderInlineDiagnostics(uri, diagnostics) {
+    const enabled = vscode.workspace
+      .getConfiguration("orviscript")
+      .get("diagnostics.inlineMessages", true);
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.uri.toString() !== uri.toString()) continue;
+      if (!enabled) {
+        editor.setDecorations(this.inlineDiagnostics, []);
+        continue;
+      }
+      const decorations = inlineDiagnosticEntries(diagnostics, enabled).map((entry) => {
+        const lineNumber = Math.min(entry.line, editor.document.lineCount - 1);
+        const end = editor.document.lineAt(lineNumber).range.end;
+        return {
+          range: new vscode.Range(end, end),
+          renderOptions: { after: { contentText: entry.text } },
+        };
+      });
+      editor.setDecorations(this.inlineDiagnostics, decorations);
     }
   }
 
@@ -342,6 +447,33 @@ function documentPosition(document, position) {
     textDocument: { uri: document.uri.toString() },
     position: { line: position.line, character: position.character },
   };
+}
+
+function asProtocolRange(range) {
+  return {
+    start: { line: range.start.line, character: range.start.character },
+    end: { line: range.end.line, character: range.end.character },
+  };
+}
+
+function asProtocolDiagnostic(diagnostic) {
+  return {
+    range: asProtocolRange(diagnostic.range),
+    severity: diagnostic.severity === undefined ? undefined : diagnostic.severity + 1,
+    code: diagnostic.code,
+    source: diagnostic.source,
+    message: diagnostic.message,
+  };
+}
+
+function asWorkspaceEdit(response) {
+  const edit = new vscode.WorkspaceEdit();
+  for (const [uri, changes] of Object.entries(response?.changes ?? {})) {
+    for (const change of changes) {
+      edit.replace(vscode.Uri.parse(uri), asRange(change.range), change.newText);
+    }
+  }
+  return edit;
 }
 
 function completionKind(kind) {

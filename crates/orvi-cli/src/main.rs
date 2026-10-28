@@ -8,7 +8,10 @@ use std::process::ExitCode;
 use orvi_project::{Project, add_path_dependency, remove_dependency, resolve_import};
 use orvi_runtime::{ExecutionContext, TaskStatus, execute_file, execute_tasks};
 use orvi_sema::analyze_program_with_modules;
-use orvi_syntax::{Program, Span, StatementKind, format_source, line_column, parse};
+use orvi_syntax::{
+    Program, RuleDiagnostic, RuleSeverity, Span, StatementKind, compiled_diagnostic_rules,
+    diagnostic_rules_hash, format_source, line_column, parse,
+};
 
 const HELP: &str = "OrviScript
 
@@ -30,6 +33,10 @@ Commands:
   fmt <FILE>    Format an OrviScript program in place
   fmt --check <FILE>
                 Check whether an OrviScript program is formatted
+  diagnostics export <FILE>
+                Export the diagnostic rules compiled into this executable
+  diagnostics hash
+                Print the compiled diagnostic rules catalog hash
   task link <ALIAS> <FILE>
                 Link an alias to an OrviScript task file
   task list     List linked task aliases
@@ -72,6 +79,8 @@ enum Command {
         path: PathBuf,
         check: bool,
     },
+    ExportDiagnosticRules(PathBuf),
+    DiagnosticRulesHash,
 }
 
 fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
@@ -143,6 +152,15 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
                 path: PathBuf::from(path),
             })
         }
+        [command, action, path] if command == "diagnostics" && action == "export" => {
+            Ok(Command::ExportDiagnosticRules(PathBuf::from(path)))
+        }
+        [command, action] if command == "diagnostics" && action == "hash" => {
+            Ok(Command::DiagnosticRulesHash)
+        }
+        [command, action] if command == "diagnostics" && action == "export" => {
+            Err("command 'diagnostics export' requires an output file".into())
+        }
         [command, option] if command == "fmt" && option == "--check" => {
             Err("command 'fmt --check' requires a file".into())
         }
@@ -187,11 +205,42 @@ fn main() -> ExitCode {
         Ok(Command::TaskRun(alias)) => task_run(&alias),
         Ok(Command::TaskUnlink(alias)) => task_unlink(&alias),
         Ok(Command::Format { path, check }) => format_file(&path, check),
+        Ok(Command::ExportDiagnosticRules(path)) => export_diagnostic_rules(&path),
+        Ok(Command::DiagnosticRulesHash) => {
+            println!("{}", diagnostic_rules_hash());
+            ExitCode::SUCCESS
+        }
         Err(message) => {
             eprintln!("error: {message}\n\nFor usage information, try 'orviscript --help'.");
             ExitCode::from(2)
         }
     }
+}
+
+fn export_diagnostic_rules(path: &Path) -> ExitCode {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "error: could not create diagnostic rules directory '{}': {error}",
+            parent.display()
+        );
+        return ExitCode::from(1);
+    }
+    if let Err(error) = fs::write(path, compiled_diagnostic_rules()) {
+        eprintln!(
+            "error: could not export diagnostic rules to '{}': {error}",
+            path.display()
+        );
+        return ExitCode::from(1);
+    }
+    println!(
+        "Exported diagnostic rules {} to {}",
+        diagnostic_rules_hash(),
+        path.display()
+    );
+    ExitCode::SUCCESS
 }
 
 fn with_source_target(target: Option<PathBuf>, operation: fn(&Path) -> ExitCode) -> ExitCode {
@@ -954,10 +1003,44 @@ fn report_syntax_errors(path: &Path, source: &str, parsed: &orvi_syntax::Parsed)
     for error in &parsed.lexical_errors {
         report_error(path, source, error.span, &error.to_string());
     }
+    for diagnostic in &parsed.rule_diagnostics {
+        report_rule_diagnostic(path, source, diagnostic);
+    }
     for error in &parsed.parse_errors {
-        report_error(path, source, error.span, &error.message);
+        if !parsed.rule_diagnostics.iter().any(|diagnostic| {
+            diagnostic.span == error.span && diagnostic.severity == RuleSeverity::Error
+        }) {
+            report_error(path, source, error.span, &error.message);
+        }
     }
     parsed.has_errors()
+}
+
+fn report_rule_diagnostic(path: &Path, source: &str, diagnostic: &RuleDiagnostic) {
+    let position = line_column(source, diagnostic.span.start())
+        .unwrap_or(orvi_syntax::LineColumn { line: 1, column: 1 });
+    let severity = match diagnostic.severity {
+        RuleSeverity::Error => "error",
+        RuleSeverity::Warning => "warning",
+        RuleSeverity::Information => "information",
+        RuleSeverity::Hint => "hint",
+    };
+    eprintln!(
+        "{}:{}:{}: {severity}[{}]: {}",
+        path.display(),
+        position.line,
+        position.column,
+        diagnostic.id,
+        diagnostic.message
+    );
+    if let Some(line) = source.lines().nth(position.line.saturating_sub(1)) {
+        eprintln!("  {line}");
+        eprintln!("  {}^", " ".repeat(position.column.saturating_sub(1)));
+    }
+    if let Some(replacement) = diagnostic.replacement {
+        let original = diagnostic.span.text(source).unwrap_or_default();
+        eprintln!("  help: replace '{original}' with '{replacement}'");
+    }
 }
 
 fn report_semantic_errors(path: &Path, source: &str, program: &orvi_syntax::Program) -> bool {
@@ -1107,6 +1190,22 @@ mod tests {
                 path: PathBuf::from("app.orvi"),
                 check: true,
             })
+        );
+    }
+
+    #[test]
+    fn parses_diagnostic_catalog_commands() {
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("diagnostics"),
+                OsString::from("export"),
+                OsString::from("rules.json"),
+            ]),
+            Ok(Command::ExportDiagnosticRules(PathBuf::from("rules.json")))
+        );
+        assert_eq!(
+            parse_arguments(&[OsString::from("diagnostics"), OsString::from("hash")]),
+            Ok(Command::DiagnosticRulesHash)
         );
     }
     #[test]

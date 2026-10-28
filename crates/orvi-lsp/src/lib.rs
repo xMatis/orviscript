@@ -8,17 +8,22 @@ use orvi_sema::{
     Analysis, STANDARD_MODULES, StandardMember, SymbolOccurrence, analyze_program,
     analyze_program_with_modules, standard_module,
 };
-use orvi_syntax::{Program, Span, Statement, StatementKind, TokenKind, format_source, lex, parse};
+use orvi_syntax::{
+    Program, RuleDiagnostic, RuleSeverity, Span, Statement, StatementKind, TokenKind,
+    format_source, lex, parse,
+};
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType, OneOf,
-    Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams,
-    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    InitializedParams, InsertTextFormat, Location, MarkupContent, MarkupKind, MessageType,
+    NumberOrString, OneOf, Position, PrepareRenameResponse, Range, ReferenceParams, RenameOptions,
+    RenameParams, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensResult, ServerCapabilities, ServerInfo, SymbolKind as LspSymbolKind,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
@@ -32,6 +37,54 @@ const SERVER_NAME: &str = "orvi-lsp";
 pub struct Backend {
     client: Client,
     documents: RwLock<HashMap<String, String>>,
+    diagnostic_settings: RwLock<DiagnosticSettings>,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticSettings {
+    enabled_categories: HashSet<String>,
+    minimum_severity: RuleSeverity,
+}
+
+impl Default for DiagnosticSettings {
+    fn default() -> Self {
+        Self {
+            enabled_categories: HashSet::new(),
+            minimum_severity: RuleSeverity::Hint,
+        }
+    }
+}
+
+impl DiagnosticSettings {
+    fn from_value(value: &serde_json::Value) -> Self {
+        let diagnostics = value.get("diagnostics").unwrap_or(value);
+        let enabled_categories = diagnostics
+            .get("enabledCategories")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let minimum_severity = match diagnostics
+            .get("minimumSeverity")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("error") => RuleSeverity::Error,
+            Some("warning") => RuleSeverity::Warning,
+            Some("information") => RuleSeverity::Information,
+            _ => RuleSeverity::Hint,
+        };
+        Self {
+            enabled_categories,
+            minimum_severity,
+        }
+    }
+
+    fn allows(&self, rule: &RuleDiagnostic) -> bool {
+        (self.enabled_categories.is_empty() || self.enabled_categories.contains(rule.category))
+            && severity_rank(rule.severity) <= severity_rank(self.minimum_severity)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +99,7 @@ impl Backend {
         Self {
             client,
             documents: RwLock::new(HashMap::new()),
+            diagnostic_settings: RwLock::new(DiagnosticSettings::default()),
         }
     }
 
@@ -60,7 +114,13 @@ impl Backend {
             .to_file_path()
             .map(|path| imported_programs(path.as_ref(), source, &project_documents))
             .unwrap_or_default();
-        let mut current_diagnostics = diagnostics_with_modules(source, &modules);
+        let settings = self
+            .diagnostic_settings
+            .read()
+            .expect("diagnostic settings lock poisoned")
+            .clone();
+        let mut current_diagnostics =
+            diagnostics_with_modules_and_settings(source, &modules, &settings);
         if let Some(path) = uri.to_file_path() {
             let documents = self.documents.read().expect("document store lock poisoned");
             current_diagnostics.extend(import_diagnostics(path.as_ref(), source, &documents));
@@ -117,7 +177,14 @@ impl Backend {
 }
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if let Some(options) = params.initialization_options.as_ref() {
+            *self
+                .diagnostic_settings
+                .write()
+                .expect("diagnostic settings lock poisoned") =
+                DiagnosticSettings::from_value(options);
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -137,6 +204,7 @@ impl LanguageServer for Backend {
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -182,6 +250,24 @@ impl LanguageServer for Backend {
             .await;
         self.republish_other_open_project_documents(&document.uri)
             .await;
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        *self
+            .diagnostic_settings
+            .write()
+            .expect("diagnostic settings lock poisoned") =
+            DiagnosticSettings::from_value(&params.settings);
+        let documents = self
+            .documents
+            .read()
+            .expect("document store lock poisoned")
+            .iter()
+            .filter_map(|(uri, source)| Some((uri.parse::<Uri>().ok()?, source.clone())))
+            .collect::<Vec<_>>();
+        for (uri, source) in documents {
+            self.publish(uri, &source, None).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -271,6 +357,23 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(format_document(&source).map(|edit| vec![edit]))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let Some(source) = self.document(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let settings = self
+            .diagnostic_settings
+            .read()
+            .expect("diagnostic settings lock poisoned")
+            .clone();
+        Ok(Some(code_actions_with_settings(
+            params.text_document.uri,
+            &source,
+            params.range,
+            &settings,
+        )))
     }
 
     async fn document_symbol(
@@ -992,6 +1095,14 @@ pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
 }
 
 fn diagnostics_with_modules(source: &str, modules: &HashMap<String, Program>) -> Vec<Diagnostic> {
+    diagnostics_with_modules_and_settings(source, modules, &DiagnosticSettings::default())
+}
+
+fn diagnostics_with_modules_and_settings(
+    source: &str,
+    modules: &HashMap<String, Program>,
+    settings: &DiagnosticSettings,
+) -> Vec<Diagnostic> {
     let parsed = parse(source);
     let mut diagnostics = parsed
         .lexical_errors
@@ -1001,9 +1112,23 @@ fn diagnostics_with_modules(source: &str, modules: &HashMap<String, Program>) ->
             parsed
                 .parse_errors
                 .iter()
+                .filter(|error| {
+                    !parsed.rule_diagnostics.iter().any(|diagnostic| {
+                        settings.allows(diagnostic)
+                            && diagnostic.severity == RuleSeverity::Error
+                            && diagnostic.span == error.span
+                    })
+                })
                 .map(|error| diagnostic(source, error.span, error.message.clone())),
         )
         .collect::<Vec<_>>();
+    diagnostics.extend(
+        parsed
+            .rule_diagnostics
+            .iter()
+            .filter(|rule| settings.allows(rule))
+            .map(|rule| rule_diagnostic(source, rule)),
+    );
     if !parsed.has_errors() {
         diagnostics.extend(
             analyze_program_with_modules(&parsed.program, modules)
@@ -1013,6 +1138,56 @@ fn diagnostics_with_modules(source: &str, modules: &HashMap<String, Program>) ->
         );
     }
     diagnostics
+}
+
+#[cfg(test)]
+fn code_actions(uri: Uri, source: &str, requested: Range) -> CodeActionResponse {
+    code_actions_with_settings(uri, source, requested, &DiagnosticSettings::default())
+}
+
+fn code_actions_with_settings(
+    uri: Uri,
+    source: &str,
+    requested: Range,
+    settings: &DiagnosticSettings,
+) -> CodeActionResponse {
+    let start = offset_at_position(source, requested.start).unwrap_or(0);
+    let end = offset_at_position(source, requested.end).unwrap_or(start);
+    parse(source)
+        .rule_diagnostics
+        .into_iter()
+        .filter(|rule| settings.allows(rule))
+        .filter_map(|rule| {
+            let replacement = rule.replacement?;
+            if rule.span.end() < start || end < rule.span.start() {
+                return None;
+            }
+            let original = rule.span.text(source).unwrap_or_default();
+            let edit = TextEdit::new(span_range(source, rule.span), replacement.into());
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Replace '{original}' with '{replacement}'"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![rule_diagnostic(source, &rule)]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..WorkspaceEdit::default()
+                }),
+                is_preferred: Some(true),
+                ..CodeAction::default()
+            }))
+        })
+        .collect()
+}
+
+fn severity_rank(severity: RuleSeverity) -> u8 {
+    match severity {
+        RuleSeverity::Error => 1,
+        RuleSeverity::Warning => 2,
+        RuleSeverity::Information => 3,
+        RuleSeverity::Hint => 4,
+    }
 }
 
 fn imported_programs(
@@ -1542,6 +1717,23 @@ fn diagnostic(source: &str, span: Span, message: String) -> Diagnostic {
     }
 }
 
+fn rule_diagnostic(source: &str, rule: &RuleDiagnostic) -> Diagnostic {
+    let severity = match rule.severity {
+        RuleSeverity::Error => DiagnosticSeverity::ERROR,
+        RuleSeverity::Warning => DiagnosticSeverity::WARNING,
+        RuleSeverity::Information => DiagnosticSeverity::INFORMATION,
+        RuleSeverity::Hint => DiagnosticSeverity::HINT,
+    };
+    Diagnostic {
+        range: span_range(source, rule.span),
+        severity: Some(severity),
+        code: Some(NumberOrString::String(rule.id.into())),
+        source: Some("orviscript".into()),
+        message: rule.message.into(),
+        ..Diagnostic::default()
+    }
+}
+
 fn format_document(source: &str) -> Option<TextEdit> {
     let formatted = format_source(source).ok()?;
     Some(TextEdit::new(
@@ -1595,18 +1787,20 @@ fn offset_at_position(source: &str, position: Position) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        completion_items, diagnostics, document_symbols, format_document, hover_at,
-        import_completion_items, import_diagnostics, is_identifier, load_project_documents,
-        position, project_symbol_description, project_symbol_locations, same_path, semantic_tokens,
-        span_range, standard_completion_items, standard_hover_at, symbol_at, symbol_identity,
+        DiagnosticSettings, code_actions, code_actions_with_settings, completion_items,
+        diagnostics, diagnostics_with_modules_and_settings, document_symbols, format_document,
+        hover_at, import_completion_items, import_diagnostics, is_identifier,
+        load_project_documents, position, project_symbol_description, project_symbol_locations,
+        same_path, semantic_tokens, span_range, standard_completion_items, standard_hover_at,
+        symbol_at, symbol_identity,
     };
     use orvi_syntax::Span;
     use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower_lsp_server::ls_types::{
-        CompletionItemKind, DiagnosticSeverity, HoverContents, InsertTextFormat, Position, Range,
-        Uri,
+        CodeActionOrCommand, CompletionItemKind, DiagnosticSeverity, HoverContents,
+        InsertTextFormat, NumberOrString, Position, Range, Uri,
     };
 
     #[test]
@@ -1622,6 +1816,57 @@ mod tests {
     #[test]
     fn accepts_valid_programs_without_diagnostics() {
         assert!(diagnostics("let answer = 42; print(answer);").is_empty());
+    }
+
+    #[test]
+    fn reports_foreign_syntax_and_builds_a_quick_fix() {
+        let source = "function greet() {}";
+        let diagnostics = diagnostics(source);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("ORVI1001".into()))
+        );
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 8))
+        );
+
+        let uri = "file:///foreign.orvi".parse::<Uri>().unwrap();
+        let actions = code_actions(
+            uri.clone(),
+            source,
+            Range::new(Position::new(0, 0), Position::new(0, 8)),
+        );
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected a code action");
+        };
+        assert_eq!(action.title, "Replace 'function' with 'fn'");
+        let edit = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&uri][0];
+        assert_eq!(edit.new_text, "fn");
+        assert_eq!(edit.range, diagnostics[0].range);
+    }
+
+    #[test]
+    fn filters_rule_diagnostics_and_actions_by_lsp_settings() {
+        let source = "function greet() {}";
+        let settings = DiagnosticSettings::from_value(&serde_json::json!({
+            "diagnostics": {
+                "enabledCategories": ["another_category"],
+                "minimumSeverity": "hint"
+            }
+        }));
+        let diagnostics = diagnostics_with_modules_and_settings(source, &HashMap::new(), &settings);
+        assert!(diagnostics.is_empty());
+
+        let uri = "file:///foreign.orvi".parse::<Uri>().unwrap();
+        let actions = code_actions_with_settings(
+            uri,
+            source,
+            Range::new(Position::new(0, 0), Position::new(0, 8)),
+            &settings,
+        );
+        assert!(actions.is_empty());
     }
 
     #[test]

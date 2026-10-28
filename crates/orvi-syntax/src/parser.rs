@@ -2,8 +2,9 @@ use std::fmt;
 
 use crate::{
     BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, MatchArm, Parameter,
-    Pattern, PatternKind, Program, Span, Statement, StatementKind, StructField, Token, TokenKind,
-    TypeAnnotation, UnaryOperator, lex,
+    Pattern, PatternKind, Program, RuleDiagnostic, Span, Statement, StatementKind, StructField,
+    Token, TokenKind, TypeAnnotation, UnaryOperator, diagnostic_rules::rule_diagnostics_for_tokens,
+    lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,11 +24,17 @@ pub struct Parsed {
     pub program: Program,
     pub lexical_errors: Vec<LexError>,
     pub parse_errors: Vec<ParseError>,
+    pub rule_diagnostics: Vec<RuleDiagnostic>,
 }
 
 impl Parsed {
     pub fn has_errors(&self) -> bool {
-        !self.lexical_errors.is_empty() || !self.parse_errors.is_empty()
+        !self.lexical_errors.is_empty()
+            || !self.parse_errors.is_empty()
+            || self
+                .rule_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == crate::RuleSeverity::Error)
     }
 }
 
@@ -37,7 +44,8 @@ pub fn parse(source: &str) -> Parsed {
         .tokens
         .into_iter()
         .filter(|token| !token.kind.is_trivia())
-        .collect();
+        .collect::<Vec<_>>();
+    let rule_diagnostics = rule_diagnostics_for_tokens(source, &tokens);
     let mut parser = Parser {
         source,
         tokens,
@@ -49,6 +57,7 @@ pub fn parse(source: &str) -> Parsed {
         program,
         lexical_errors: lexed.errors,
         parse_errors: parser.errors,
+        rule_diagnostics,
     }
 }
 

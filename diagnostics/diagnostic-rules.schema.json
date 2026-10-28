@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orviscript.dev/schemas/diagnostic-rules.schema.json",
+  "title": "OrviScript diagnostic rules",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "rules"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "includes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "default": []
+    },
+    "rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "match",
+        "message",
+        "replacement",
+        "severity",
+        "quickFix",
+        "priority"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^ORVI[0-9]{4}$" },
+        "category": { "type": "string", "minLength": 1 },
+        "match": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token", "context"],
+          "properties": {
+            "token": { "type": "string", "minLength": 1 },
+            "context": {
+              "enum": [
+                "function_declaration",
+                "variable_declaration",
+                "condition",
+                "loop",
+                "type_position",
+                "import",
+                "return",
+                "expression"
+              ]
+            }
+          }
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "replacement": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["error", "warning", "information", "hint"] },
+        "quickFix": { "type": "boolean" },
+        "priority": { "type": "integer", "minimum": -10000, "maximum": 10000 },
+        "sourceLanguages": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        }
+      }
+    }
+  }
+}

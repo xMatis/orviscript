@@ -28,6 +28,14 @@ Measure the parser, semantic analyzer, runtime startup and interpreter separatel
 cargo bench -p orvi-runtime --bench pipeline_breakdown
 ```
 
+Measure compiled diagnostic lookup with a synthetic 1,000-rule catalog and a 10,000-line source file:
+
+```powershell
+cargo bench -p orvi-syntax --bench diagnostic_rules
+```
+
+The benchmark reports indexed missing/matching lookup and the production token scan separately. The production engine uses generated token buckets, so unrelated catalog entries are not scanned for each source token.
+
 Use the `profiling` Cargo profile when collecting CPU profiles. It keeps debug symbols while retaining release optimizations:
 
 ```powershell
