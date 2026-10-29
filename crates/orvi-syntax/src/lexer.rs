@@ -323,6 +323,8 @@ fn keyword_kind(identifier: &str) -> Option<TokenKind> {
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
+        "for" => TokenKind::For,
+        "in" => TokenKind::In,
         "return" => TokenKind::Return,
         "match" => TokenKind::Match,
         "async" => TokenKind::Async,

@@ -44,6 +44,15 @@ fn evaluates_variables_and_arithmetic() {
 }
 
 #[test]
+fn iterates_lists_and_integer_ranges_in_the_tree_interpreter() {
+    let output = run(
+        "let total = 0; defer print(\"done\"); for value in [2, 3, 5] { total = total + value; } for index in 1..=3 { total = total + index; } for ignored in 5..2 { total = total + ignored; } for edge in 9223372036854775807..=9223372036854775807 { total = total + 1; } print(total); let values = [1, 2]; let snapshot_total = 0; for value in values { values[1] = 9; snapshot_total = snapshot_total + value; } print(snapshot_total);",
+    )
+    .expect("for loops run");
+    assert_eq!(output, ["17", "3", "done"]);
+}
+
+#[test]
 fn runs_isolated_workers_and_transfers_values_and_output() {
     let source = r#"
         async fn main() -> Result<void, string> {

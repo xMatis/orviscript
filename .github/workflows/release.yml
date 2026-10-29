@@ -55,6 +55,15 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} --bin orviscript --bin orvi-lsp
 
+      - name: Smoke-test standalone bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'print(6 * 7);\n' > standalone-smoke.orvi
+          runtime="target/${{ matrix.target }}/release/orviscript"
+          "$runtime" build standalone-smoke.orvi --output standalone-smoke
+          test "$(./standalone-smoke)" = "42"
+
       - name: Package archive and checksum
         shell: bash
         run: |
@@ -104,6 +113,15 @@ jobs:
         run: |
           $staged = ./scripts/release/Stage-Windows.ps1 -OutputDirectory "$PWD/artifacts/stage"
           "source=$($staged.SourceDirectory)" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke-test standalone bundle
+        shell: pwsh
+        run: |
+          Set-Content -Path standalone-smoke.orvi -Value "print(6 * 7);"
+          & "artifacts/stage/orviscript.exe" build standalone-smoke.orvi --output standalone-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Standalone build failed." }
+          $output = & ./standalone-smoke.exe
+          if ($LASTEXITCODE -ne 0 -or $output -ne "42") { throw "Standalone bundle smoke test failed." }
 
       - name: Build installer and portable archive
         shell: pwsh

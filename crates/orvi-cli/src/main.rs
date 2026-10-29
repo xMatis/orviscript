@@ -5,8 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod bundle;
+
 use orvi_project::{Project, add_path_dependency, remove_dependency, resolve_import};
-use orvi_runtime::{ExecutionContext, TaskStatus, execute_file, execute_tasks};
+use orvi_runtime::{
+    ExecutionContext, TaskStatus, execute_file, execute_tasks, execute_with_context,
+};
 use orvi_sema::analyze_program_with_modules;
 use orvi_syntax::{
     Program, RuleDiagnostic, RuleSeverity, Span, StatementKind, compiled_diagnostic_rules,
@@ -23,6 +27,10 @@ Commands:
                 Create a new OrviScript project (defaults to the current directory)
   run [FILE]    Run a file or the current project's entry
   check [FILE]  Check a file or the current project's entry
+  build [FILE] --output <PATH> [--force]
+                Build a standalone single-file executable
+  inspect <BUNDLE>
+                Inspect standalone bundle metadata without executing it
   test [FILE] [--filter TEXT] [--list]
                 Run, filter or list test_ tasks (all project files by default)
   add <NAME> --path <DIRECTORY>
@@ -56,6 +64,12 @@ enum Command {
     Init(PathBuf),
     Run(Option<PathBuf>),
     Check(Option<PathBuf>),
+    Build {
+        path: Option<PathBuf>,
+        output: PathBuf,
+        force: bool,
+    },
+    Inspect(PathBuf),
     Test {
         path: Option<PathBuf>,
         filter: Option<String>,
@@ -92,6 +106,47 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
         [command, path] if command == "init" => Ok(Command::Init(PathBuf::from(path))),
         [command] if command == "run" => Ok(Command::Run(None)),
         [command] if command == "check" => Ok(Command::Check(None)),
+        [command, output_option, output]
+            if command == "build" && (output_option == "--output" || output_option == "-o") =>
+        {
+            Ok(Command::Build {
+                path: None,
+                output: PathBuf::from(output),
+                force: false,
+            })
+        }
+        [command, output_option, output, force]
+            if command == "build"
+                && (output_option == "--output" || output_option == "-o")
+                && force == "--force" =>
+        {
+            Ok(Command::Build {
+                path: None,
+                output: PathBuf::from(output),
+                force: true,
+            })
+        }
+        [command, path, output_option, output]
+            if command == "build" && (output_option == "--output" || output_option == "-o") =>
+        {
+            Ok(Command::Build {
+                path: Some(PathBuf::from(path)),
+                output: PathBuf::from(output),
+                force: false,
+            })
+        }
+        [command, path, output_option, output, force]
+            if command == "build"
+                && (output_option == "--output" || output_option == "-o")
+                && force == "--force" =>
+        {
+            Ok(Command::Build {
+                path: Some(PathBuf::from(path)),
+                output: PathBuf::from(output),
+                force: true,
+            })
+        }
+        [command, path] if command == "inspect" => Ok(Command::Inspect(PathBuf::from(path))),
         [command] if command == "test" => Ok(Command::Test {
             path: None,
             filter: None,
@@ -182,6 +237,9 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
 }
 
 fn main() -> ExitCode {
+    if let Some(exit) = run_embedded_bundle() {
+        return exit;
+    }
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     match parse_arguments(&args) {
         Ok(Command::Help) => {
@@ -194,6 +252,12 @@ fn main() -> ExitCode {
         }
         Ok(Command::Init(path)) => init_project(&path),
         Ok(Command::Check(path)) => with_source_target(path, check_file),
+        Ok(Command::Build {
+            path,
+            output,
+            force,
+        }) => build_bundle(path, &output, force),
+        Ok(Command::Inspect(path)) => inspect_bundle(&path),
         Ok(Command::Run(path)) => with_source_target(path, run_file),
         Ok(Command::Test { path, filter, list }) => test_command(path, filter.as_deref(), list),
         Ok(Command::Add { name, path }) => add_dependency(&name, &path),
@@ -243,24 +307,176 @@ fn export_diagnostic_rules(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn with_source_target(target: Option<PathBuf>, operation: fn(&Path) -> ExitCode) -> ExitCode {
-    let path = match target {
-        Some(path) => path,
-        None => {
-            let current = match env::current_dir() {
-                Ok(current) => current,
-                Err(error) => {
-                    eprintln!("error: could not determine current directory: {error}");
-                    return ExitCode::from(1);
-                }
-            };
-            match Project::discover(&current).and_then(|project| project.existing_entry_path()) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return ExitCode::from(1);
-                }
+fn run_embedded_bundle() -> Option<ExitCode> {
+    let executable = env::current_exe().ok()?;
+    let bundled = match bundle::read_current() {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("error: invalid OrviScript bundle: {error}");
+            return Some(ExitCode::from(1));
+        }
+    };
+    let parsed = parse(&bundled.source);
+    if report_syntax_errors(&executable, &bundled.source, &parsed)
+        || report_semantic_errors(&executable, &bundled.source, &parsed.program)
+    {
+        return Some(ExitCode::from(1));
+    }
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let context = ExecutionContext {
+        cwd: cwd.clone(),
+        project_dir: cwd.clone(),
+        script_dir: cwd,
+    };
+    Some(match execute_with_context(&parsed.program, context) {
+        Ok(execution) => {
+            for line in execution.output {
+                println!("{line}");
             }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            report_error(&executable, &bundled.source, error.span, &error.message);
+            ExitCode::from(1)
+        }
+    })
+}
+
+fn build_bundle(target: Option<PathBuf>, output: &Path, force: bool) -> ExitCode {
+    let path = match resolve_source_target(target) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some((source, parsed)) = load_and_parse(&path) else {
+        return ExitCode::from(1);
+    };
+    if report_syntax_errors(&path, &source, &parsed)
+        || report_semantic_errors(&path, &source, &parsed.program)
+    {
+        return ExitCode::from(1);
+    }
+    let unsupported_imports = parsed
+        .program
+        .statements
+        .iter()
+        .filter_map(|statement| {
+            let StatementKind::Import {
+                source: import_source,
+                ..
+            } = &statement.kind
+            else {
+                return None;
+            };
+            (!import_source.starts_with("std:")).then_some((import_source, statement.span))
+        })
+        .collect::<Vec<_>>();
+    if !unsupported_imports.is_empty() {
+        for (import_source, span) in unsupported_imports {
+            report_error(
+                &path,
+                &source,
+                span,
+                &format!(
+                    "standalone bundles do not yet support local or package import '{import_source}'"
+                ),
+            );
+        }
+        return ExitCode::from(1);
+    }
+    let runtime = match env::current_exe().and_then(|path| path.canonicalize()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not locate the OrviScript runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let output_absolute = absolute_path(output);
+    if output_absolute == runtime || path.canonicalize().ok().as_ref() == Some(&output_absolute) {
+        eprintln!(
+            "error: bundle output '{}' would overwrite an input executable or source file",
+            output.display()
+        );
+        return ExitCode::from(1);
+    }
+    match bundle::write(
+        &runtime,
+        &output_absolute,
+        &source,
+        env!("CARGO_PKG_VERSION"),
+        force,
+    ) {
+        Ok(()) => {
+            println!("Built standalone bundle: {}", output_absolute.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn inspect_bundle(path: &Path) -> ExitCode {
+    match bundle::read(path) {
+        Ok(Some(bundle)) => {
+            println!("OrviScript standalone bundle");
+            println!("format: {}", bundle.format_version);
+            println!("language: {}", bundle.language_version);
+            println!("source bytes: {}", bundle.source.len());
+            println!("sha256: {}", bundle::checksum_hex(&bundle.checksum));
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("error: '{}' is not an OrviScript bundle", path.display());
+            ExitCode::from(1)
+        }
+        Err(error) => {
+            eprintln!("error: invalid OrviScript bundle: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn resolve_source_target(target: Option<PathBuf>) -> Result<PathBuf, String> {
+    match target {
+        Some(path) => Ok(path),
+        None => {
+            let current = env::current_dir()
+                .map_err(|error| format!("could not determine current directory: {error}"))?;
+            Project::discover(&current)
+                .and_then(|project| project.existing_entry_path())
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    }
+}
+
+fn with_source_target(target: Option<PathBuf>, operation: fn(&Path) -> ExitCode) -> ExitCode {
+    let path = match resolve_source_target(target) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
         }
     };
     operation(&path)
@@ -1206,6 +1422,28 @@ mod tests {
         assert_eq!(
             parse_arguments(&[OsString::from("diagnostics"), OsString::from("hash")]),
             Ok(Command::DiagnosticRulesHash)
+        );
+    }
+
+    #[test]
+    fn parses_standalone_bundle_commands() {
+        assert_eq!(
+            parse_arguments(&[
+                OsString::from("build"),
+                OsString::from("app.orvi"),
+                OsString::from("--output"),
+                OsString::from("app.exe"),
+                OsString::from("--force"),
+            ]),
+            Ok(Command::Build {
+                path: Some(PathBuf::from("app.orvi")),
+                output: PathBuf::from("app.exe"),
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse_arguments(&[OsString::from("inspect"), OsString::from("app.exe")]),
+            Ok(Command::Inspect(PathBuf::from("app.exe")))
         );
     }
     #[test]

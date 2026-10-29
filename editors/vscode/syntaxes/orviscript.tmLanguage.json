@@ -42,7 +42,7 @@
     "keywords": {
       "patterns": [
         { "name": "keyword.declaration.orviscript", "match": "\\b(?:let|const|fn|async|struct|interface|import|export|from|task)\\b" },
-        { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|return|match|using|defer|await)\\b" }
+        { "name": "keyword.control.orviscript", "match": "\\b(?:if|else|while|for|in|return|match|using|defer|await)\\b" }
       ]
     },
     "constants": {

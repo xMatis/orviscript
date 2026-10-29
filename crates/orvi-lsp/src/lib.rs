@@ -1381,6 +1381,8 @@ fn classify_token(
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::While
+        | TokenKind::For
+        | TokenKind::In
         | TokenKind::Return
         | TokenKind::True
         | TokenKind::False
@@ -1473,6 +1475,12 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
         ("if", CompletionItemKind::KEYWORD, "conditional branch"),
         ("else", CompletionItemKind::KEYWORD, "alternative branch"),
         ("while", CompletionItemKind::KEYWORD, "loop"),
+        (
+            "for",
+            CompletionItemKind::KEYWORD,
+            "iterate over a list or integer range",
+        ),
+        ("in", CompletionItemKind::KEYWORD, "for-loop source"),
         (
             "return",
             CompletionItemKind::KEYWORD,
@@ -1630,6 +1638,8 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "if" => "`if` executes a branch when its condition is `true`.",
         "else" => "`else` provides an alternative branch.",
         "while" => "`while` repeats a block while its condition is `true`.",
+        "for" => "`for name in source` iterates over a list or integer range.",
+        "in" => "`in` separates a for-loop variable from its list or integer range.",
         "return" => "`return` exits the current function.",
         "true" | "false" => "Built-in boolean value.",
         "null" => "Built-in null value.",
@@ -1924,6 +1934,7 @@ mod tests {
         let items = completion_items(None);
 
         assert!(items.iter().any(|item| item.label == "let"));
+        assert!(items.iter().any(|item| item.label == "for"));
         assert!(items.iter().any(|item| {
             item.label == "print" && item.kind == Some(CompletionItemKind::FUNCTION)
         }));

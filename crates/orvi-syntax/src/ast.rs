@@ -111,6 +111,11 @@ pub enum StatementKind {
         condition: Expression,
         body: Box<Statement>,
     },
+    For {
+        name: Identifier,
+        source: ForSource,
+        body: Box<Statement>,
+    },
     Return(Option<Expression>),
     Defer(Expression),
     Using {
@@ -119,6 +124,16 @@ pub enum StatementKind {
         cleanup: Expression,
     },
     Expression(Expression),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForSource {
+    Iterable(Expression),
+    Range {
+        start: Expression,
+        end: Expression,
+        inclusive: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

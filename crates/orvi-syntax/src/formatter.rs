@@ -190,7 +190,10 @@ impl Formatter {
             self.pending_space = true;
         }
         self.previous = Some(kind);
-        if !matches!(kind, TokenKind::Comma | TokenKind::Colon) {
+        if !matches!(
+            kind,
+            TokenKind::Comma | TokenKind::Colon | TokenKind::RightBrace
+        ) {
             self.pending_newline = false;
         }
         if !self.is_spaced_operator(kind)
@@ -293,6 +296,8 @@ fn is_word(kind: TokenKind) -> bool {
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
             | TokenKind::Return
             | TokenKind::Match
             | TokenKind::Using
@@ -354,6 +359,17 @@ mod tests {
         assert_eq!(
             formatted,
             "async fn fetch(url: string) -> Result<string, string> {\n    return await http.get_async(url)\n}\n"
+        );
+    }
+
+    #[test]
+    fn formats_for_loops_and_ranges() {
+        let formatted =
+            format_source("for value in [1,2]{print(value)} for index in 0..=3{print(index)}")
+                .expect("for loops format");
+        assert_eq!(
+            formatted,
+            "for value in [1, 2] {\n    print(value)\n}\nfor index in 0..=3 {\n    print(index)\n}\n"
         );
     }
 

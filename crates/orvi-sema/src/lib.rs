@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, Literal, Parameter, PatternKind,
-    Program, Span, Statement, StatementKind, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, ForSource, Identifier, Literal, Parameter,
+    PatternKind, Program, Span, Statement, StatementKind, TypeAnnotation, UnaryOperator,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1131,6 +1131,45 @@ impl Analyzer {
                 let condition_type = self.expression(condition);
                 self.require_assignable(&StaticType::Bool, &condition_type, condition.span);
                 self.statement(body);
+            }
+            StatementKind::For { name, source, body } => {
+                let value_type = match source {
+                    ForSource::Iterable(iterable) => match self.expression(iterable) {
+                        StaticType::List(element) => *element,
+                        StaticType::Dynamic => StaticType::Dynamic,
+                        actual => {
+                            self.errors.push(SemanticError {
+                                kind: SemanticErrorKind::TypeMismatch,
+                                message: format!(
+                                    "for expects list<T>, received {}",
+                                    actual.display_name()
+                                ),
+                                span: iterable.span,
+                            });
+                            StaticType::Dynamic
+                        }
+                    },
+                    ForSource::Range { start, end, .. } => {
+                        let start_type = self.expression(start);
+                        let end_type = self.expression(end);
+                        self.require_assignable(&StaticType::Int, &start_type, start.span);
+                        self.require_assignable(&StaticType::Int, &end_type, end.span);
+                        StaticType::Int
+                    }
+                };
+                self.scopes.push(HashMap::new());
+                self.declare(
+                    name,
+                    Symbol {
+                        kind: SymbolKind::Constant,
+                        mutable: false,
+                        arity: None,
+                        definition: Some(name.span),
+                        value_type,
+                    },
+                );
+                self.statement(body);
+                self.scopes.pop();
             }
             StatementKind::Return(value) => {
                 if self.function_depth == 0 {
@@ -2301,6 +2340,25 @@ mod tests {
         assert!(
             errors("fn add(a, b) { return a + b; } let result = add(1, 2); print(result);")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn checks_for_loop_sources_and_loop_variable_types() {
+        assert!(
+            errors(
+                "let values: list<int> = [1, 2]; for value in values { let typed: int = value; } for index in 0..=2 { let typed: int = index; }"
+            )
+            .is_empty()
+        );
+        let errors =
+            errors("for value in 42 { print(value); } for index in 0..\"bad\" { print(index); }");
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.kind == SemanticErrorKind::TypeMismatch)
+                .count(),
+            2
         );
     }
 

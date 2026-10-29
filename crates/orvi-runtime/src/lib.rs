@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_recursion::async_recursion;
 use orvi_project::resolve_import;
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Literal, Parameter, PatternKind, Program, Span,
-    Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, ForSource, Literal, Parameter, PatternKind,
+    Program, Span, Statement, StatementKind, StructField, TypeAnnotation, UnaryOperator,
 };
 
 mod bytecode;
@@ -1200,6 +1200,48 @@ impl Interpreter {
                         break;
                     }
                     if let returned @ Control::Return(_) = self.execute_statement(body).await? {
+                        return Ok(returned);
+                    }
+                }
+                Ok(Control::Continue(Value::Null))
+            }
+            StatementKind::For { name, source, body } => {
+                let values: Box<dyn Iterator<Item = Value>> = match source {
+                    ForSource::Iterable(iterable) => {
+                        let value = self.evaluate(iterable).await?;
+                        let Value::List(values) = value else {
+                            return Err(self.error("for expects a list", iterable.span));
+                        };
+                        Box::new(values.borrow().clone().into_iter())
+                    }
+                    ForSource::Range {
+                        start,
+                        end,
+                        inclusive,
+                    } => {
+                        let start_value = self.evaluate(start).await?;
+                        let end_value = self.evaluate(end).await?;
+                        let Value::Integer(start_value) = start_value else {
+                            return Err(self.error("range start must be int", start.span));
+                        };
+                        let Value::Integer(end_value) = end_value else {
+                            return Err(self.error("range end must be int", end.span));
+                        };
+                        if *inclusive {
+                            Box::new((start_value..=end_value).map(Value::Integer))
+                        } else {
+                            Box::new((start_value..end_value).map(Value::Integer))
+                        }
+                    }
+                };
+                let outer = self.environment.clone();
+                for value in values {
+                    let environment = self.child_environment(outer.clone());
+                    environment.define(name.name.clone(), value, false, None);
+                    let previous = std::mem::replace(&mut self.environment, environment);
+                    let result = self.execute_statement(body).await;
+                    self.environment = previous;
+                    if let returned @ Control::Return(_) = result? {
                         return Ok(returned);
                     }
                 }

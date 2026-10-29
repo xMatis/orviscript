@@ -130,7 +130,7 @@ fn explains_foreign_syntax_with_a_structured_fix() {
     fs::remove_file(path).expect("temporary source can be removed");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error[ORVI1001]: Unknown syntax. Did you mean 'fn'?"));
+    assert!(stderr.contains("error[ORVI1001]: Unknown function declaration. Did you mean 'fn'?"));
     assert!(stderr.contains("help: replace 'function' with 'fn'"));
 }
 
@@ -158,6 +158,128 @@ fn exports_the_compiled_diagnostic_catalog() {
     assert!(exported.contains("\"includes\": []"));
     assert!(exported.contains("\"catalogHash\":"));
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn builds_inspects_and_runs_a_standalone_bundle() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!("orviscript-bundle-{id}"));
+    fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("main.orvi");
+    fs::write(&source, "print(6 * 7);").unwrap();
+    let executable = directory.join(if cfg!(windows) {
+        "answer.exe"
+    } else {
+        "answer"
+    });
+    let source_text = source.to_str().unwrap();
+    let executable_text = executable.to_str().unwrap();
+
+    let built = run(&["build", source_text, "--output", executable_text]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    fs::remove_file(&source).unwrap();
+
+    let inspected = run(&["inspect", executable_text]);
+    assert!(inspected.status.success());
+    let metadata = String::from_utf8_lossy(&inspected.stdout);
+    assert!(metadata.contains("format: 1"));
+    assert!(metadata.contains("language: 0.10.0"));
+    assert!(metadata.contains("sha256:"));
+
+    let executed = Command::new(&executable)
+        .arg("ignored-by-bundle-for-now")
+        .output()
+        .expect("standalone executable starts");
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&executed.stdout).trim(), "42");
+
+    fs::write(&source, "print(7);").unwrap();
+    let refused = run(&["build", source_text, "--output", executable_text]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn standalone_build_rejects_local_imports() {
+    let path = source_file("import { value } from \"./module.orvi\"; print(value);");
+    let output = path.with_extension(if cfg!(windows) { "exe" } else { "bin" });
+    let built = run(&[
+        "build",
+        path.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(built.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&built.stderr)
+            .contains("standalone bundles do not yet support local or package import")
+    );
+    assert!(!output.exists());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn standalone_bundle_supports_standard_library_imports() {
+    let path = source_file("import { stringify } from \"std:json\"; print(stringify([1, 2, 3]));");
+    let output = path.with_extension(if cfg!(windows) { "exe" } else { "bin" });
+    let built = run(&[
+        "build",
+        path.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let executed = Command::new(&output).output().unwrap();
+    assert!(executed.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&executed.stdout).trim(),
+        "Ok([1,2,3])"
+    );
+    fs::remove_file(path).unwrap();
+    fs::remove_file(output).unwrap();
+}
+
+#[test]
+fn standalone_build_uses_the_current_project_entry() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is valid")
+        .as_nanos();
+    let project = std::env::temp_dir().join(format!("orviscript-bundle-project-{id}"));
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("orvi.toml"),
+        "[project]\nname = \"bundle-project\"\nversion = \"0.1.0\"\nentry = \"src/main.orvi\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/main.orvi"), "print(21 * 2);").unwrap();
+    let output = project.join(if cfg!(windows) { "tool.exe" } else { "tool" });
+    let built = run_in(&["build", "--output", output.to_str().unwrap()], &project);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let executed = Command::new(&output).output().unwrap();
+    assert!(executed.status.success());
+    assert_eq!(String::from_utf8_lossy(&executed.stdout).trim(), "42");
+    fs::remove_dir_all(project).unwrap();
 }
 
 #[test]

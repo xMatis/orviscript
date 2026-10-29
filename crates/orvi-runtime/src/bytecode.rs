@@ -4,8 +4,8 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use orvi_syntax::{
-    BinaryOperator, Expression, ExpressionKind, Literal, Parameter, PatternKind, Program, Span,
-    Statement, StatementKind, TypeAnnotation, UnaryOperator,
+    BinaryOperator, Expression, ExpressionKind, ForSource, Literal, Parameter, PatternKind,
+    Program, Span, Statement, StatementKind, TypeAnnotation, UnaryOperator,
 };
 
 use super::{
@@ -59,6 +59,8 @@ enum Instruction {
     Call(usize, usize, Span),
     Return,
     BuildList(usize),
+    SnapshotList(Span),
+    ListLength(Span),
     BuildMap(Vec<String>),
     Index(Span),
     SetIndex(Span),
@@ -482,6 +484,158 @@ impl Compiler {
                 self.instructions.push(Instruction::Pop);
                 self.instructions.push(Instruction::Jump(loop_start));
                 self.patch_jump(exit_jump, self.instructions.len());
+                self.instructions.push(Instruction::Push(Value::Null));
+            }
+            StatementKind::For { name, source, body } => {
+                self.scopes.push(HashMap::new());
+                let item_slot = self.slot_types.len();
+                self.slot_types.push(None);
+                let item_primitive = match source {
+                    ForSource::Range { .. } => Some(PrimitiveKind::Integer),
+                    ForSource::Iterable(_) => None,
+                };
+                self.scopes.last_mut()?.insert(
+                    name.name.clone(),
+                    Local {
+                        slot: item_slot,
+                        mutable: false,
+                        primitive: item_primitive,
+                    },
+                );
+                match source {
+                    ForSource::Range {
+                        start,
+                        end,
+                        inclusive,
+                    } => {
+                        let current_slot = item_slot;
+                        self.compile_expression(start)?;
+                        self.instructions
+                            .push(Instruction::Store(current_slot, start.span));
+                        self.instructions.push(Instruction::Pop);
+                        let end_constant = match end.kind {
+                            ExpressionKind::Literal(Literal::Integer(value)) => Some(value),
+                            _ => None,
+                        };
+                        let end_slot = if end_constant.is_none() {
+                            let slot = self.slot_types.len();
+                            self.slot_types.push(None);
+                            self.compile_expression(end)?;
+                            self.instructions.push(Instruction::Store(slot, end.span));
+                            self.instructions.push(Instruction::Pop);
+                            Some(slot)
+                        } else {
+                            None
+                        };
+
+                        let loop_start = self.instructions.len();
+                        self.instructions.push(Instruction::Load(current_slot));
+                        let comparison = if *inclusive {
+                            BinaryOperator::LessEqual
+                        } else {
+                            BinaryOperator::Less
+                        };
+                        if let Some(end_constant) = end_constant {
+                            self.instructions.push(Instruction::IntegerConstant(
+                                comparison,
+                                end_constant,
+                                statement.span,
+                            ));
+                        } else {
+                            self.instructions
+                                .push(Instruction::Load(end_slot.expect("dynamic range end slot")));
+                            self.instructions
+                                .push(Instruction::IntegerBinary(comparison, statement.span));
+                        }
+                        let exit_jump =
+                            self.emit(Instruction::JumpIfFalse(usize::MAX, statement.span));
+                        self.compile_statement(body)?;
+                        self.instructions.push(Instruction::Pop);
+                        let inclusive_end_jump = if *inclusive {
+                            self.instructions.push(Instruction::Load(current_slot));
+                            if let Some(end_constant) = end_constant {
+                                self.instructions.push(Instruction::IntegerConstant(
+                                    BinaryOperator::Equal,
+                                    end_constant,
+                                    statement.span,
+                                ));
+                            } else {
+                                self.instructions.push(Instruction::Load(
+                                    end_slot.expect("dynamic range end slot"),
+                                ));
+                                self.instructions.push(Instruction::IntegerBinary(
+                                    BinaryOperator::Equal,
+                                    statement.span,
+                                ));
+                            }
+                            Some(self.emit(Instruction::JumpIfTrue(usize::MAX, statement.span)))
+                        } else {
+                            None
+                        };
+                        self.instructions.push(Instruction::Load(current_slot));
+                        self.instructions.push(Instruction::IntegerConstant(
+                            BinaryOperator::Add,
+                            1,
+                            statement.span,
+                        ));
+                        self.instructions
+                            .push(Instruction::Store(current_slot, statement.span));
+                        self.instructions.push(Instruction::Pop);
+                        self.instructions.push(Instruction::Jump(loop_start));
+                        self.patch_jump(exit_jump, self.instructions.len());
+                        if let Some(inclusive_end_jump) = inclusive_end_jump {
+                            self.patch_jump(inclusive_end_jump, self.instructions.len());
+                        }
+                    }
+                    ForSource::Iterable(iterable) => {
+                        let collection_slot = self.slot_types.len();
+                        self.slot_types.push(None);
+                        self.compile_expression(iterable)?;
+                        self.instructions
+                            .push(Instruction::SnapshotList(iterable.span));
+                        self.instructions
+                            .push(Instruction::Store(collection_slot, iterable.span));
+                        self.instructions.push(Instruction::Pop);
+                        let index_slot = self.slot_types.len();
+                        self.slot_types.push(None);
+                        self.instructions.push(Instruction::Push(Value::Integer(0)));
+                        self.instructions
+                            .push(Instruction::Store(index_slot, iterable.span));
+                        self.instructions.push(Instruction::Pop);
+
+                        let loop_start = self.instructions.len();
+                        self.instructions.push(Instruction::Load(index_slot));
+                        self.instructions.push(Instruction::Load(collection_slot));
+                        self.instructions
+                            .push(Instruction::ListLength(iterable.span));
+                        self.instructions.push(Instruction::IntegerBinary(
+                            BinaryOperator::Less,
+                            statement.span,
+                        ));
+                        let exit_jump =
+                            self.emit(Instruction::JumpIfFalse(usize::MAX, statement.span));
+                        self.instructions.push(Instruction::Load(collection_slot));
+                        self.instructions.push(Instruction::Load(index_slot));
+                        self.instructions.push(Instruction::Index(iterable.span));
+                        self.instructions
+                            .push(Instruction::Store(item_slot, name.span));
+                        self.instructions.push(Instruction::Pop);
+                        self.compile_statement(body)?;
+                        self.instructions.push(Instruction::Pop);
+                        self.instructions.push(Instruction::Load(index_slot));
+                        self.instructions.push(Instruction::IntegerConstant(
+                            BinaryOperator::Add,
+                            1,
+                            statement.span,
+                        ));
+                        self.instructions
+                            .push(Instruction::Store(index_slot, statement.span));
+                        self.instructions.push(Instruction::Pop);
+                        self.instructions.push(Instruction::Jump(loop_start));
+                        self.patch_jump(exit_jump, self.instructions.len());
+                    }
+                }
+                self.scopes.pop();
                 self.instructions.push(Instruction::Push(Value::Null));
             }
             StatementKind::Expression(expression) => self.compile_expression(expression)?,
@@ -1276,6 +1430,24 @@ fn execute_chunk_inner(
                 heap.lists.push(Rc::downgrade(&values));
                 stack.push(Value::List(values));
             }
+            Instruction::SnapshotList(span) => {
+                let value = stack.pop().expect("verified bytecode stack");
+                let Value::List(values) = value else {
+                    return Err(error("for expects a list", *span));
+                };
+                let snapshot = Rc::new(RefCell::new(values.borrow().clone()));
+                heap.lists.push(Rc::downgrade(&snapshot));
+                stack.push(Value::List(snapshot));
+            }
+            Instruction::ListLength(span) => {
+                let value = stack.pop().expect("verified bytecode stack");
+                let Value::List(values) = value else {
+                    return Err(error("for expects a list", *span));
+                };
+                let length = i64::try_from(values.borrow().len())
+                    .map_err(|_| error("list is too large to iterate", *span))?;
+                stack.push(Value::Integer(length));
+            }
             Instruction::BuildMap(keys) => {
                 let start = stack.len() - keys.len();
                 let values = stack.split_off(start);
@@ -1656,6 +1828,21 @@ mod tests {
             "let index = 0; let total = 0; while index < 10 { let value = index; total = total + value; index = index + 1; } if total == 45 { let total = 7; print(total); } print(total);",
         );
         assert_eq!(output, ["7", "45"]);
+    }
+
+    #[test]
+    fn executes_for_loops_on_the_bytecode_fast_path() {
+        let source = "let total = 0; for value in [2, 3, 5] { total = total + value; } for index in 1..=3 { total = total + index; } for skipped in 5..2 { total = total + skipped; } for edge in 9223372036854775807..=9223372036854775807 { total = total + 1; } print(total); let values = [1, 2]; let snapshot_total = 0; for value in values { values[1] = 9; snapshot_total = snapshot_total + value; } print(snapshot_total);";
+        let parsed = parse(source);
+        assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+        let bytecode = compile(&parsed.program).expect("for loops compile to bytecode");
+        assert!(
+            bytecode
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, super::Instruction::ListLength(_)))
+        );
+        assert_eq!(execute(&bytecode).unwrap().output, ["17", "3"]);
     }
 
     #[test]

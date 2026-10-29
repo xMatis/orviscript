@@ -1,10 +1,10 @@
 use std::fmt;
 
 use crate::{
-    BinaryOperator, Expression, ExpressionKind, Identifier, LexError, Literal, MatchArm, Parameter,
-    Pattern, PatternKind, Program, RuleDiagnostic, Span, Statement, StatementKind, StructField,
-    Token, TokenKind, TypeAnnotation, UnaryOperator, diagnostic_rules::rule_diagnostics_for_tokens,
-    lex,
+    BinaryOperator, Expression, ExpressionKind, ForSource, Identifier, LexError, Literal, MatchArm,
+    Parameter, Pattern, PatternKind, Program, RuleDiagnostic, Span, Statement, StatementKind,
+    StructField, Token, TokenKind, TypeAnnotation, UnaryOperator,
+    diagnostic_rules::rule_diagnostics_for_tokens, lex,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +336,9 @@ impl Parser<'_> {
         if self.consume(TokenKind::While) {
             return self.while_statement();
         }
+        if self.consume(TokenKind::For) {
+            return self.for_statement();
+        }
         if self.consume(TokenKind::Return) {
             return self.return_statement();
         }
@@ -396,6 +399,33 @@ impl Parser<'_> {
         Ok(Statement {
             span: start.cover(body.span),
             kind: StatementKind::While { condition, body },
+        })
+    }
+
+    fn for_statement(&mut self) -> Result<Statement, ParseError> {
+        let start = self.previous().span;
+        let name = self.expect_identifier("expected loop variable after 'for'")?;
+        self.expect(TokenKind::In, "expected 'in' after loop variable")?;
+        let first = self.expression()?;
+        let source = if self.consume(TokenKind::DotDot) {
+            ForSource::Range {
+                start: first,
+                end: self.expression()?,
+                inclusive: false,
+            }
+        } else if self.consume(TokenKind::DotDotEqual) {
+            ForSource::Range {
+                start: first,
+                end: self.expression()?,
+                inclusive: true,
+            }
+        } else {
+            ForSource::Iterable(first)
+        };
+        let body = Box::new(self.statement()?);
+        Ok(Statement {
+            span: start.cover(body.span),
+            kind: StatementKind::For { name, source, body },
         })
     }
 

@@ -163,6 +163,7 @@ fn valid_replacement(replacement: &str) -> bool {
                 | "="
                 | "=>"
                 | "->"
+                | "!"
                 | "?"
         )
 }

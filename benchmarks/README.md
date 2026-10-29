@@ -48,6 +48,7 @@ Workloads:
 
 - `startup.orvi`: process and minimal-language startup cost;
 - `sync_loop.orvi`: 100,000 interpreted loop iterations;
+- `for_loop.orvi`: one million iterations through the optimized integer-range `for` path;
 - `async_10000_tasks.orvi`: the maximum 10,000 lightweight tasks in one scope;
 - `async_timers.orvi`: 1,000 concurrent timers;
 - `comparison.orvi`, `comparison.js`, `comparison.py`: the same one-million-iteration integer summation, including process startup and program execution.

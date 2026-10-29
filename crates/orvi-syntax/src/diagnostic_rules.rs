@@ -160,18 +160,27 @@ fn context_matches(context: DiagnosticContext, tokens: &[Token], index: usize) -
             at_declaration_boundary || previous.is_some_and(|token| token.kind == TokenKind::Return)
         }
         DiagnosticContext::Expression => {
-            !at_declaration_boundary
-                || previous.is_some_and(|token| {
-                    matches!(
-                        token.kind,
-                        TokenKind::Equal
-                            | TokenKind::Comma
-                            | TokenKind::LeftParenthesis
-                            | TokenKind::LeftBracket
-                            | TokenKind::Return
-                            | TokenKind::FatArrow
-                    )
-                })
+            let declaration_name = previous.is_some_and(|token| {
+                matches!(
+                    token.kind,
+                    TokenKind::Let
+                        | TokenKind::Const
+                        | TokenKind::Fn
+                        | TokenKind::Struct
+                        | TokenKind::Interface
+                        | TokenKind::Import
+                        | TokenKind::Export
+                        | TokenKind::From
+                        | TokenKind::Colon
+                        | TokenKind::Dot
+                )
+            });
+            let named_field = next.is_some_and(|token| token.kind == TokenKind::Colon);
+            let import_list_name = previous.is_some_and(|token| token.kind == TokenKind::LeftBrace)
+                && next.is_some_and(|token| {
+                    matches!(token.kind, TokenKind::Comma | TokenKind::RightBrace)
+                });
+            !declaration_name && !named_field && !import_list_name
         }
     }
 }
@@ -229,5 +238,39 @@ mod tests {
             .map(|number| format!("function example_{number}() {{}}\n"))
             .collect::<String>();
         assert_eq!(diagnose(&source).len(), super::MAX_RULE_DIAGNOSTICS);
+    }
+
+    #[test]
+    fn diagnoses_common_foreign_syntax_in_precise_contexts() {
+        let cases = [
+            ("def greet() {}", "ORVI1002", Some("fn")),
+            ("var value = 1;", "ORVI1005", Some("let")),
+            ("let enabled: boolean = True;", "ORVI1023", Some("bool")),
+            ("println(\"hello\");", "ORVI1015", Some("print")),
+            ("let value = left and right;", "ORVI1041", Some("&&")),
+            ("let values: Vec<int> = [];", "ORVI1044", Some("list")),
+        ];
+
+        for (source, id, replacement) in cases {
+            let diagnostics = diagnose(source);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.id == id && diagnostic.replacement == replacement),
+                "missing {id} for {source:?}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_diagnose_valid_orviscript_or_identifier_names() {
+        let source = r#"
+            import { print_value } from "./value.orvi";
+            fn println() -> void { print(None); }
+            let and = null;
+            let value: int = 1;
+            let mapping: map<string> = { undefined: "allowed field" };
+        "#;
+        assert!(diagnose(source).is_empty());
     }
 }

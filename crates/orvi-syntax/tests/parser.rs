@@ -1,4 +1,4 @@
-use orvi_syntax::{BinaryOperator, ExpressionKind, StatementKind, parse};
+use orvi_syntax::{BinaryOperator, ExpressionKind, ForSource, StatementKind, parse};
 
 #[test]
 fn applies_standard_arithmetic_precedence() {
@@ -30,6 +30,41 @@ fn parses_control_flow_and_functions() {
     assert!(matches!(
         parsed.program.statements[0].kind,
         StatementKind::Function { .. }
+    ));
+}
+
+#[test]
+fn parses_list_and_integer_range_for_loops() {
+    let parsed = parse(
+        "for value in [1, 2, 3] { print(value) } for index in 0..10 { print(index) } for index in 1..=3 { print(index) }",
+    );
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    assert!(matches!(
+        parsed.program.statements[0].kind,
+        StatementKind::For {
+            source: ForSource::Iterable(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        parsed.program.statements[1].kind,
+        StatementKind::For {
+            source: ForSource::Range {
+                inclusive: false,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        parsed.program.statements[2].kind,
+        StatementKind::For {
+            source: ForSource::Range {
+                inclusive: true,
+                ..
+            },
+            ..
+        }
     ));
 }
 

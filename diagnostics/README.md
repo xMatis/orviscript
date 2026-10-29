@@ -14,7 +14,7 @@ Add an object to `rules` in `diagnostic-rules.json` and rebuild the workspace:
     "token": "function",
     "context": "function_declaration"
   },
-  "message": "Unknown syntax. Did you mean 'fn'?",
+  "message": "Unknown function declaration. Did you mean 'fn'?",
   "replacement": "fn",
   "severity": "error",
   "quickFix": true,
