@@ -298,6 +298,8 @@ fn is_word(kind: TokenKind) -> bool {
             | TokenKind::While
             | TokenKind::For
             | TokenKind::In
+            | TokenKind::Break
+            | TokenKind::Continue
             | TokenKind::Return
             | TokenKind::Match
             | TokenKind::Using

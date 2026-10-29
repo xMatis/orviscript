@@ -10,6 +10,7 @@ use orvi_syntax::{Program, parse};
 const SOURCE: &str = include_str!("../../../benchmarks/comparison.orvi");
 const FUNCTION_SOURCE: &str = "fn add_one(value: int) -> int { return value + 1; } let index = 0; let total = 0; while index < 1000000 { total = add_one(total); index = index + 1; } total";
 const COLLECTION_SOURCE: &str = "let values = [0, 0, 0, 0]; let record = { total: 0 }; let index = 0; while index < 250000 { let slot = index % 4; values[slot] = values[slot] + 1; record.total = record.total + values[slot]; index = index + 1; } record.total";
+const LOOP_CONTROL_SOURCE: &str = include_str!("../../../benchmarks/loop_control.orvi");
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static DEALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -125,6 +126,16 @@ fn main() {
         execute(black_box(&collections.program)).expect("collection benchmark must execute")
     });
 
+    let loop_control = parse(LOOP_CONTROL_SOURCE);
+    assert!(!loop_control.has_errors());
+    let loop_control_analysis = analyze_program(&loop_control.program);
+    assert!(loop_control_analysis.errors.is_empty());
+    let loop_control_probe = execute(&loop_control.program).expect("loop control must execute");
+    assert_eq!(loop_control_probe.output, ["250000000000"]);
+    let loop_control_time = measure(execution_samples, 2, || {
+        execute(black_box(&loop_control.program)).expect("loop control benchmark must execute")
+    });
+
     let pipeline_samples = 10;
     let pipeline_time = measure(pipeline_samples, 2, || {
         let parsed = parse(black_box(SOURCE));
@@ -141,6 +152,7 @@ fn main() {
     print_measurement("execute 1M loop", execution_time, execution_samples);
     print_measurement("execute 1M calls", function_time, execution_samples);
     print_measurement("collections 250K", collection_time, execution_samples);
+    print_measurement("break/continue 1M", loop_control_time, execution_samples);
     print_measurement("complete in-process", pipeline_time, pipeline_samples);
     println!(
         "execute 1M allocations: {execution_allocations} allocations, {execution_deallocations} deallocations before result drop"

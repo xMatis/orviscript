@@ -116,6 +116,8 @@ pub enum StatementKind {
         source: ForSource,
         body: Box<Statement>,
     },
+    Break,
+    Continue,
     Return(Option<Expression>),
     Defer(Expression),
     Using {

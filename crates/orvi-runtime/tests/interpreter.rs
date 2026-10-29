@@ -53,6 +53,24 @@ fn iterates_lists_and_integer_ranges_in_the_tree_interpreter() {
 }
 
 #[test]
+fn runs_break_continue_and_cleanup_in_the_tree_interpreter() {
+    let output = run(r#"
+            let total = 0;
+            for outer in 0..3 {
+                defer print("cleanup", outer);
+                for inner in 0..5 {
+                    if inner == 1 { continue; }
+                    if inner == 3 { break; }
+                    total = total + 1;
+                }
+            }
+            print(total);
+        "#)
+    .expect("loop control runs");
+    assert_eq!(output, ["cleanup 0", "cleanup 1", "cleanup 2", "6"]);
+}
+
+#[test]
 fn runs_isolated_workers_and_transfers_values_and_output() {
     let source = r#"
         async fn main() -> Result<void, string> {
@@ -158,6 +176,50 @@ fn executes_multiple_workers_on_parallel_threads() {
             "two 200 ms workers should overlap"
         );
     }
+}
+
+#[test]
+fn maps_cpu_work_in_parallel_and_preserves_input_order() {
+    let source = r#"
+        async fn main() -> Result<void, string> {
+            let results: list<map<any>> = (await parallel.map(
+                "if worker_input == 1 { time.sleep_ms(20); } print(worker_input); worker_input * 2",
+                [1, 2, 3]
+            ))?;
+            print(results[0].value);
+            print(results[1].value);
+            print(results[2].value);
+            print(results[2].output);
+            return Ok();
+        }
+        print(await main());
+    "#;
+    let output = run(source).expect("parallel map runs");
+    assert_eq!(output, ["2", "4", "6", "[3]", "Ok()"]);
+}
+
+#[test]
+fn parallel_map_returns_indexed_errors_and_handles_empty_inputs() {
+    let source = r#"
+        import { map } from "std:parallel";
+        async fn main() -> Result<void, string> {
+            print(await map("worker_input", []));
+            print(await map(
+                "if worker_input == 2 { 1 / 0; } worker_input",
+                [1, 2, 3]
+            ));
+            return Ok();
+        }
+        print(await main());
+    "#;
+    let output = run(source).expect("parallel map failures are values");
+    assert_eq!(output[0], "Ok([])");
+    assert!(
+        output[1].contains("parallel.map item 1 failed: division by zero"),
+        "{}",
+        output[1]
+    );
+    assert_eq!(output[2], "Ok()");
 }
 
 #[test]

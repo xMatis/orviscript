@@ -25,6 +25,8 @@ try {
     $commands = @(
         "`"$binary`" run benchmarks/startup.orvi",
         "`"$binary`" run benchmarks/sync_loop.orvi",
+        "`"$binary`" run benchmarks/for_loop.orvi",
+        "`"$binary`" run benchmarks/loop_control.orvi",
         "`"$binary`" run benchmarks/async_10000_tasks.orvi",
         "`"$binary`" run benchmarks/async_timers.orvi"
     )

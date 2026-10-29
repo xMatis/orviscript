@@ -1383,6 +1383,8 @@ fn classify_token(
         | TokenKind::While
         | TokenKind::For
         | TokenKind::In
+        | TokenKind::Break
+        | TokenKind::Continue
         | TokenKind::Return
         | TokenKind::True
         | TokenKind::False
@@ -1481,6 +1483,16 @@ fn completion_items(source: Option<&str>) -> Vec<CompletionItem> {
             "iterate over a list or integer range",
         ),
         ("in", CompletionItemKind::KEYWORD, "for-loop source"),
+        (
+            "break",
+            CompletionItemKind::KEYWORD,
+            "exit the nearest loop",
+        ),
+        (
+            "continue",
+            CompletionItemKind::KEYWORD,
+            "start the next iteration of the nearest loop",
+        ),
         (
             "return",
             CompletionItemKind::KEYWORD,
@@ -1640,6 +1652,8 @@ fn hover_at(source: &str, position: Position) -> Option<Hover> {
         "while" => "`while` repeats a block while its condition is `true`.",
         "for" => "`for name in source` iterates over a list or integer range.",
         "in" => "`in` separates a for-loop variable from its list or integer range.",
+        "break" => "`break` exits the nearest enclosing loop.",
+        "continue" => "`continue` starts the next iteration of the nearest enclosing loop.",
         "return" => "`return` exits the current function.",
         "true" | "false" => "Built-in boolean value.",
         "null" => "Built-in null value.",
@@ -1935,6 +1949,8 @@ mod tests {
 
         assert!(items.iter().any(|item| item.label == "let"));
         assert!(items.iter().any(|item| item.label == "for"));
+        assert!(items.iter().any(|item| item.label == "break"));
+        assert!(items.iter().any(|item| item.label == "continue"));
         assert!(items.iter().any(|item| {
             item.label == "print" && item.kind == Some(CompletionItemKind::FUNCTION)
         }));
@@ -1964,6 +1980,7 @@ mod tests {
                 .expect("standard module completion");
         assert!(modules.iter().any(|item| item.label == "std:fs"));
         assert!(modules.iter().any(|item| item.label == "std:http"));
+        assert!(modules.iter().any(|item| item.label == "std:parallel"));
 
         let import_source = "import { read } from \"std:fs\";";
         let members = import_completion_items(
@@ -2002,6 +2019,18 @@ mod tests {
         assert_eq!(
             read_text.insert_text_format,
             Some(InsertTextFormat::SNIPPET)
+        );
+
+        let source = "parallel.ma";
+        let members = standard_completion_items(source, Position::new(0, source.len() as u32))
+            .expect("parallel member completion");
+        let map = members
+            .iter()
+            .find(|item| item.label == "map")
+            .expect("parallel.map completion");
+        assert_eq!(
+            map.insert_text.as_deref(),
+            Some("map(${1:source}, ${2:inputs})")
         );
     }
 

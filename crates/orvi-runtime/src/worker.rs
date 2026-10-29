@@ -46,7 +46,7 @@ pub struct WorkerTaskValue {
 }
 
 pub(super) struct WorkerJob {
-    pub(super) source: String,
+    pub(super) source: Arc<str>,
     pub(super) input: TransferValue,
     pub(super) context: ExecutionContext,
     pub(super) cancellation: Arc<AtomicBool>,
@@ -170,7 +170,7 @@ impl WorkerPool {
 
     pub(super) fn spawn(
         &self,
-        source: String,
+        source: Arc<str>,
         input: TransferValue,
         context: ExecutionContext,
     ) -> Result<Rc<RefCell<WorkerTaskValue>>, String> {

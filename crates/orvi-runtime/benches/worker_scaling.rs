@@ -25,6 +25,15 @@ fn sequential_program(count: usize, iterations: i64) -> String {
     )
 }
 
+fn parallel_map_program(count: usize, iterations: i64) -> String {
+    let inputs = std::iter::repeat_n(iterations.to_string(), count)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "async fn main() -> Result<void, string> {{ (await parallel.map(\"{WORKER_BODY}\", [{inputs}]))?; return Ok(); }} await main();"
+    )
+}
+
 fn measure(label: &str, source: &str) {
     let parsed = parse(source);
     assert!(!parsed.has_errors(), "benchmark source must parse");
@@ -43,6 +52,10 @@ fn main() {
         measure(
             &format!("workers-{count}"),
             &worker_program(count, iterations),
+        );
+        measure(
+            &format!("parallel-map-{count}"),
+            &parallel_map_program(count, iterations),
         );
     }
 }

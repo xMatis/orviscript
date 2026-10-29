@@ -36,6 +36,12 @@ cargo bench -p orvi-syntax --bench diagnostic_rules
 
 The benchmark reports indexed missing/matching lookup and the production token scan separately. The production engine uses generated token buckets, so unrelated catalog entries are not scanned for each source token.
 
+Compare sequential CPU work, individual worker handles and `parallel.map` for 1, 2, 4 and 8 jobs:
+
+```powershell
+cargo bench -p orvi-runtime --bench worker_scaling
+```
+
 Use the `profiling` Cargo profile when collecting CPU profiles. It keeps debug symbols while retaining release optimizations:
 
 ```powershell
@@ -49,6 +55,7 @@ Workloads:
 - `startup.orvi`: process and minimal-language startup cost;
 - `sync_loop.orvi`: 100,000 interpreted loop iterations;
 - `for_loop.orvi`: one million iterations through the optimized integer-range `for` path;
+- `loop_control.orvi`: one million range iterations with conditional `continue` and final `break`;
 - `async_10000_tasks.orvi`: the maximum 10,000 lightweight tasks in one scope;
 - `async_timers.orvi`: 1,000 concurrent timers;
 - `comparison.orvi`, `comparison.js`, `comparison.py`: the same one-million-iteration integer summation, including process startup and program execution.

@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use orvi_project::resolve_import;
 use orvi_syntax::{
     BinaryOperator, Expression, ExpressionKind, ForSource, Literal, Parameter, PatternKind,
@@ -142,6 +143,7 @@ enum FutureState {
         duration: Duration,
     },
     WorkerJoining(Rc<RefCell<WorkerTaskValue>>),
+    WorkerMapJoining(Vec<Rc<RefCell<WorkerTaskValue>>>),
     WorkerTimingOut {
         worker: Rc<RefCell<WorkerTaskValue>>,
         duration: Duration,
@@ -224,6 +226,7 @@ pub enum NativeModule {
     Http,
     Time,
     Worker,
+    Parallel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +271,7 @@ pub enum NativeFunction {
     WorkerThreads,
     WorkerStatus,
     WorkerStats,
+    ParallelMap,
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +418,8 @@ enum AssignError {
 enum Control {
     Continue(Value),
     Return(Value),
+    Break,
+    LoopContinue,
 }
 
 pub fn execute(program: &Program) -> Result<Execution, RuntimeError> {
@@ -474,6 +480,13 @@ async fn execute_internal_async(
         Control::Return(_) => {
             return Err(RuntimeError {
                 message: "return is only valid inside a function".into(),
+                span: Span::empty(0),
+                propagated: None,
+            });
+        }
+        Control::Break | Control::LoopContinue => {
+            return Err(RuntimeError {
+                message: "loop control is only valid inside a loop".into(),
                 span: Span::empty(0),
                 propagated: None,
             });
@@ -546,6 +559,9 @@ fn execute_worker_job(
         let value = match control {
             Control::Continue(value) => value,
             Control::Return(_) => return Err("return is only valid inside a function".into()),
+            Control::Break | Control::LoopContinue => {
+                return Err("loop control is only valid inside a loop".into());
+            }
         };
         let output = interpreter.output.borrow().clone();
         worker_execution_result(value, output)
@@ -590,8 +606,11 @@ async fn execute_tasks_async(
     validate_tasks(&tasks, selected)?;
     let mut interpreter = Interpreter::new(context, Some(entry_file));
     let control = interpreter.execute_statements(&program.statements).await?;
-    if matches!(control, Control::Return(_)) {
-        return Err(interpreter.error("return is only valid inside a function", Span::empty(0)));
+    if !matches!(control, Control::Continue(_)) {
+        return Err(interpreter.error(
+            "return, break and continue are not valid at task module level",
+            Span::empty(0),
+        ));
     }
     let reports = interpreter.run_tasks(&tasks, selected).await;
     interpreter.finish_current_task_scope().await?;
@@ -795,6 +814,7 @@ impl Interpreter {
             ("http", NativeModule::Http),
             ("time", NativeModule::Time),
             ("worker", NativeModule::Worker),
+            ("parallel", NativeModule::Parallel),
         ] {
             globals.define(name.into(), Value::NativeModule(module), false, None);
         }
@@ -911,6 +931,7 @@ impl Interpreter {
                     self.collect_garbage(std::slice::from_ref(&value));
                     return Ok(Control::Return(value));
                 }
+                control @ (Control::Break | Control::LoopContinue) => return Ok(control),
             }
         }
         Ok(Control::Continue(value))
@@ -1024,6 +1045,9 @@ impl Interpreter {
         let value = match result {
             Ok(Control::Continue(_)) => Value::Void,
             Ok(Control::Return(value)) => value,
+            Ok(Control::Break | Control::LoopContinue) => {
+                return Err(self.error("loop control is only valid inside a loop", task.span));
+            }
             Err(mut error) => match error.propagated.take() {
                 Some(value) => value,
                 None => return Err(error),
@@ -1199,8 +1223,10 @@ impl Interpreter {
                     if !self.boolean(condition_value, condition.span)? {
                         break;
                     }
-                    if let returned @ Control::Return(_) = self.execute_statement(body).await? {
-                        return Ok(returned);
+                    match self.execute_statement(body).await? {
+                        Control::Continue(_) | Control::LoopContinue => {}
+                        Control::Break => break,
+                        returned @ Control::Return(_) => return Ok(returned),
                     }
                 }
                 Ok(Control::Continue(Value::Null))
@@ -1241,12 +1267,16 @@ impl Interpreter {
                     let previous = std::mem::replace(&mut self.environment, environment);
                     let result = self.execute_statement(body).await;
                     self.environment = previous;
-                    if let returned @ Control::Return(_) = result? {
-                        return Ok(returned);
+                    match result? {
+                        Control::Continue(_) | Control::LoopContinue => {}
+                        Control::Break => break,
+                        returned @ Control::Return(_) => return Ok(returned),
                     }
                 }
                 Ok(Control::Continue(Value::Null))
             }
+            StatementKind::Break => Ok(Control::Break),
+            StatementKind::Continue => Ok(Control::LoopContinue),
             StatementKind::Return(expression) => {
                 if self.function_depth == 0 {
                     return Err(
@@ -1374,8 +1404,11 @@ impl Interpreter {
             self.current_files.pop();
             self.environment = previous;
             let control = execution.and_then(|control| cleanup.map(|()| control))?;
-            if matches!(control, Control::Return(_)) {
-                return Err(self.error("return is not valid at module top level", span));
+            if !matches!(control, Control::Continue(_)) {
+                return Err(self.error(
+                    "return, break and continue are not valid at module top level",
+                    span,
+                ));
             }
             self.module_cache
                 .insert(path.to_path_buf(), environment.clone());
@@ -1881,6 +1914,9 @@ impl Interpreter {
         let value = match result {
             Ok(Control::Continue(_)) => Value::Void,
             Ok(Control::Return(value)) => value,
+            Ok(Control::Break | Control::LoopContinue) => {
+                return Err(self.error("loop control is only valid inside a loop", Span::empty(0)));
+            }
             Err(mut error) => {
                 let Some(value) = error.propagated.take() else {
                     return Err(error);
@@ -2033,21 +2069,88 @@ impl Interpreter {
     async fn join_worker(
         &self,
         worker: Rc<RefCell<WorkerTaskValue>>,
-        span: Span,
+        _span: Span,
     ) -> Result<Value, RuntimeError> {
+        Ok(worker_result_value(
+            Self::receive_worker_result(worker).await,
+        ))
+    }
+
+    async fn receive_worker_result(worker: Rc<RefCell<WorkerTaskValue>>) -> worker::WorkerResult {
         if let Some(result) = worker.borrow().result.clone() {
-            return Ok(worker_result_value(result));
+            return result;
         }
-        let receiver = worker
-            .borrow_mut()
-            .receiver
-            .take()
-            .ok_or_else(|| self.error("worker result is already being awaited", span))?;
+        let Some(receiver) = worker.borrow_mut().receiver.take() else {
+            return Err("worker result is already being awaited".into());
+        };
         let result = receiver
             .await
             .unwrap_or_else(|_| Err("worker stopped without returning a result".into()));
         worker.borrow_mut().result = Some(result.clone());
-        Ok(worker_result_value(result))
+        result
+    }
+
+    async fn join_worker_map(
+        &self,
+        workers: Vec<Rc<RefCell<WorkerTaskValue>>>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let all_workers = workers.clone();
+        let mut pending = FuturesUnordered::new();
+        for (index, worker) in workers.into_iter().enumerate() {
+            pending.push(async move { (index, Self::receive_worker_result(worker).await) });
+        }
+
+        let mut values = vec![None; all_workers.len()];
+        let mut failure = None;
+        loop {
+            let next = if let Some(cancellation) = self.cancellation.clone() {
+                if cancellation.cancelled.get() {
+                    for worker in &all_workers {
+                        worker::cancel(&worker.borrow());
+                    }
+                    while pending.next().await.is_some() {}
+                    return Err(self.error("task was cancelled", span));
+                }
+                tokio::select! {
+                    next = pending.next() => next,
+                    _ = cancellation.notify.notified() => {
+                        for worker in &all_workers {
+                            worker::cancel(&worker.borrow());
+                        }
+                        while pending.next().await.is_some() {}
+                        return Err(self.error("task was cancelled", span));
+                    }
+                }
+            } else {
+                pending.next().await
+            };
+            let Some((index, result)) = next else {
+                break;
+            };
+            match result {
+                Ok(value) if failure.is_none() => {
+                    values[index] = Some(worker::value_from_transfer(value));
+                }
+                Err(message) if failure.is_none() => {
+                    failure = Some(format!("parallel.map item {index} failed: {message}"));
+                    for worker in &all_workers {
+                        worker::cancel(&worker.borrow());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(message) = failure {
+            return Ok(err_value(message));
+        }
+        let Some(values) = values.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(err_value(
+                "parallel.map did not receive every worker result",
+            ));
+        };
+        Ok(ok_value(Value::List(Rc::new(RefCell::new(values)))))
     }
 
     async fn timeout_worker(
@@ -2111,6 +2214,7 @@ impl Interpreter {
                 | FutureState::Joining(_)
                 | FutureState::TimingOut { .. }
                 | FutureState::WorkerJoining(_)
+                | FutureState::WorkerMapJoining(_)
                 | FutureState::WorkerTimingOut { .. } => {}
             }
             std::mem::replace(&mut future.state, FutureState::Running)
@@ -2144,6 +2248,7 @@ impl Interpreter {
                 self.timeout_async_task(task, duration, span).await
             }
             FutureState::WorkerJoining(worker) => self.join_worker(worker, span).await,
+            FutureState::WorkerMapJoining(workers) => self.join_worker_map(workers, span).await,
             FutureState::WorkerTimingOut { worker, duration } => {
                 self.timeout_worker(worker, duration, span).await
             }
@@ -2654,7 +2759,9 @@ impl Interpreter {
                 if self.is_worker {
                     return Err(self.error("workers cannot spawn nested workers", span));
                 }
-                let source = self.string_argument(arguments.next(), function, span)?;
+                let source: Arc<str> = self
+                    .string_argument(arguments.next(), function, span)?
+                    .into();
                 let input = arguments.next().expect("checked argument count");
                 let scope = self
                     .worker_scopes
@@ -2674,6 +2781,62 @@ impl Interpreter {
                     .expect("interpreter always has a worker scope")
                     .push(worker.clone());
                 Ok(Value::Worker(worker))
+            }
+            NativeFunction::ParallelMap => {
+                if self.is_worker {
+                    return Err(self.error("workers cannot start parallel maps", span));
+                }
+                let source: Arc<str> = self
+                    .string_argument(arguments.next(), function, span)?
+                    .into();
+                let inputs = arguments.next().expect("checked argument count");
+                let Value::List(inputs) = inputs else {
+                    return Err(self.error("parallel.map expects list<any> inputs", span));
+                };
+                let inputs = inputs.borrow().clone();
+                let scope_len = self
+                    .worker_scopes
+                    .last()
+                    .expect("interpreter always has a worker scope")
+                    .len();
+                if scope_len.saturating_add(inputs.len()) > worker::MAX_WORKERS_PER_SCOPE {
+                    return Err(self.error("worker scope limit exceeded", span));
+                }
+                let inputs = inputs
+                    .iter()
+                    .map(worker::transfer_from_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|message| self.error(message, span))?;
+                if inputs.is_empty() {
+                    return Ok(self.register_future(FutureState::Ready(Ok(ok_value(
+                        Value::List(Rc::new(RefCell::new(Vec::new()))),
+                    )))));
+                }
+
+                let pool = self.worker_pool.get_or_insert_with(WorkerPool::new).clone();
+                let mut workers = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    match pool.spawn(source.clone(), input, self.context.clone()) {
+                        Ok(worker) => workers.push(worker),
+                        Err(message) => {
+                            for worker in &workers {
+                                worker::cancel(&worker.borrow());
+                            }
+                            self.worker_scopes
+                                .last_mut()
+                                .expect("interpreter always has a worker scope")
+                                .extend(workers);
+                            return Ok(
+                                self.register_future(FutureState::Ready(Ok(err_value(message))))
+                            );
+                        }
+                    }
+                }
+                self.worker_scopes
+                    .last_mut()
+                    .expect("interpreter always has a worker scope")
+                    .extend(workers.iter().cloned());
+                Ok(self.register_future(FutureState::WorkerMapJoining(workers)))
             }
             NativeFunction::WorkerJoin => {
                 let value = arguments.next().expect("checked argument count");
@@ -3188,6 +3351,7 @@ impl NativeModule {
             Self::Http => "http",
             Self::Time => "time",
             Self::Worker => "worker",
+            Self::Parallel => "parallel",
         }
     }
 
@@ -3233,6 +3397,7 @@ impl NativeModule {
             (Self::Worker, "threads") => Some(NativeFunction::WorkerThreads),
             (Self::Worker, "status") => Some(NativeFunction::WorkerStatus),
             (Self::Worker, "stats") => Some(NativeFunction::WorkerStats),
+            (Self::Parallel, "map") => Some(NativeFunction::ParallelMap),
             _ => None,
         }
     }
@@ -3250,6 +3415,7 @@ fn native_module(name: &str) -> Option<NativeModule> {
         "http" => Some(NativeModule::Http),
         "time" => Some(NativeModule::Time),
         "worker" => Some(NativeModule::Worker),
+        "parallel" => Some(NativeModule::Parallel),
         _ => None,
     }
 }
@@ -3297,6 +3463,7 @@ impl NativeFunction {
             Self::WorkerThreads => "worker.threads",
             Self::WorkerStatus => "worker.status",
             Self::WorkerStats => "worker.stats",
+            Self::ParallelMap => "parallel.map",
         }
     }
 
@@ -3307,7 +3474,7 @@ impl NativeFunction {
             | Self::ProcessRun
             | Self::ProcessRunAsync
             | Self::TaskTimeout => 2,
-            Self::WorkerSpawn | Self::WorkerTimeout => 2,
+            Self::WorkerSpawn | Self::WorkerTimeout | Self::ParallelMap => 2,
             Self::HttpRequest | Self::HttpRequestAsync => 4,
             Self::EnvCurrentDir
             | Self::TimeUnixMs
@@ -3456,6 +3623,7 @@ fn mark_value(
                     marked_lists,
                 ),
                 FutureState::WorkerJoining(_)
+                | FutureState::WorkerMapJoining(_)
                 | FutureState::WorkerTimingOut { .. }
                 | FutureState::Sleeping(_)
                 | FutureState::Native(_)
@@ -3863,6 +4031,7 @@ fn format_value(value: &Value, visited: &mut HashSet<usize>) -> String {
             FutureState::Joining(_) => "<future joining>".into(),
             FutureState::TimingOut { .. } => "<future timeout>".into(),
             FutureState::WorkerJoining(_) => "<future worker join>".into(),
+            FutureState::WorkerMapJoining(_) => "<future parallel map>".into(),
             FutureState::WorkerTimingOut { .. } => "<future worker timeout>".into(),
             FutureState::Running => "<future running>".into(),
             FutureState::Ready(_) => "<future ready>".into(),

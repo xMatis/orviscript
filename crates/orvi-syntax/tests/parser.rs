@@ -69,6 +69,26 @@ fn parses_list_and_integer_range_for_loops() {
 }
 
 #[test]
+fn parses_loop_control_statements() {
+    let parsed = parse("while true { if false { break; } continue }");
+    assert!(!parsed.has_errors(), "{:?}", parsed.parse_errors);
+    let StatementKind::While { body, .. } = &parsed.program.statements[0].kind else {
+        panic!("expected while loop")
+    };
+    let StatementKind::Block(statements) = &body.kind else {
+        panic!("expected loop block")
+    };
+    let StatementKind::If { then_branch, .. } = &statements[0].kind else {
+        panic!("expected conditional break")
+    };
+    let StatementKind::Block(branch) = &then_branch.kind else {
+        panic!("expected branch block")
+    };
+    assert!(matches!(branch[0].kind, StatementKind::Break));
+    assert!(matches!(statements[1].kind, StatementKind::Continue));
+}
+
+#[test]
 fn reports_missing_initializer() {
     let parsed = parse("let value =");
     assert!(parsed.has_errors());

@@ -190,7 +190,7 @@ fn builds_inspects_and_runs_a_standalone_bundle() {
     assert!(inspected.status.success());
     let metadata = String::from_utf8_lossy(&inspected.stdout);
     assert!(metadata.contains("format: 1"));
-    assert!(metadata.contains("language: 0.10.0"));
+    assert!(metadata.contains("language: 0.10.1"));
     assert!(metadata.contains("sha256:"));
 
     let executed = Command::new(&executable)

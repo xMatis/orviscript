@@ -1,0 +1,11 @@
+let total = 0;
+for index in 0..1000000 {
+    if index % 2 == 0 {
+        continue;
+    }
+    total = total + index;
+    if index == 999999 {
+        break;
+    }
+}
+print(total);

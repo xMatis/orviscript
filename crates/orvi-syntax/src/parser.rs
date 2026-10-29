@@ -339,6 +339,12 @@ impl Parser<'_> {
         if self.consume(TokenKind::For) {
             return self.for_statement();
         }
+        if self.consume(TokenKind::Break) {
+            return Ok(self.loop_control_statement(StatementKind::Break));
+        }
+        if self.consume(TokenKind::Continue) {
+            return Ok(self.loop_control_statement(StatementKind::Continue));
+        }
         if self.consume(TokenKind::Return) {
             return self.return_statement();
         }
@@ -427,6 +433,19 @@ impl Parser<'_> {
             span: start.cover(body.span),
             kind: StatementKind::For { name, source, body },
         })
+    }
+
+    fn loop_control_statement(&mut self, kind: StatementKind) -> Statement {
+        let start = self.previous().span;
+        let end = if self.consume(TokenKind::Semicolon) {
+            self.previous().span
+        } else {
+            start
+        };
+        Statement {
+            span: start.cover(end),
+            kind,
+        }
     }
 
     fn return_statement(&mut self) -> Result<Statement, ParseError> {
@@ -978,6 +997,9 @@ impl Parser<'_> {
                     | TokenKind::Export
                     | TokenKind::If
                     | TokenKind::While
+                    | TokenKind::For
+                    | TokenKind::Break
+                    | TokenKind::Continue
                     | TokenKind::Return
             ) {
                 return;

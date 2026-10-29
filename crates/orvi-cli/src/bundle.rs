@@ -337,10 +337,10 @@ mod tests {
     #[test]
     fn round_trips_and_validates_the_payload_checksum() {
         let (runtime, output, directory) = paths();
-        write(&runtime, &output, "print(42);", "0.10.0", false).unwrap();
+        write(&runtime, &output, "print(42);", "0.10.1", false).unwrap();
         let bundle = read(&output).unwrap().unwrap();
         assert_eq!(bundle.source, "print(42);");
-        assert_eq!(bundle.language_version, "0.10.0");
+        assert_eq!(bundle.language_version, "0.10.1");
 
         let mut file = OpenOptions::new().write(true).open(&output).unwrap();
         file.seek(SeekFrom::Start(HEADER_BYTES as u64)).unwrap();
@@ -353,9 +353,9 @@ mod tests {
     fn refuses_to_overwrite_without_force() {
         let (runtime, output, directory) = paths();
         fs::write(&output, b"existing").unwrap();
-        assert!(write(&runtime, &output, "print(1);", "0.10.0", false).is_err());
+        assert!(write(&runtime, &output, "print(1);", "0.10.1", false).is_err());
         assert_eq!(fs::read(&output).unwrap(), b"existing");
-        write(&runtime, &output, "print(2);", "0.10.0", true).unwrap();
+        write(&runtime, &output, "print(2);", "0.10.1", true).unwrap();
         assert_eq!(read(&output).unwrap().unwrap().source, "print(2);");
         fs::remove_dir_all(directory).unwrap();
     }
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn rejects_unknown_versions_and_treats_truncated_slots_as_non_bundles() {
         let (runtime, output, directory) = paths();
-        write(&runtime, &output, "print(42);", "0.10.0", false).unwrap();
+        write(&runtime, &output, "print(42);", "0.10.1", false).unwrap();
         let mut file = OpenOptions::new().write(true).open(&output).unwrap();
         file.seek(SeekFrom::Start(SLOT_MAGIC.len() as u64)).unwrap();
         file.write_all(&2_u32.to_le_bytes()).unwrap();
@@ -383,8 +383,8 @@ mod tests {
     fn produces_identical_bundles_for_identical_inputs() {
         let (runtime, output, directory) = paths();
         let second = directory.join("output-second");
-        write(&runtime, &output, "print(42);", "0.10.0", false).unwrap();
-        write(&runtime, &second, "print(42);", "0.10.0", false).unwrap();
+        write(&runtime, &output, "print(42);", "0.10.1", false).unwrap();
+        write(&runtime, &second, "print(42);", "0.10.1", false).unwrap();
         assert_eq!(fs::read(&output).unwrap(), fs::read(&second).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -396,7 +396,7 @@ mod tests {
 
         let (runtime, output, directory) = paths();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
-        write(&runtime, &output, "print(42);", "0.10.0", false).unwrap();
+        write(&runtime, &output, "print(42);", "0.10.1", false).unwrap();
         assert_ne!(
             fs::metadata(&output).unwrap().permissions().mode() & 0o111,
             0

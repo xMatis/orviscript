@@ -12,6 +12,7 @@ pub enum SemanticErrorKind {
     DuplicateName,
     ImmutableAssignment,
     ReturnOutsideFunction,
+    LoopControlOutsideLoop,
     ArgumentCount,
     UnknownType,
     TypeMismatch,
@@ -288,6 +289,12 @@ const WORKER_MEMBERS: &[StandardMember] = &[
     },
 ];
 
+const PARALLEL_MEMBERS: &[StandardMember] = &[StandardMember {
+    name: "map",
+    signature: "fn map(source: string, inputs: list<any>) -> Future<Result<list<map<any>>, string>>",
+    description: "Runs isolated source for every input on the bounded worker pool, preserving input order and cancelling remaining work after an error.",
+}];
+
 pub const STANDARD_MODULES: &[StandardModule] = &[
     StandardModule {
         name: "json",
@@ -338,6 +345,11 @@ pub const STANDARD_MODULES: &[StandardModule] = &[
         name: "worker",
         description: "Isolated parallel CPU execution",
         members: WORKER_MEMBERS,
+    },
+    StandardModule {
+        name: "parallel",
+        description: "Ordered data-parallel CPU execution on isolated workers",
+        members: PARALLEL_MEMBERS,
     },
 ];
 
@@ -431,6 +443,7 @@ fn analyze_program_internal(
         errors: Vec::new(),
         symbols: Vec::new(),
         function_depth: 0,
+        loop_depth: 0,
         current_return_type: None,
         current_function_async: false,
         in_cleanup_expression: false,
@@ -748,6 +761,7 @@ fn builtin_symbols() -> HashMap<String, Symbol> {
         ("http".into(), module_symbol("http")),
         ("time".into(), module_symbol("time")),
         ("worker".into(), module_symbol("worker")),
+        ("parallel".into(), module_symbol("parallel")),
         (
             "context".into(),
             Symbol {
@@ -776,6 +790,7 @@ struct Analyzer {
     errors: Vec<SemanticError>,
     symbols: Vec<SymbolOccurrence>,
     function_depth: usize,
+    loop_depth: usize,
     current_return_type: Option<StaticType>,
     current_function_async: bool,
     in_cleanup_expression: bool,
@@ -1130,7 +1145,9 @@ impl Analyzer {
             StatementKind::While { condition, body } => {
                 let condition_type = self.expression(condition);
                 self.require_assignable(&StaticType::Bool, &condition_type, condition.span);
+                self.loop_depth += 1;
                 self.statement(body);
+                self.loop_depth -= 1;
             }
             StatementKind::For { name, source, body } => {
                 let value_type = match source {
@@ -1168,8 +1185,24 @@ impl Analyzer {
                         value_type,
                     },
                 );
+                self.loop_depth += 1;
                 self.statement(body);
+                self.loop_depth -= 1;
                 self.scopes.pop();
+            }
+            StatementKind::Break | StatementKind::Continue => {
+                if self.loop_depth == 0 {
+                    let keyword = if matches!(statement.kind, StatementKind::Break) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    self.errors.push(SemanticError {
+                        kind: SemanticErrorKind::LoopControlOutsideLoop,
+                        message: format!("{keyword} is only valid inside a loop"),
+                        span: statement.span,
+                    });
+                }
             }
             StatementKind::Return(value) => {
                 if self.function_depth == 0 {
@@ -1252,15 +1285,18 @@ impl Analyzer {
         }
         let previous_return_type = self.current_return_type.clone();
         let previous_async = self.current_function_async;
+        let previous_loop_depth = self.loop_depth;
         self.current_return_type = return_type.and_then(|annotation| {
             static_type_from_annotation(annotation, &self.struct_names, &self.interface_names)
         });
         self.current_function_async = is_async;
+        self.loop_depth = 0;
         self.function_depth += 1;
         self.statements(body, false);
         self.function_depth -= 1;
         self.current_return_type = previous_return_type;
         self.current_function_async = previous_async;
+        self.loop_depth = previous_loop_depth;
         self.scopes.pop();
     }
 
@@ -2228,6 +2264,15 @@ fn module_member_type(module: &str, member: &str) -> Option<StaticType> {
             Vec::new(),
             StaticType::Map(Box::new(StaticType::Dynamic)),
         )),
+        ("parallel", "map") => Some(function_type(
+            vec![
+                StaticType::String,
+                StaticType::List(Box::new(StaticType::Dynamic)),
+            ],
+            StaticType::Future(Box::new(result_type(StaticType::List(Box::new(
+                StaticType::Map(Box::new(StaticType::Dynamic)),
+            ))))),
+        )),
         ("http", "get") => Some(function_type(
             vec![StaticType::String],
             result_type(StaticType::Map(Box::new(StaticType::Dynamic))),
@@ -2431,6 +2476,12 @@ mod tests {
         let worker = parse("worker_input");
         assert!(analyze_worker_program(&worker.program).errors.is_empty());
         assert_eq!(errors("print(worker_input)").len(), 1);
+        assert!(
+            errors(
+                "let mapped: Future<Result<list<map<any>>, string>> = parallel.map(\"worker_input\", [1, 2, 3]);"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -2456,6 +2507,23 @@ mod tests {
         let errors = errors("fn one(value) { return value; } one(); return 1;");
         assert_eq!(errors[0].kind, SemanticErrorKind::ArgumentCount);
         assert_eq!(errors[1].kind, SemanticErrorKind::ReturnOutsideFunction);
+    }
+
+    #[test]
+    fn validates_loop_control_scope() {
+        assert!(
+            errors("while true { continue; break; } for value in [1] { if value == 1 { break; } }")
+                .is_empty()
+        );
+
+        let errors =
+            errors("break; continue; while true { fn nested() -> void { break; } break; }");
+        assert_eq!(errors.len(), 3);
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.kind == SemanticErrorKind::LoopControlOutsideLoop)
+        );
     }
 
     #[test]

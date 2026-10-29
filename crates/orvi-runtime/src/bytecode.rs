@@ -107,6 +107,13 @@ struct Compiler {
     in_function: bool,
     stack_parameter: Option<String>,
     stack_parameter_type: Option<PrimitiveKind>,
+    loop_stack: Vec<LoopContext>,
+}
+
+#[derive(Default)]
+struct LoopContext {
+    break_jumps: Vec<usize>,
+    continue_jumps: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -183,6 +190,7 @@ pub(super) fn compile_with_bindings(
         in_function: false,
         stack_parameter: None,
         stack_parameter_type: None,
+        loop_stack: Vec::new(),
     };
     compiler.compile_statements(&program.statements)?;
     let compiled_functions = compile_functions(program, &functions)?;
@@ -403,6 +411,7 @@ impl Compiler {
             in_function: true,
             stack_parameter: None,
             stack_parameter_type: None,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -480,10 +489,19 @@ impl Compiler {
                 let loop_start = self.instructions.len();
                 self.compile_expression(condition)?;
                 let exit_jump = self.emit(Instruction::JumpIfFalse(usize::MAX, condition.span));
+                self.loop_stack.push(LoopContext::default());
                 self.compile_statement(body)?;
+                let loop_context = self.loop_stack.pop()?;
                 self.instructions.push(Instruction::Pop);
                 self.instructions.push(Instruction::Jump(loop_start));
-                self.patch_jump(exit_jump, self.instructions.len());
+                let exit = self.instructions.len();
+                self.patch_jump(exit_jump, exit);
+                for jump in loop_context.continue_jumps {
+                    self.patch_jump(jump, loop_start);
+                }
+                for jump in loop_context.break_jumps {
+                    self.patch_jump(jump, exit);
+                }
                 self.instructions.push(Instruction::Push(Value::Null));
             }
             StatementKind::For { name, source, body } => {
@@ -549,8 +567,11 @@ impl Compiler {
                         }
                         let exit_jump =
                             self.emit(Instruction::JumpIfFalse(usize::MAX, statement.span));
+                        self.loop_stack.push(LoopContext::default());
                         self.compile_statement(body)?;
+                        let loop_context = self.loop_stack.pop()?;
                         self.instructions.push(Instruction::Pop);
+                        let continue_target = self.instructions.len();
                         let inclusive_end_jump = if *inclusive {
                             self.instructions.push(Instruction::Load(current_slot));
                             if let Some(end_constant) = end_constant {
@@ -582,9 +603,16 @@ impl Compiler {
                             .push(Instruction::Store(current_slot, statement.span));
                         self.instructions.push(Instruction::Pop);
                         self.instructions.push(Instruction::Jump(loop_start));
-                        self.patch_jump(exit_jump, self.instructions.len());
+                        let exit = self.instructions.len();
+                        self.patch_jump(exit_jump, exit);
                         if let Some(inclusive_end_jump) = inclusive_end_jump {
-                            self.patch_jump(inclusive_end_jump, self.instructions.len());
+                            self.patch_jump(inclusive_end_jump, exit);
+                        }
+                        for jump in loop_context.continue_jumps {
+                            self.patch_jump(jump, continue_target);
+                        }
+                        for jump in loop_context.break_jumps {
+                            self.patch_jump(jump, exit);
                         }
                     }
                     ForSource::Iterable(iterable) => {
@@ -620,8 +648,11 @@ impl Compiler {
                         self.instructions
                             .push(Instruction::Store(item_slot, name.span));
                         self.instructions.push(Instruction::Pop);
+                        self.loop_stack.push(LoopContext::default());
                         self.compile_statement(body)?;
+                        let loop_context = self.loop_stack.pop()?;
                         self.instructions.push(Instruction::Pop);
+                        let continue_target = self.instructions.len();
                         self.instructions.push(Instruction::Load(index_slot));
                         self.instructions.push(Instruction::IntegerConstant(
                             BinaryOperator::Add,
@@ -632,7 +663,14 @@ impl Compiler {
                             .push(Instruction::Store(index_slot, statement.span));
                         self.instructions.push(Instruction::Pop);
                         self.instructions.push(Instruction::Jump(loop_start));
-                        self.patch_jump(exit_jump, self.instructions.len());
+                        let exit = self.instructions.len();
+                        self.patch_jump(exit_jump, exit);
+                        for jump in loop_context.continue_jumps {
+                            self.patch_jump(jump, continue_target);
+                        }
+                        for jump in loop_context.break_jumps {
+                            self.patch_jump(jump, exit);
+                        }
                     }
                 }
                 self.scopes.pop();
@@ -645,6 +683,14 @@ impl Compiler {
                 self.instructions.push(Instruction::Push(Value::Null));
             }
             StatementKind::Export(declaration) => self.compile_statement(declaration)?,
+            StatementKind::Break => {
+                let jump = self.emit(Instruction::Jump(usize::MAX));
+                self.loop_stack.last_mut()?.break_jumps.push(jump);
+            }
+            StatementKind::Continue => {
+                let jump = self.emit(Instruction::Jump(usize::MAX));
+                self.loop_stack.last_mut()?.continue_jumps.push(jump);
+            }
             StatementKind::Return(value) => {
                 if !self.in_function {
                     return None;
@@ -1843,6 +1889,14 @@ mod tests {
                 .any(|instruction| matches!(instruction, super::Instruction::ListLength(_)))
         );
         assert_eq!(execute(&bytecode).unwrap().output, ["17", "3"]);
+    }
+
+    #[test]
+    fn compiles_nested_break_and_continue_to_bytecode_jumps() {
+        let output = run(
+            "let total = 0; for outer in 0..3 { for inner in 0..5 { if inner == 1 { continue; } if inner == 3 { break; } total = total + 1; } } print(total); let index = 0; let hits = 0; while true { index = index + 1; if index < 3 { continue; } hits = hits + 1; if index == 4 { break; } } print(hits);",
+        );
+        assert_eq!(output, ["6", "2"]);
     }
 
     #[test]
