@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, InlineTable, Item, Value};
 
+mod remote;
+
 pub const MANIFEST_FILE: &str = "orvi.toml";
 pub const LOCK_FILE: &str = "orvi.lock";
 
@@ -15,13 +17,22 @@ pub struct ProjectManifest {
     pub name: String,
     pub version: String,
     pub entry: PathBuf,
-    pub dependencies: BTreeMap<String, PathDependency>,
+    pub dependencies: BTreeMap<String, Dependency>,
+    pub exports: Option<BTreeMap<String, PathBuf>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum Dependency {
+    Path(PathDependency),
+    Remote(remote::RemoteDependency),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PathDependency {
     pub path: PathBuf,
+    pub version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,13 +85,16 @@ pub enum ProjectErrorKind {
     DependencyCycle,
     LockIo,
     LockSyntax,
+    VersionConflict,
+    RemotePackage,
 }
 
 #[derive(Deserialize)]
 struct ManifestDocument {
     project: ManifestProject,
     #[serde(default)]
-    dependencies: BTreeMap<String, PathDependency>,
+    dependencies: BTreeMap<String, Dependency>,
+    exports: Option<BTreeMap<String, PathBuf>>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +102,13 @@ struct ManifestProject {
     name: String,
     version: String,
     entry: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum Resolution<'a> {
+    Offline,
+    Install,
+    Locked(&'a Lockfile),
 }
 
 impl Project {
@@ -147,7 +168,36 @@ impl Project {
         validate_entry(&document.project.entry)?;
         for (name, dependency) in &document.dependencies {
             validate_package_name(name)?;
-            validate_dependency_path(&dependency.path)?;
+            match dependency {
+                Dependency::Path(spec) => validate_dependency_path(&spec.path)?,
+                Dependency::Remote(spec) => spec.validate()?,
+            }
+            if let Some(requirement) = dependency.version() {
+                semver::VersionReq::parse(requirement).map_err(|error| {
+                    ProjectError::new(
+                        ProjectErrorKind::InvalidVersion,
+                        format!("invalid version requirement for '{name}': {error}"),
+                    )
+                })?;
+            }
+        }
+        if let Some(exports) = &document.exports {
+            for (alias, path) in exports {
+                validate_package_name(alias)?;
+                validate_package_module_path(path)?;
+            }
+        }
+        if remote::is_cached_package(root)
+            && (document.exports.is_none()
+                || document
+                    .dependencies
+                    .values()
+                    .any(|dep| matches!(dep, Dependency::Path(_))))
+        {
+            return Err(ProjectError::new(
+                ProjectErrorKind::RemotePackage,
+                "remote packages must declare [exports] and may only use remote dependencies",
+            ));
         }
         Ok(Self {
             root: root.to_path_buf(),
@@ -157,6 +207,7 @@ impl Project {
                 version: document.project.version,
                 entry: document.project.entry,
                 dependencies: document.dependencies,
+                exports: document.exports,
             },
         })
     }
@@ -197,6 +248,10 @@ impl Project {
     }
 
     pub fn dependency(&self, name: &str) -> Result<Project, ProjectError> {
+        self.load_dependency(name, false)
+    }
+
+    fn load_dependency(&self, name: &str, download: bool) -> Result<Project, ProjectError> {
         validate_package_name(name)?;
         let dependency = self.manifest.dependencies.get(name).ok_or_else(|| {
             ProjectError::new(
@@ -207,20 +262,21 @@ impl Project {
                 ),
             )
         })?;
-        validate_dependency_path(&dependency.path)?;
-        let dependency_root = self
-            .root
-            .join(&dependency.path)
-            .canonicalize()
-            .map_err(|error| {
-                ProjectError::new(
-                    ProjectErrorKind::DependencyMissing,
-                    format!(
-                        "could not resolve dependency '{name}' at '{}': {error}",
-                        self.root.join(&dependency.path).display()
-                    ),
-                )
-            })?;
+        let dependency_root = match dependency {
+            Dependency::Path(spec) => {
+                let path = self.root.join(&spec.path);
+                path.canonicalize().map_err(|error| {
+                    ProjectError::new(
+                        ProjectErrorKind::DependencyMissing,
+                        format!(
+                            "could not resolve dependency '{name}' at '{}': {error}",
+                            path.display()
+                        ),
+                    )
+                })?
+            }
+            Dependency::Remote(spec) => spec.package_root(name, download)?,
+        };
         let dependency_project = Project::load(&dependency_root)?;
         if dependency_project.manifest.name != name {
             return Err(ProjectError::new(
@@ -231,14 +287,33 @@ impl Project {
                 ),
             ));
         }
+        if let Some(requirement) = dependency.version() {
+            let matches = semver::VersionReq::parse(requirement)
+                .ok()
+                .zip(semver::Version::parse(&dependency_project.manifest.version).ok())
+                .is_some_and(|(requirement, version)| requirement.matches(&version));
+            if !matches {
+                return Err(ProjectError::new(
+                    ProjectErrorKind::VersionConflict,
+                    format!(
+                        "package '{name}' has version '{}' but '{}' requires '{requirement}'",
+                        dependency_project.manifest.version, self.manifest.name
+                    ),
+                ));
+            }
+        }
         Ok(dependency_project)
     }
 
     pub fn resolve_dependencies(&self) -> Result<Lockfile, ProjectError> {
+        self.resolve_graph(Resolution::Offline)
+    }
+
+    fn resolve_graph(&self, resolution: Resolution<'_>) -> Result<Lockfile, ProjectError> {
         let mut packages = BTreeMap::new();
         let mut paths = HashMap::new();
         let mut stack = Vec::new();
-        resolve_project_dependencies(self, &mut packages, &mut paths, &mut stack)?;
+        resolve_project_dependencies(self, &mut packages, &mut paths, &mut stack, resolution)?;
         Ok(Lockfile {
             lock: LockMetadata { version: 1 },
             packages: packages.into_values().collect(),
@@ -246,7 +321,22 @@ impl Project {
     }
 
     pub fn write_lockfile(&self) -> Result<Lockfile, ProjectError> {
-        let lockfile = self.resolve_dependencies()?;
+        self.save_lockfile(self.resolve_dependencies()?)
+    }
+
+    pub fn install(&self, locked: bool) -> Result<Lockfile, ProjectError> {
+        if locked {
+            let expected = self.read_lockfile()?;
+            let actual = self.resolve_graph(Resolution::Locked(&expected))?;
+            if expected != actual {
+                return Err(lock_mismatch());
+            }
+            return Ok(actual);
+        }
+        self.save_lockfile(self.resolve_graph(Resolution::Install)?)
+    }
+
+    fn save_lockfile(&self, lockfile: Lockfile) -> Result<Lockfile, ProjectError> {
         let encoded = toml::to_string_pretty(&lockfile).map_err(|error| {
             ProjectError::new(
                 ProjectErrorKind::LockSyntax,
@@ -254,7 +344,7 @@ impl Project {
             )
         })?;
         let path = self.root.join(LOCK_FILE);
-        fs::write(&path, encoded).map_err(|error| {
+        atomic_write(&path, &encoded).map_err(|error| {
             ProjectError::new(
                 ProjectErrorKind::LockIo,
                 format!("could not write lockfile '{}': {error}", path.display()),
@@ -287,6 +377,24 @@ impl Project {
     }
 }
 
+impl Dependency {
+    fn version(&self) -> Option<&str> {
+        match self {
+            Self::Path(spec) => spec.version.as_deref(),
+            Self::Remote(spec) => Some(&spec.version),
+        }
+    }
+}
+
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
+    temporary.write_all(contents.as_bytes())?;
+    temporary.persist(path)?;
+    Ok(())
+}
+
 impl ProjectError {
     fn new(kind: ProjectErrorKind, message: impl Into<String>) -> Self {
         Self {
@@ -311,6 +419,8 @@ impl ProjectError {
             ProjectErrorKind::DependencyCycle => "ORVI-PROJECT-012",
             ProjectErrorKind::LockIo => "ORVI-PROJECT-013",
             ProjectErrorKind::LockSyntax => "ORVI-PROJECT-014",
+            ProjectErrorKind::VersionConflict => "ORVI-PROJECT-015",
+            ProjectErrorKind::RemotePackage => "ORVI-PROJECT-016",
         }
     }
 }
@@ -369,9 +479,10 @@ pub fn add_path_dependency(
     let mut prospective = project.clone();
     prospective.manifest.dependencies.insert(
         name.to_owned(),
-        PathDependency {
+        Dependency::Path(PathDependency {
             path: relative.clone(),
-        },
+            version: None,
+        }),
     );
     prospective.resolve_dependencies()?;
     update_manifest_dependency(&project.manifest_path, name, Some(&relative))?;
@@ -389,6 +500,9 @@ pub fn remove_dependency(project: &Project, name: &str) -> Result<Project, Proje
             ),
         ));
     }
+    let mut prospective = project.clone();
+    prospective.manifest.dependencies.remove(name);
+    prospective.resolve_dependencies()?;
     update_manifest_dependency(&project.manifest_path, name, None)?;
     Project::load(&project.root)
 }
@@ -409,6 +523,19 @@ pub fn resolve_import(module_path: &Path, source: &str) -> Result<PathBuf, Proje
         let dependency = project.dependency(name)?;
         let candidate = match requested {
             Some(path) if !path.is_empty() => {
+                if let Some(exports) = &dependency.manifest.exports {
+                    let public = exports.get(path).ok_or_else(|| {
+                        ProjectError::new(
+                            ProjectErrorKind::InvalidDependency,
+                            format!("package '{name}' does not export '{path}'"),
+                        )
+                    })?;
+                    return contained_source_file(
+                        &dependency.root,
+                        &dependency.root.join(public),
+                        source,
+                    );
+                }
                 let relative = Path::new(path);
                 validate_package_module_path(relative)?;
                 dependency.root.join(relative)
@@ -427,6 +554,9 @@ pub fn resolve_import(module_path: &Path, source: &str) -> Result<PathBuf, Proje
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(source);
+    if let Some(root) = remote::containing_package(module_path) {
+        return contained_source_file(&root, &candidate, source);
+    }
     if candidate
         .extension()
         .and_then(|extension| extension.to_str())
@@ -484,7 +614,7 @@ fn update_manifest_dependency(
     {
         dependencies.remove(name);
     }
-    fs::write(manifest_path, document.to_string()).map_err(|error| {
+    atomic_write(manifest_path, &document.to_string()).map_err(|error| {
         ProjectError::new(
             ProjectErrorKind::ManifestIo,
             format!(
@@ -500,6 +630,7 @@ fn resolve_project_dependencies(
     packages: &mut BTreeMap<String, LockedPackage>,
     paths: &mut HashMap<String, PathBuf>,
     stack: &mut Vec<PathBuf>,
+    resolution: Resolution<'_>,
 ) -> Result<(), ProjectError> {
     let project_root = project
         .root
@@ -518,7 +649,45 @@ fn resolve_project_dependencies(
     }
     stack.push(project_root);
     for (name, spec) in &project.manifest.dependencies {
-        let dependency = project.dependency(name)?;
+        let source = match spec {
+            Dependency::Path(spec) => format!(
+                "path+{}:{}",
+                project.manifest.name,
+                path_to_manifest(&spec.path)
+            ),
+            Dependency::Remote(spec) => spec.lock_source(),
+        };
+        if let Resolution::Locked(expected) = resolution {
+            let Some(locked) = expected
+                .packages
+                .iter()
+                .find(|package| package.name == *name)
+            else {
+                return Err(lock_mismatch());
+            };
+            if (!packages.contains_key(name) || matches!(spec, Dependency::Remote(_)))
+                && locked.source != source
+            {
+                return Err(lock_mismatch());
+            }
+        }
+        if let Some(existing) = packages.get(name)
+            && (matches!(spec, Dependency::Remote(_)) || !existing.source.starts_with("path+"))
+            && existing.source != source
+        {
+            return Err(ProjectError::new(
+                ProjectErrorKind::VersionConflict,
+                format!("package '{name}' has conflicting sources in the dependency graph"),
+            ));
+        }
+        let dependency =
+            project.load_dependency(name, !matches!(resolution, Resolution::Offline))?;
+        contained_source_file(&dependency.root, &dependency.entry_path(), name)?;
+        if let Some(exports) = &dependency.manifest.exports {
+            for (alias, target) in exports {
+                contained_source_file(&dependency.root, &dependency.root.join(target), alias)?;
+            }
+        }
         let dependency_root = dependency
             .root
             .canonicalize()
@@ -526,13 +695,16 @@ fn resolve_project_dependencies(
         if let Some(existing) = paths.get(name) {
             if existing != &dependency_root {
                 return Err(ProjectError::new(
-                    ProjectErrorKind::DependencyNameMismatch,
+                    ProjectErrorKind::VersionConflict,
                     format!(
                         "package '{name}' resolves to both '{}' and '{}'",
                         existing.display(),
                         dependency_root.display()
                     ),
                 ));
+            }
+            if !stack.contains(&dependency_root) {
+                continue;
             }
         } else {
             paths.insert(name.clone(), dependency_root);
@@ -542,18 +714,21 @@ fn resolve_project_dependencies(
             .or_insert_with(|| LockedPackage {
                 name: name.clone(),
                 version: dependency.manifest.version.clone(),
-                source: format!(
-                    "path+{}:{}",
-                    project.manifest.name,
-                    path_to_manifest(&spec.path)
-                ),
+                source,
                 entry: path_to_manifest(&dependency.manifest.entry),
                 dependencies: dependency.manifest.dependencies.keys().cloned().collect(),
             });
-        resolve_project_dependencies(&dependency, packages, paths, stack)?;
+        resolve_project_dependencies(&dependency, packages, paths, stack, resolution)?;
     }
     stack.pop();
     Ok(())
+}
+
+fn lock_mismatch() -> ProjectError {
+    ProjectError::new(
+        ProjectErrorKind::LockSyntax,
+        "dependency graph differs from orvi.lock; run 'orviscript install' to update it",
+    )
 }
 
 fn validate_package_name(name: &str) -> Result<(), ProjectError> {

@@ -190,7 +190,7 @@ fn builds_inspects_and_runs_a_standalone_bundle() {
     assert!(inspected.status.success());
     let metadata = String::from_utf8_lossy(&inspected.stdout);
     assert!(metadata.contains("format: 1"));
-    assert!(metadata.contains("language: 0.10.1"));
+    assert!(metadata.contains("language: 0.11.0"));
     assert!(metadata.contains("sha256:"));
 
     let executed = Command::new(&executable)
@@ -496,6 +496,81 @@ fn manages_and_runs_local_path_dependencies() {
             .contains("math =")
     );
 
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn verifies_locked_packages_and_enforces_their_public_module_paths() {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("orviscript-lock-{id}"));
+    let app = base.join("app");
+    let cache = base.join("cache");
+    let digest = "a".repeat(64);
+    let package = cache.join(&digest);
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(package.join("src")).unwrap();
+    let package_manifest = "[project]\nname = 'math'\nversion = '1.2.0'\nentry = 'src/main.orvi'\n[exports]\napi = 'src/api.orvi'\n";
+    fs::write(package.join("orvi.toml"), package_manifest).unwrap();
+    fs::write(package.join("src/main.orvi"), "").unwrap();
+    fs::write(package.join("src/api.orvi"), "export const answer = 42").unwrap();
+    let manifest = format!(
+        "[project]\nname = 'app'\nversion = '1.0.0'\nentry = 'main.orvi'\n[dependencies]\nmath = {{ url = 'https://example.invalid/math.json', sha256 = '{digest}', version = '^1.0' }}\n"
+    );
+    fs::write(app.join("orvi.toml"), &manifest).unwrap();
+    let entry = app.join("main.orvi");
+    fs::write(
+        &entry,
+        "import { answer } from \"pkg:math/api\"; print(answer)",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_orviscript"))
+            .args(args)
+            .current_dir(&app)
+            .env("ORVI_PACKAGE_CACHE", &cache)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&["install"]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let lock = fs::read(app.join("orvi.lock")).unwrap();
+    assert!(String::from_utf8_lossy(&lock).contains(&digest));
+    assert!(run(&["install", "--locked"]).status.success());
+    assert!(run(&["install"]).status.success());
+    assert_eq!(fs::read(app.join("orvi.lock")).unwrap(), lock);
+    let executed = run(&["run"]);
+    assert!(
+        executed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&executed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&executed.stdout).trim(), "42");
+
+    fs::write(&entry, "import { answer } from \"pkg:math/src/api.orvi\"").unwrap();
+    let private = run(&["check"]);
+    assert!(!private.status.success());
+    assert!(String::from_utf8_lossy(&private.stderr).contains("does not export"));
+
+    fs::write(app.join("orvi.toml"), manifest.replace("^1.0", "^2.0")).unwrap();
+    let conflict = run(&["install"]);
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("ORVI-PROJECT-015"));
+    fs::write(
+        app.join("orvi.toml"),
+        manifest.replace(&digest, &"b".repeat(64)),
+    )
+    .unwrap();
+    let stale = run(&["install", "--locked"]);
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("differs from orvi.lock"));
+    assert_eq!(fs::read(app.join("orvi.lock")).unwrap(), lock);
     fs::remove_dir_all(base).unwrap();
 }
 

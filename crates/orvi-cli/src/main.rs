@@ -36,7 +36,8 @@ Commands:
   add <NAME> --path <DIRECTORY>
                 Add a local path dependency and refresh orvi.lock
   remove <NAME> Remove a dependency and refresh orvi.lock
-  install       Validate dependencies and generate orvi.lock
+  install [--locked]
+                Install dependencies and write or verify orvi.lock
   deps          List resolved project dependencies
   fmt <FILE>    Format an OrviScript program in place
   fmt --check <FILE>
@@ -80,7 +81,9 @@ enum Command {
         path: PathBuf,
     },
     Remove(String),
-    Install,
+    Install {
+        locked: bool,
+    },
     Dependencies,
     TaskLink {
         alias: String,
@@ -164,7 +167,10 @@ fn parse_arguments(args: &[OsString]) -> Result<Command, String> {
                 list: false,
             })
         }
-        [command] if command == "install" => Ok(Command::Install),
+        [command] if command == "install" => Ok(Command::Install { locked: false }),
+        [command, option] if command == "install" && option == "--locked" => {
+            Ok(Command::Install { locked: true })
+        }
         [command] if command == "deps" => Ok(Command::Dependencies),
         [command, name] if command == "remove" => {
             Ok(Command::Remove(name.to_string_lossy().into_owned()))
@@ -262,7 +268,7 @@ fn main() -> ExitCode {
         Ok(Command::Test { path, filter, list }) => test_command(path, filter.as_deref(), list),
         Ok(Command::Add { name, path }) => add_dependency(&name, &path),
         Ok(Command::Remove(name)) => remove_project_dependency(&name),
-        Ok(Command::Install) => install_dependencies(),
+        Ok(Command::Install { locked }) => install_dependencies(locked),
         Ok(Command::Dependencies) => list_dependencies(),
         Ok(Command::TaskLink { alias, path }) => task_link(&alias, &path),
         Ok(Command::TaskList) => task_list(),
@@ -479,7 +485,28 @@ fn with_source_target(target: Option<PathBuf>, operation: fn(&Path) -> ExitCode)
             return ExitCode::from(1);
         }
     };
+    if !check_dependency_graph(&path) {
+        return ExitCode::from(1);
+    }
     operation(&path)
+}
+
+fn check_dependency_graph(path: &Path) -> bool {
+    let path = absolute_path(path);
+    match Project::discover(&path) {
+        Ok(project) => match project.resolve_dependencies() {
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("error: {error}");
+                false
+            }
+        },
+        Err(error) if error.kind == orvi_project::ProjectErrorKind::ManifestNotFound => true,
+        Err(error) => {
+            eprintln!("error: {error}");
+            false
+        }
+    }
 }
 
 fn init_project(path: &Path) -> ExitCode {
@@ -582,7 +609,7 @@ fn remove_project_dependency(name: &str) -> ExitCode {
     }
 }
 
-fn install_dependencies() -> ExitCode {
+fn install_dependencies(locked: bool) -> ExitCode {
     let project = match current_project() {
         Ok(project) => project,
         Err(error) => {
@@ -590,10 +617,11 @@ fn install_dependencies() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match project.write_lockfile() {
+    match project.install(locked) {
         Ok(lockfile) => {
             println!(
-                "Resolved {} package(s) into {}",
+                "{} {} package(s) against {}",
+                if locked { "Verified" } else { "Installed" },
                 lockfile.packages.len(),
                 project.root.join(orvi_project::LOCK_FILE).display()
             );
@@ -691,6 +719,11 @@ fn run_file(path: &Path) -> ExitCode {
 }
 
 fn test_command(path: Option<PathBuf>, filter: Option<&str>, list: bool) -> ExitCode {
+    if let Some(path) = &path
+        && !check_dependency_graph(path)
+    {
+        return ExitCode::from(1);
+    }
     let paths = match path {
         Some(path) => vec![path],
         None => {
@@ -701,6 +734,10 @@ fn test_command(path: Option<PathBuf>, filter: Option<&str>, list: bool) -> Exit
                     return ExitCode::from(1);
                 }
             };
+            if let Err(error) = project.resolve_dependencies() {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
             match project.source_files() {
                 Ok(paths) => paths,
                 Err(error) => {
@@ -1369,7 +1406,7 @@ mod tests {
         );
         assert_eq!(
             parse_arguments(&[OsString::from("install")]),
-            Ok(Command::Install)
+            Ok(Command::Install { locked: false })
         );
     }
     #[test]
